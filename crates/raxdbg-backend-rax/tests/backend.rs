@@ -559,7 +559,11 @@ fn mem_map_protect_and_unmap_round_trip() {
     backend
         .mem_protect(base, 0x1000, Prot::READ)
         .expect("protect");
-    assert!(backend.mem_write(base, b"x").is_err());
+    // A host write still reaches the mapping: unidbg writes guest memory
+    // through unicorn's host API, which is how the ELF loader fills segments it
+    // mapped `READ | EXEC`. The guest's own stores are what the protection
+    // stops, which the next test covers.
+    backend.mem_write(base, b"x").expect("host write");
 
     backend.mem_unmap(base, 0x2000).expect("unmap");
     match backend.mem_read(base, 1) {
@@ -567,6 +571,23 @@ fn mem_map_protect_and_unmap_round_trip() {
             assert_eq!(fault.kind, MemoryFaultKind::Unmapped);
         }
         other => panic!("expected an unmapped fault, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_guest_store_to_a_read_only_page_faults() {
+    let base = 0x4000_0000u64;
+    let mut backend = arm64_backend(&[a64::str_x1_x0()]);
+    map_rw(&mut backend, base, 0x1000);
+    backend
+        .mem_protect(base, 0x1000, Prot::READ)
+        .expect("protect");
+    backend.reg_write(RegId::X(0), base).expect("x0");
+    backend.reg_write(RegId::X(1), 0x1234).expect("x1");
+
+    match backend.emu_start(CODE, 0, 0, 1) {
+        Err(RunError::UnmappedMemory { addr, .. }) => assert_eq!(addr, base),
+        other => panic!("expected the store to fault, got {other:?}"),
     }
 }
 

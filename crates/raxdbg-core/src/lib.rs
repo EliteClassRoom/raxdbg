@@ -6,7 +6,11 @@
 
 pub mod alloc;
 pub mod backend;
+pub mod debug;
 pub mod errno;
+pub mod file;
+pub mod hook;
 pub mod memory;
 pub mod pointer;
 pub mod reg;
+pub mod svc;

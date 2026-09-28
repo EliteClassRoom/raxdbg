@@ -48,6 +48,18 @@ impl std::fmt::Debug for RaxBackend {
 }
 
 impl RaxBackend {
+    /// A user address space with raxdbg's defaults: a 48-bit virtual address
+    /// limit and a 64 MiB frame arena, which is what the Android loader, the
+    /// stack area and a few mapped libraries need.
+    pub fn default_space() -> AddressSpace {
+        AddressSpace::new(rax::user::mm::SpaceConfig {
+            va_limit: 1 << 48,
+            arena_bytes: 64 * 1024 * 1024,
+            reserved_phys: Vec::new(),
+        })
+        .expect("a 48-bit address space with a 64 MiB arena is always valid")
+    }
+
     /// Creates a backend for `isa` over a fresh address space.
     pub fn new(space: AddressSpace, isa: Isa) -> Self {
         let shared = Arc::new(MemShared::new(space));
@@ -274,24 +286,26 @@ impl Backend for RaxBackend {
 
     fn mem_read(&self, addr: u64, size: usize) -> Result<Vec<u8>, BackendError> {
         let mut buf = vec![0u8; size];
-        self.shared
-            .space()
-            .read(addr, &mut buf)
-            .map_err(|fault| BackendError::Memory(memory_fault(fault, size)))?;
+        self.mem_read_into(addr, &mut buf)?;
         Ok(buf)
     }
 
     fn mem_read_into(&self, addr: u64, buf: &mut [u8]) -> Result<(), BackendError> {
+        // unidbg reads guest memory through unicorn's host API, which checks
+        // that the range is mapped but not the guest's own permissions; the
+        // guest's accesses are the ones the CPU enforces.
         self.shared
             .space()
-            .read(addr, buf)
+            .read_raw(addr, buf)
             .map_err(|fault| BackendError::Memory(memory_fault(fault, buf.len())))
     }
 
     fn mem_write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), BackendError> {
+        // As with `mem_read_into`: a host write reaches a read-only mapping,
+        // which is how unidbg loads segments it mapped `READ | EXEC`.
         self.shared
             .space()
-            .write(addr, bytes)
+            .write_raw(addr, bytes)
             .map_err(|fault| BackendError::Memory(memory_fault(fault, bytes.len())))
     }
 
