@@ -21,6 +21,9 @@ hex.workspace = true
 [dev-dependencies]
 env_logger.workspace = true
 object.workspace = true
+# The decoder comparison in tests/arm32_decoding.rs needs rax's own Thumb
+# instruction-size rule to check our disassembly against the CPU's.
+rax = { git = "https://github.com/HexRaysSA/rax", rev = "c468ca32087553bb6c16aad10c17c08fee24ce95", default-features = false }
 
 [lints]
 workspace = true

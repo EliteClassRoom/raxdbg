@@ -163,7 +163,19 @@ registers that look like addresses (`r0`, `r2`, `r3`, `r4`, `r10`) are all
 libc code pointers around `0x1203fdbb`–`0x1203fdc2`, i.e. a table of function
 pointers, and `r9 = 0x12` is a small integer that would be an offset.
 
-**A code hook that records every PC says the linear disassembly is wrong.**
+**Correction: the two decoders agree.** An earlier version of this note claimed
+the CPU and the disassembler disagreed about Thumb instruction boundaries,
+because a code hook recording every PC showed `0x1202e624 -> 0x1202e626` where
+yaxpeax, decoding linearly, put a four-byte `bne.w` at `0x1202e624`. That
+conclusion was **wrong**. `tests/arm32_decoding.rs` now walks the whole of arm32
+libc's code with both rules — rax's `ThumbDecoder::is_32bit_instruction` and
+yaxpeax's top-bits rule — and they agree everywhere, so the extra PC in the
+trace is an artifact of how the code hook reports addresses (it fires more than
+once across a wide instruction), not a decoder disagreement. The disassembly at
+`0x2e636` therefore stands, and the fault there is a genuine read of `0x90` by
+`ldr r7, [sp, 0x1c]`'s neighbours rather than a mis-decoded instruction.
+
+The old text, kept so the wrong turn is not repeated:
 With a code hook over libc's range recording the last 24 program counters, the
 trace before the fault is:
 
@@ -189,13 +201,14 @@ ones that actually ran — so **the "`ldr r7, [sp, 0x1c]` at `0x2e636`" above is
 misaligned reading and must not be trusted**. Whatever faults at `0x90` is a
 different instruction than the one that linear disassembly shows there.
 
-That makes the next step a decoder comparison rather than a memory one: dump the
-raw bytes from `0x1202e620` to `0x1202e640`, decode them with both `yaxpeax-arm`
-and rax's `Decoder`/`ThumbDecoder`, and see which is right. If rax is mis-decoding
-a Thumb-2 instruction there, that is a rax bug to report or work around; if
-yaxpeax is, our disassembler is wrong for this encoding and P11's output is
-affected too. `crates/raxdbg-android/tests/arm32_parity.rs` and the code-hook
-trace above are the harness for it.
+That comparison has now been run (`tests/arm32_decoding.rs`, over the whole of
+libc) and the decoders agree, so this line of attack is closed. What is left is
+the fault itself: a read of `0x90` while `r0`/`r2`/`r3`/`r4`/`r10` all hold Thumb
+function pointers around `0x1203fdbb`-`0x1203fdc2` and `r12` holds `0xffffffff`,
+which reads like a walk over a table of function pointers after a syscall
+returned an error. Check what the syscall immediately before the fault returned
+(the trace above shows a call at `0x120234a8`), and whether the arm32 handler
+answered it with something the guest would treat as a pointer.
 
 ## P8 handoff: the replace hook works for a direct call
 

@@ -680,6 +680,7 @@ dependencies = [
  "log",
  "object",
  "parking_lot",
+ "rax",
  "raxdbg-backend-rax",
  "raxdbg-core",
  "thiserror",
