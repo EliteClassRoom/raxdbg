@@ -177,11 +177,8 @@ fn system_property_get_writes_value_and_returns_length() {
     with_backend(&loader, |backend| { backend.reg_write(RegId::X(0), key_ptr).expect("set x0") });
     with_backend(&loader, |backend| { backend.reg_write(RegId::X(1), value_ptr).expect("set x1") });
 
-    let mut svc = dispatch
-        .handlers
-        .borrow_mut()
-        .remove(&hook.stubs().get.number)
-        .expect("get stub registered");
+    let number = hook.stubs().get.number;
+    let mut svc = svc_memory.take_svc(number).expect("get stub registered");
     let length = with_backend(&loader, |backend| svc.handle(backend).expect("handle")) as usize;
     assert_eq!(length, 2, "ro.build.version.sdk = 23 (two bytes)");
 
@@ -190,10 +187,7 @@ fn system_property_get_writes_value_and_returns_length() {
     let value = std::str::from_utf8(&buf[..length]).expect("utf-8 value");
     assert_eq!(value, "23");
 
-    dispatch
-        .handlers
-        .borrow_mut()
-        .insert(hook.stubs().get.number, svc);
+    svc_memory.put_svc(number, svc);
 }
 
 #[test]
@@ -246,11 +240,8 @@ fn system_property_get_reads_keys_only_in_bundled_properties() {
     with_backend(&loader, |backend| { backend.reg_write(RegId::X(0), key_ptr).expect("x0") });
     with_backend(&loader, |backend| { backend.reg_write(RegId::X(1), value_ptr).expect("x1") });
 
-    let mut svc = dispatch
-        .handlers
-        .borrow_mut()
-        .remove(&hook.stubs().get.number)
-        .expect("get stub registered");
+    let number = hook.stubs().get.number;
+    let mut svc = svc_memory.take_svc(number).expect("get stub registered");
     let length = with_backend(&loader, |backend| svc.handle(backend).expect("handle")) as usize;
     assert!(length > 0, "ro.hardware has a non-empty value");
     let mut buf = vec![0u8; length + 1];
@@ -258,10 +249,7 @@ fn system_property_get_reads_keys_only_in_bundled_properties() {
     let value = std::str::from_utf8(&buf[..length]).expect("utf-8 value");
     assert_eq!(value, "bullhead");
 
-    dispatch
-        .handlers
-        .borrow_mut()
-        .insert(hook.stubs().get.number, svc);
+    svc_memory.put_svc(number, svc);
 }
 
 #[test]
@@ -281,28 +269,23 @@ fn armld64_registers_libdl_symbols_and_dlsym_resolves_a_real_export() {
         HookListener::hook(&arm_ld, svc_memory.as_ref(), Some("libdl.so"), "dlerror", 0);
     assert!(dlerror_addr >= SVC_BASE, "dlerror stub lives in the SVC page");
     let dlerror_number = arm_ld.stubs.dlerror.number;
-    let mut svc = dispatch
-        .handlers
-        .borrow_mut()
-        .remove(&dlerror_number)
+    let number = dlerror_number;
+    let mut svc = svc_memory
+        .take_svc(number)
         .expect("dlerror stub registered");
     let return_value = with_backend(&loader, |backend| svc.handle(backend).expect("handle"));
     assert_eq!(
         return_value as u64, SVC_BASE,
         "dlerror returns the error buffer, which `Dlfcn` allocates first in the SVC page"
     );
-    dispatch
-        .handlers
-        .borrow_mut()
-        .insert(dlerror_number, svc);
+    svc_memory.put_svc(number, svc);
 
     let dlsym_addr =
         HookListener::hook(&arm_ld, svc_memory.as_ref(), Some("libdl.so"), "dlsym", 0);
     let dlsym_number = arm_ld.stubs.dlsym.number;
-    let mut svc = dispatch
-        .handlers
-        .borrow_mut()
-        .remove(&dlsym_number)
+    let number = dlsym_number;
+    let mut svc = svc_memory
+        .take_svc(number)
         .expect("dlsym stub");
 
     let name = "malloc";
@@ -333,10 +316,7 @@ fn armld64_registers_libdl_symbols_and_dlsym_resolves_a_real_export() {
         libc.base + libc.size
     );
 
-    dispatch
-        .handlers
-        .borrow_mut()
-        .insert(dlsym_number, svc);
+    svc_memory.put_svc(number, svc);
 }
 
 /// Runs `f` with the loader's own backend borrowed, and nothing else.
