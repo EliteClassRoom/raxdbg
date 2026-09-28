@@ -49,6 +49,27 @@ One more, for output rather than correctness: `StdoutFileIO` must answer
 bionic's `isatty` is false and stdout stays block-buffered, so a `printf` with
 a newline never reaches the host.
 
+## Handoff notes for the remaining phases
+
+The five phases below were each delegated to a subagent with a full brief; every
+one of those runs died with exit 1 while reading the reference sources (long
+exploration, then a crash — a context limit rather than a task problem). The
+lessons for whoever picks them up:
+
+* **Scope one file per agent.** The failures all happened after 10-20 large file
+  reads. A brief that says "port `ARM32SyscallHandler.java`" pulls in the whole
+  syscall layer, the memory facade and the loader; a brief that says "port
+  `ARM32SyscallHandler.java`'s `nr::OPENAT` arm into `syscall/arm32.rs`, whose
+  helpers are `UnixSyscallHandler::{open,resolve}`" does not.
+* **The interfaces are stable and documented.** `crates/raxdbg-android/src/emulator.rs`
+  and `crates/raxdbg-android/src/syscall/arm64.rs` are the two files to read
+  first: the emulator shows how the loader, the syscall layer, the trap page and
+  the host services are wired, and the arm64 table shows the shape a syscall
+  table takes (`nr` constants, a table struct with `arg_u64`, a free `dispatch`).
+* **The fixtures are ready.** `fixtures/prebuilt/{arm64-v8a,armeabi-v7a}/`
+  carry every symbol the P6-P9 acceptance tests call; `libs/` carries both SDK
+  levels. Nothing needs building to run a new test.
+
 ## Not started
 
 * **P6 JNI (`dvm`)** — the fixture (`fixtures/prebuilt/arm64-v8a/libjnitest.so`)
