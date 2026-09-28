@@ -292,7 +292,6 @@ fn load_address(reg: u32, address: u32) -> [u32; 2] {
 fn a_task_that_waits_on_a_futex_runs_again_when_it_is_woken() {
     let emulator = emulator();
     let runtime = ThreadRuntime::install(&emulator).expect("runtime");
-    let waiters = emulator.syscall().borrow().unix_handler().waiters().clone();
     let futex = emulator
         .memory()
         .mmap2_impl(0, 0x1000, Prot::from_bits(0x3), 0x22, -1, 0)
@@ -340,7 +339,6 @@ fn a_task_that_waits_on_a_futex_runs_again_when_it_is_woken() {
     );
 
     let mut dispatcher = runtime.dispatcher(&emulator);
-    dispatcher.set_waiters(Rc::clone(&waiters));
     let a_stack = runtime.allocate_stack(&emulator).expect("stack");
     let b_stack = runtime.allocate_stack(&emulator).expect("stack");
     let a = dispatcher.create(waiter_code.address, &[], a_stack);
@@ -391,7 +389,6 @@ fn a_futex_wait_on_a_changed_value_does_not_park() {
         ],
     );
     let mut dispatcher = runtime.dispatcher(&emulator);
-    dispatcher.set_waiters(emulator.syscall().borrow().unix_handler().waiters().clone());
     let stack = runtime.allocate_stack(&emulator).expect("stack");
     dispatcher.create(code.address, &[], stack);
     let results = {

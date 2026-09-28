@@ -48,7 +48,15 @@ pub struct ThreadRuntime {
     exit_stub: u64,
     number: i32,
     svc: Rc<SvcMemory>,
-    next_index: std::cell::Cell<usize>,
+    /// The syscall handler's futex registry.
+    ///
+    /// The dispatcher needs the *same* registry the handler parks threads in: a
+    /// `FUTEX_WAIT` registers a waiter there and asks for a switch, and the
+    /// dispatcher claims that waiter to park the task. A dispatcher without it
+    /// would re-run the parked task's `svc` forever instead of blocking it, so
+    /// [`ThreadRuntime::dispatcher`] wires it in rather than leaving it to the
+    /// caller.
+    waiters: Rc<raxdbg_core::thread::Waiters>,
 }
 
 impl ThreadRuntime {
@@ -71,7 +79,7 @@ impl ThreadRuntime {
             exit_stub,
             number,
             svc,
-            next_index: std::cell::Cell::new(0),
+            waiters: emulator.syscall().borrow().unix_handler().waiters().clone(),
         })
     }
 
@@ -85,9 +93,17 @@ impl ThreadRuntime {
         self.number
     }
 
-    /// A dispatcher whose tasks return through this runtime's exit stub.
+    /// A dispatcher whose tasks return through this runtime's exit stub, with
+    /// the futex registry already installed.
     pub fn dispatcher(&self, emulator: &Rc<AndroidEmulator>) -> ThreadDispatcher {
-        ThreadDispatcher::new(self.exit_stub, emulator.is_64bit())
+        let mut dispatcher = ThreadDispatcher::new(self.exit_stub, emulator.is_64bit());
+        dispatcher.set_waiters(Rc::clone(&self.waiters));
+        dispatcher
+    }
+
+    /// The futex registry the dispatcher and the syscall handler share.
+    pub fn waiters(&self) -> &Rc<raxdbg_core::thread::Waiters> {
+        &self.waiters
     }
 
     /// A stack for a new task, from the loader's thread-stack area.
@@ -97,7 +113,6 @@ impl ThreadRuntime {
     /// that goes with it.
     pub fn allocate_stack(&self, emulator: &Rc<AndroidEmulator>) -> Result<u64, MemoryError> {
         let index = emulator.memory().allocate_thread_index_impl()?;
-        self.next_index.set(index + 1);
         let stack = emulator.memory().allocate_thread_stack_impl(index)?;
         // The thread-stack pointer is the *top* of the thread's area, and the
         // ABI wants it 16-byte aligned at a call boundary.
