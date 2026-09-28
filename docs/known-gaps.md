@@ -291,3 +291,25 @@ the missing runtime, so the day `dvm` lands that assertion flips to a call.
   is done and tested; the `yaxpeax-arm` disassembler seam and the REPL are not.
 * **P12 CLI** — `raxdbg-cli` is still the placeholder binary.
 * **P13 docs** — `README.md`, `THIRD_PARTY_NOTICES.md`, the acceptance matrix.
+
+
+## Building on this machine: name the MSVC linker explicitly
+
+`link.exe` on `PATH` resolves to Git's `C:\Program Files\Git\usr\bin\link.exe`,
+which cannot link Rust binaries. The symptom is every build script failing at
+once -- not just the crate being worked on -- with `linking with link.exe
+failed`. The MSVC linker is at
+
+```
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\link.exe
+```
+
+(note `Hostx64`, lowercase `x`; the `HostX64` spelling does not exist and gives
+"linker not found"). Point cargo at it:
+
+```
+CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=<that path> cargo test --workspace
+```
+
+Editing `PATH` from the shell does not fix it: the inherited entries are
+Windows-style, so the lookup still finds Git's `link.exe` first.
