@@ -4,5 +4,9 @@
 //! guest memory facade, pointer helpers, module/symbol registry, the syscall
 //! framework, the cooperative thread dispatcher and the debugger API.
 
+pub mod alloc;
 pub mod backend;
+pub mod errno;
+pub mod memory;
+pub mod pointer;
 pub mod reg;

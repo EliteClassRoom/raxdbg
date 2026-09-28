@@ -446,6 +446,16 @@ pub trait Backend {
     /// Reads `size` bytes of guest memory.
     fn mem_read(&self, addr: u64, size: usize) -> Result<Vec<u8>, BackendError>;
 
+    /// Reads `buf.len()` bytes of guest memory into `buf`.
+    ///
+    /// The default allocates through [`Backend::mem_read`]; backends override it
+    /// to fill `buf` directly, which is what `Pointer`'s typed accessors use.
+    fn mem_read_into(&self, addr: u64, buf: &mut [u8]) -> Result<(), BackendError> {
+        let bytes = self.mem_read(addr, buf.len())?;
+        buf.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     /// Writes guest memory.
     fn mem_write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), BackendError>;
 

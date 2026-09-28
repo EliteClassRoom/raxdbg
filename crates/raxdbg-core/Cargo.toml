@@ -10,6 +10,7 @@ description = "Core abstractions of raxdbg: backend contract, memory, pointer, m
 log.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+parking_lot.workspace = true
 
 [lints]
 workspace = true

@@ -76,13 +76,13 @@ foreach ($t in $targets) {
         $extra = $t.March
         if ($Thumb -and $t.Abi -eq "armeabi-v7a") { $extra += "-mthumb" }
         if ($zig) {
-            $args = @("cc", "-target", $t.Zig, "-shared", "-fPIC", "-O2", "-o", $out, $src) + $extra
+            $args = @("cc", "-target", $t.Zig, "-shared", "-fPIC", "-O2", "-o", $out, $src) + $extra + @("-llog")
             Write-Host "zig $($args -join ' ')"
             & $zig @args
         } else {
             $clang = Join-Path $ndkPath "toolchains/llvm/prebuilt/windows-x86_64/bin/$($t.Ndk)-clang.cmd"
             if (-not (Test-Path $clang)) { throw "NDK clang not found: $clang" }
-            $args = @("-shared", "-fPIC", "-O2", "-o", $out, $src) + $extra
+            $args = @("-shared", "-fPIC", "-O2", "-o", $out, $src) + $extra + @("-llog")
             Write-Host "$clang $($args -join ' ')"
             & $clang @args
         }

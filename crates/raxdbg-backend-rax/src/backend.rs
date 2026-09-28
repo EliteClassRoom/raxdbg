@@ -281,6 +281,13 @@ impl Backend for RaxBackend {
         Ok(buf)
     }
 
+    fn mem_read_into(&self, addr: u64, buf: &mut [u8]) -> Result<(), BackendError> {
+        self.shared
+            .space()
+            .read(addr, buf)
+            .map_err(|fault| BackendError::Memory(memory_fault(fault, buf.len())))
+    }
+
     fn mem_write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), BackendError> {
         self.shared
             .space()
