@@ -17,6 +17,7 @@
 //! plan P4.2 contract.
 
 pub mod android;
+pub mod arm32;
 pub mod arm64;
 pub mod handler;
 

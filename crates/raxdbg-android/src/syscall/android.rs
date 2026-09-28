@@ -364,6 +364,24 @@ impl AndroidSyscallHandler {
             }
         }
 
+        // The arm32 numbers are a different table from the arm64 ones, so an
+        // arm32 `svc #0` is translated before it reaches the shared table.
+        // Without this an arm32 `write` (4) lands on arm64 `fstat` (4) and the
+        // guest reads whatever that left in `r0`.
+        let mut args = args;
+        let nr = if self.is_64bit {
+            nr
+        } else {
+            match super::arm32::translate(nr, &mut args) {
+                Some(mapped) => mapped,
+                None => {
+                    // unidbg's `handleUnknownSyscall` answers `-ENOSYS`.
+                    let target = RegId::R(0);
+                    backend.reg_write(target, (-38i64) as u64)?;
+                    return Ok(());
+                }
+            }
+        };
         let handler = self.handler.borrow();
         let result = super::arm64::dispatch(&handler, &self.state, nr, args);
         let target = if self.is_64bit {

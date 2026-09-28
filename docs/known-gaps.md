@@ -99,6 +99,41 @@ lessons for whoever picks them up:
   carry every symbol the P6-P9 acceptance tests call; `libs/` carries both SDK
   levels. Nothing needs building to run a new test.
 
+## P9: what is done for arm32, and what the initialiser fault is not
+
+Done and tested:
+
+* `crates/raxdbg-android/src/syscall/arm32.rs` — the arm32 EABI numbers and the
+  translation onto the shared table. This was a real bug, not a missing
+  feature: the arm32 SVC dispatch called `arm64::dispatch` with the arm32
+  number, so an arm32 `write` (4) ran arm64 `fstat` (4) and left a pointer where
+  the guest expected a count. `open` also shifts its arguments to make room for
+  `AT_FDCWD`, and `_llseek` becomes a 64-bit `lseek`. Unimplemented numbers
+  answer `-ENOSYS`, as unidbg's `handleUnknownSyscall` does. Four tests in
+  `arm32.rs`, plus `tests/arm32_parity.rs`.
+
+Ruled out by experiment, so the next person does not repeat them:
+
+* **The thread pointer is fine.** `mrc p15, 0, r0, c13, c0, 3` executes at EL0
+  and returns exactly what was written to `cp15.tpidruro` —
+  `tests/arm32_parity.rs::the_guest_reads_the_thread_pointer_through_cp15`.
+* **The stack pointer is fine.** It is `0xe4fff740` before the initialiser runs,
+  inside the mapped stack, and the instruction rax reports as faulting
+  (`ldr r7, [sp, 0x1c]` at libc offset `0x2e636`) addresses `0xe4fff754` —
+  mapped. rax reports the fault address and PC but not the access width, and
+  the PC it reports is not always the instruction that faulted, so read the
+  fault address as the signal: `0x90`, reproducibly, across both libc's and the
+  fixture's initialisers.
+* **Relocations are not the problem**: the arm32 `libc.so` resolves all of them.
+
+The remaining fault is a `NULL + 0x90` read inside arm32 bionic's initialiser
+before any relocation-sensitive code runs. The next step is to compare the
+arguments the loader passes to `DT_INIT`/`init_array` against unidbg's
+`AndroidElfLoader.callInitFunction` for the 32-bit case, and to trace which
+register is zero at the fault — `__libc_preinit` reads `__system_property_area__`
+and the auxv through pointers that a 32-bit-specific setup difference would
+leave null.
+
 ## P8 handoff: the replace hook works for a direct call
 
 `crates/raxdbg-android/src/hook/replace.rs` is the engine-independent half of
