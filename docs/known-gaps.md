@@ -247,6 +247,34 @@ handler through `r7`, and `malloc`/`free` round-trip through real bionic. So the
 now defaults to 23 like `for_64bit`; `sdk(19)` still faults and is the open item
 on that front.
 
+**The initialiser is `libc++_shared.so`'s, and the difference is the ABI.**
+`libctest.so` has no initialisers of its own (`module_init_functions` is empty,
+`DT_INIT` is 0, no init array); it pulls `libcpp.so`, and *that* module's
+`.init_array` is the one at `0x32821`. The two ABIs' copies of it differ:
+
+```
+armeabi-v7a: DT_INIT_ARRAY=0x8dc1c entries=1  relocs into it: none
+             file content at the slot: 21280300 -> 0x32821
+arm64-v8a:   DT_INIT_ARRAY=0xefa70 entries=1  relocs into it: none
+             file content at the slot: 0000000000000000 -> 0x0
+```
+
+So on arm32 the slot holds a raw virtual address that nothing relocates, our
+`InitFunction::Absolute::address` re-reads it, finds it non-zero, and returns it
+as-is — which is why the call lands on `0x32821` and faults at `0x32820`. On
+arm64 the slot is zero, the recorded address is also zero, and the module's
+initialiser is evidently not reached that way at all, so the difference never
+showed.
+
+The question to settle next is what unidbg does with an `Absolute` slot on
+32-bit: `AbsoluteInitFunction.getFuncAddress` re-reads the slot and falls back to
+the recorded address when it is zero, which is what this port does, so the
+divergence is either in the relocation pass (an `R_ARM_RELATIVE` that should
+rewrite this slot and is being skipped) or in this bundled `libcpp.so` being one
+unidbg never exercises. Check the arm32 module's `DT_REL`/`DT_RELSZ` against what
+`elf::relocation` walks for that module — an unresolved count of zero only says
+every relocation we *looked at* was applied.
+
 **The fixture's init_array entry is called unrelocated.** With libc booted, the
 arm32 fixture fails differently: `initialiser 0x32821: unmapped memory access at
 0x32820`. `0x32821` is a raw virtual address — Thumb, and the fixture's own
