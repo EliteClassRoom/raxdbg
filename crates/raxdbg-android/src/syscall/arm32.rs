@@ -303,7 +303,7 @@ pub fn translate(nr: i32, args: &mut [u64; 8]) -> Option<i32> {
             args[1] = offset;
             args[2] = whence;
             args[3] = result;
-            args[4..].copy_from_slice(&rest[..4]);
+            args[4..4 + rest.len()].copy_from_slice(&rest);
             arm64_nr::LSEEK
         }
         _ => return None,
