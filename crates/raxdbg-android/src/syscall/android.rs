@@ -293,16 +293,21 @@ impl AndroidSyscallHandler {
                     "no SVC stub registered for swi={swi:#x} (pc={pc:#x})"
                 ))));
             };
-            let result = svc.handle(backend)?;
-            // Write the result to x0 (arm64) or r0 (arm32). The kind
-            // already encodes which; we look it up to drive the right
-            // RegId.
+            // The target register follows the stub's ISA, so read it before
+            // the stub goes back.
             let target = match svc.kind() {
                 SvcKind::Arm64 => RegId::X(0),
                 _ => RegId::R(0),
             };
-            backend.reg_write(target, result as u64)?;
+            let result = svc.handle(backend);
+            // The stub goes back **before** the error is propagated: a handler
+            // that yields or ends the thread returns `ThreadSwitch`/
+            // `PopContext`, and a stub that was taken and not restored is gone
+            // for good — the next `svc` with that number then fails with "no
+            // SVC stub registered".
             self.svc_memory.put_svc(swi, svc);
+            let result = result?;
+            backend.reg_write(target, result as u64)?;
             // Crucially: do **not** touch PC. The stub's trailing
             // `ret`/`bx lr` returns to the caller.
             return Ok(());
