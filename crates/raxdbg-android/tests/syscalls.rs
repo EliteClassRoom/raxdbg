@@ -161,6 +161,11 @@ impl TestHarness {
     fn x0(&self) -> u64 {
         self.backend.borrow().reg_read(RegId::X(0)).unwrap()
     }
+
+    /// How many futex waiters are registered.
+    fn waiters(&self) -> usize {
+        self.syscall.borrow().unix_handler().waiters().len()
+    }
 }
 
 // -------- Tests ---------------------------------------------------------------------
@@ -278,23 +283,53 @@ fn unregistered_svc_reports_error() {
 }
 
 #[test]
-fn futex_wait_returns_eagain() {
+fn futex_wait_parks_the_thread_when_the_value_matches() {
+    // P7's contract: with the waiter machinery in place a matching
+    // `FUTEX_WAIT` registers a waiter and asks for a thread switch, which is
+    // how `pthread_join` and `pthread_cond_wait` block instead of spinning.
     let harness = build_test();
     harness.map_and_write_data(&[0; 8]);
-    // x0 = uaddr, x1 = op (FUTEX_WAIT), x2 = val, x3 = timeout.
+    // x0 = uaddr, x1 = op (FUTEX_WAIT), x2 = val (0, which is what is there),
+    // x3 = timeout.
     let args = [0x2000u64, 0, 0, 0, 0, 0, 0];
-    harness.dispatch_swi(98, &args).expect("futex wait");
-    assert_eq!(harness.x0() as i32, -EAGAIN, "futex wait returns -EAGAIN");
+    let error = harness
+        .dispatch_swi(98, &args)
+        .expect_err("a matching futex wait parks the thread");
+    assert!(
+        matches!(error, RunError::ThreadSwitch),
+        "expected a thread switch, got {error:?}"
+    );
+    assert_eq!(
+        harness.waiters(),
+        1,
+        "and the thread is registered as a waiter"
+    );
 }
 
 #[test]
-fn futex_wake_returns_zero_waiters() {
+fn futex_wait_returns_eagain_when_the_value_changed() {
+    // The kernel's `old != val` shortcut: nothing is parked, the caller is told
+    // to retry its check.
+    let harness = build_test();
+    harness.map_and_write_data(&[7u8; 8]);
+    let args = [0x2000u64, 0, 0, 0, 0, 0, 0];
+    harness.dispatch_swi(98, &args).expect("futex wait");
+    assert_eq!(harness.x0() as i32, -EAGAIN, "futex wait returns -EAGAIN");
+    assert_eq!(harness.waiters(), 0, "and nobody was parked");
+}
+
+#[test]
+fn futex_wake_returns_the_number_woken() {
     let harness = build_test();
     harness.map_and_write_data(&[0; 8]);
-    // x0 = uaddr, x1 = op (FUTEX_WAKE = 1), x2 = val.
-    let args = [0x2000u64, 1, 1, 0, 0, 0, 0];
-    harness.dispatch_swi(98, &args).expect("futex wake");
-    assert_eq!(harness.x0(), 0, "futex wake returns 0 (no waiters in P4)");
+    // Park one thread first, then wake it.
+    let wait = [0x2000u64, 0, 0, 0, 0, 0, 0];
+    let _ = harness.dispatch_swi(98, &wait);
+    assert_eq!(harness.waiters(), 1);
+    // x0 = uaddr, x1 = op (FUTEX_WAKE = 1), x2 = val (1).
+    let wake = [0x2000u64, 1, 1, 0, 0, 0, 0];
+    let _ = harness.dispatch_swi(98, &wake);
+    assert_eq!(harness.x0(), 1, "futex wake reports the one it woke");
 }
 
 #[test]

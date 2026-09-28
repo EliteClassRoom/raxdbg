@@ -264,3 +264,143 @@ fn the_thread_stack_area_is_below_the_main_stack() {
     probe.write_u64(0, 0x1234).expect("the stack is mapped");
     assert_eq!(probe.read_u64(0).expect("read back"), 0x1234);
 }
+
+/// `movz xN, #imm16, lsl #16` — the high half of an address.
+fn movz_x_hi(reg: u32, value: u16) -> u32 {
+    0xd2a0_0000 | (u32::from(value) << 5) | reg
+}
+
+/// `movk xN, #imm16` — the low half.
+fn movk_x(reg: u32, value: u16) -> u32 {
+    0xf280_0000 | (u32::from(value) << 5) | reg
+}
+
+/// `movz xN, #imm16`.
+fn movz_x(reg: u32, value: u16) -> u32 {
+    0xd280_0000 | (u32::from(value) << 5) | reg
+}
+
+/// The two instructions that put a 32-bit address in `xN`.
+fn load_address(reg: u32, address: u32) -> [u32; 2] {
+    [
+        movz_x_hi(reg, (address >> 16) as u16),
+        movk_x(reg, (address & 0xffff) as u16),
+    ]
+}
+
+#[test]
+fn a_task_that_waits_on_a_futex_runs_again_when_it_is_woken() {
+    let emulator = emulator();
+    let runtime = ThreadRuntime::install(&emulator).expect("runtime");
+    let waiters = emulator.syscall().borrow().unix_handler().waiters().clone();
+    let futex = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, Prot::from_bits(0x3), 0x22, -1, 0)
+        .expect("futex page");
+    emulator
+        .memory()
+        .pointer(futex)
+        .write_u32(0, 0)
+        .expect("zero the futex");
+    let futex = futex as u32;
+
+    // Task A: `futex(addr, FUTEX_WAIT, 0)` — parks — then returns 1.
+    let [hi, lo] = load_address(0, futex);
+    let waiter_code = CodePage::write(
+        &emulator,
+        &[
+            hi,
+            lo,
+            movz_x(1, 0),     // FUTEX_WAIT
+            movz_x(2, 0),     // the value it expects to find
+            movz_x(8, 98),    // futex
+            svc(0),
+            movz_x(0, 1),
+            RET,
+        ],
+    );
+
+    // Task B: store 1 at the futex, then `futex(addr, FUTEX_WAKE, 1)`, then
+    // return 2. The store is what makes A's wait satisfiable.
+    let [b_hi, b_lo] = load_address(0, futex);
+    let waker_code = CodePage::write(
+        &emulator,
+        &[
+            b_hi,
+            b_lo,
+            movz_x(9, 1),
+            0xb900_0009,      // str w9, [x0]
+            movz_x(1, 1),     // FUTEX_WAKE
+            movz_x(2, 1),     // wake one
+            movz_x(8, 98),    // futex
+            svc(0),
+            movz_x(0, 2),
+            RET,
+        ],
+    );
+
+    let mut dispatcher = runtime.dispatcher(&emulator);
+    dispatcher.set_waiters(Rc::clone(&waiters));
+    let a_stack = runtime.allocate_stack(&emulator).expect("stack");
+    let b_stack = runtime.allocate_stack(&emulator).expect("stack");
+    let a = dispatcher.create(waiter_code.address, &[], a_stack);
+    let b = dispatcher.create(waker_code.address, &[], b_stack);
+
+    let results = {
+        let mut backend = emulator.backend().borrow_mut();
+        dispatcher.run(&mut *backend).expect("run")
+    };
+    assert_eq!(dispatcher.pending(), 0, "both tasks finished: {results:?}");
+    assert!(results.contains(&(a, 1)), "the waiting task ran to the end: {results:?}");
+    assert!(results.contains(&(b, 2)), "{results:?}");
+    assert_eq!(
+        emulator.memory().pointer(u64::from(futex)).read_u32(0).expect("read"),
+        1,
+        "the waker's store landed"
+    );
+    assert!(dispatcher.switches() >= 2, "the wait and the wake both switched");
+}
+
+#[test]
+fn a_futex_wait_on_a_changed_value_does_not_park() {
+    let emulator = emulator();
+    let runtime = ThreadRuntime::install(&emulator).expect("runtime");
+    let futex = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, Prot::from_bits(0x3), 0x22, -1, 0)
+        .expect("futex page");
+    // The word already holds 7, and the guest waits for 0: the kernel's
+    // `old != val` shortcut returns `-EAGAIN` without parking anyone.
+    emulator
+        .memory()
+        .pointer(futex)
+        .write_u32(0, 7)
+        .expect("write the futex");
+    let futex = futex as u32;
+    let [hi, lo] = load_address(0, futex);
+    let code = CodePage::write(
+        &emulator,
+        &[
+            hi,
+            lo,
+            movz_x(1, 0),  // FUTEX_WAIT
+            movz_x(2, 0),  // expects 0, finds 7
+            movz_x(8, 98), // futex
+            svc(0),
+            RET,           // x0 is the syscall's return: -EAGAIN
+        ],
+    );
+    let mut dispatcher = runtime.dispatcher(&emulator);
+    dispatcher.set_waiters(emulator.syscall().borrow().unix_handler().waiters().clone());
+    let stack = runtime.allocate_stack(&emulator).expect("stack");
+    dispatcher.create(code.address, &[], stack);
+    let results = {
+        let mut backend = emulator.backend().borrow_mut();
+        dispatcher.run(&mut *backend).expect("run")
+    };
+    assert_eq!(
+        results[0].1 as i32, -11,
+        "the syscall returned -EAGAIN and nobody parked"
+    );
+    assert_eq!(dispatcher.switches(), 0, "no switch was needed");
+}

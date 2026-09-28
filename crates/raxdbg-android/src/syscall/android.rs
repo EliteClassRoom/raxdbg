@@ -389,12 +389,20 @@ impl AndroidSyscallHandler {
         };
         let handler = self.handler.borrow();
         let result = super::arm64::dispatch(&handler, &self.state, nr, args);
+        // A syscall that parked the thread (or woke another one) asks for a
+        // switch. The return value is already in `x0`/`r0`, so the resumed
+        // thread sees it, exactly as unidbg's
+        // `ThreadContextSwitchException.setReturnValue` does.
+        let switch = handler.take_switch_request();
         let target = if self.is_64bit {
             RegId::X(0)
         } else {
             RegId::R(0)
         };
         backend.reg_write(target, result as u64)?;
+        if switch {
+            return Err(RunError::ThreadSwitch);
+        }
         Ok(())
     }
 }

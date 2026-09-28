@@ -37,6 +37,7 @@ use parking_lot::{Mutex, RwLock};
 use raxdbg_core::backend::Prot;
 use raxdbg_core::errno::{EACCES, EBADF, EFAULT, EINVAL, ENOENT};
 use raxdbg_core::file::linux_fs::LinuxFileSystem;
+use raxdbg_core::thread::Waiters;
 use raxdbg_core::file::structs::{IOConstants, Stat};
 use raxdbg_core::file::{FileIO, FileResult, FileSystem, IOResolver};
 use raxdbg_core::memory::{Memory, MemoryError, MAP_ANONYMOUS, MAP_FAILED};
@@ -168,6 +169,20 @@ pub struct UnixSyscallHandler {
     /// Whether the guest is 64-bit. Drives which [`Stat`] layout to write
     /// and the size of the path strings we hand to resolvers.
     is_64bit: bool,
+
+    /// The futex waiters: what a blocking syscall parks a thread on.
+    ///
+    /// Port of unidbg: `AbstractEmulator.waiters`. The dispatcher shares this
+    /// registry, which is how a `FUTEX_WAKE` makes a parked task runnable.
+    waiters: Rc<Waiters>,
+
+    /// Set by a syscall that wants the running thread switched out.
+    ///
+    /// unidbg throws `ThreadContextSwitchException` from inside the handler.
+    /// The table here returns `i64`, so the handler records the request and the
+    /// SVC dispatch turns it into `RunError::ThreadSwitch` — plan D5's rule that
+    /// control flow is a value returned up the stack.
+    pending_switch: Cell<bool>,
 }
 
 impl std::fmt::Debug for UnixSyscallHandler {
@@ -191,7 +206,28 @@ impl UnixSyscallHandler {
             file_system: RwLock::new(None),
             memory,
             is_64bit,
+            waiters: Rc::new(Waiters::new()),
+            pending_switch: Cell::new(false),
         }
+    }
+
+    /// The futex registry, shared with the thread dispatcher.
+    pub fn waiters(&self) -> &Rc<Waiters> {
+        &self.waiters
+    }
+
+    /// Asks for the running thread to be switched out.
+    ///
+    /// Port of unidbg: the `ThreadContextSwitchException` that a blocking
+    /// syscall raises after it has registered its waiter — and that a
+    /// successful `FUTEX_WAKE` raises too, so the woken thread gets to run.
+    pub fn request_switch(&self) {
+        self.pending_switch.set(true);
+    }
+
+    /// Takes the switch request, if a syscall made one.
+    pub fn take_switch_request(&self) -> bool {
+        self.pending_switch.replace(false)
     }
 
     /// Whether the guest is 64-bit.

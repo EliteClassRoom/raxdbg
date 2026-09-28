@@ -17,8 +17,11 @@
 
 use std::collections::VecDeque;
 
+use std::rc::Rc;
+
 use crate::backend::{Backend, ContextId, RunError};
 use crate::reg::RegId;
+use crate::thread::waiter::Waiters;
 
 /// What a task is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +47,8 @@ pub struct ThreadTask {
     args: Vec<u64>,
     result: Option<u64>,
     state: TaskState,
+    /// The waiter this task is parked on, once a blocking syscall parked it.
+    waiter: Option<usize>,
 }
 
 impl ThreadTask {
@@ -77,6 +82,16 @@ impl ThreadTask {
         self.state
     }
 
+    /// Whether the task is parked on a waiter.
+    pub fn is_parked(&self) -> bool {
+        self.waiter.is_some()
+    }
+
+    /// The waiter it is parked on.
+    pub fn waiter(&self) -> Option<usize> {
+        self.waiter
+    }
+
     /// The saved context, once the task has been switched away from.
     pub fn context(&self) -> Option<ContextId> {
         self.context
@@ -99,6 +114,9 @@ pub struct ThreadDispatcher {
     is_64bit: bool,
     /// How many times the dispatcher switched tasks, for tests.
     switches: usize,
+    /// The futex registry, when the emulator installed one. A task parked on a
+    /// waiter does not run again until that waiter is woken.
+    waiters: Option<Rc<Waiters>>,
 }
 
 impl ThreadDispatcher {
@@ -115,7 +133,40 @@ impl ThreadDispatcher {
             exit_stub,
             is_64bit,
             switches: 0,
+            waiters: None,
         }
+    }
+
+    /// Installs the futex registry, so parking and waking work.
+    pub fn set_waiters(&mut self, waiters: Rc<Waiters>) {
+        self.waiters = Some(waiters);
+    }
+
+    /// Parks the running task on `waiter`.
+    ///
+    /// Port of unidbg: `AbstractEmulator.createWaiter` followed by the
+    /// `ThreadContextSwitchException` a blocking syscall raises. The task stays
+    /// out of the ready queue until something wakes the waiter, which is what
+    /// makes `pthread_join` and `pthread_cond_wait` block rather than spin.
+    pub fn park_current(&mut self, waiter: usize) {
+        if let Some(id) = self.current {
+            if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
+                task.waiter = Some(waiter);
+            }
+        }
+        self.current = None;
+    }
+
+    /// Parks a specific task, for a caller that is not inside `run`.
+    pub fn park(&mut self, id: usize, waiter: usize) {
+        if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
+            task.waiter = Some(waiter);
+        }
+    }
+
+    /// Whether any task is still parked.
+    pub fn parked(&self) -> usize {
+        self.tasks.iter().filter(|task| task.is_parked()).count()
     }
 
     /// Creates a task that will call `function` on `stack` with `args`.
@@ -132,6 +183,7 @@ impl ThreadDispatcher {
             args: args.to_vec(),
             result: None,
             state: TaskState::New,
+            waiter: None,
         });
         self.ready.push_back(id);
         id
@@ -201,7 +253,7 @@ impl ThreadDispatcher {
             let Some(id) = self.ready.pop_front() else {
                 break;
             };
-            let (state, context, stack, function, args) = {
+            let (state, context, stack, function, args, waiter) = {
                 let task = self
                     .tasks
                     .iter()
@@ -213,10 +265,28 @@ impl ThreadDispatcher {
                     task.stack,
                     task.function,
                     task.args.clone(),
+                    task.waiter,
                 )
             };
             if state == TaskState::Finished {
                 continue;
+            }
+            if let Some(waiter) = waiter {
+                // Parked: it runs again only once its waiter is woken.
+                let woken = self
+                    .waiters
+                    .as_ref()
+                    .map(|waiters| waiters.is_woken(waiter))
+                    .unwrap_or(true);
+                if !woken {
+                    continue;
+                }
+                if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
+                    task.waiter = None;
+                }
+                if let Some(waiters) = self.waiters.as_ref() {
+                    waiters.remove(waiter);
+                }
             }
 
             match state {
@@ -286,6 +356,45 @@ impl ThreadDispatcher {
                     if let Some(previous) = previous {
                         backend.context_free(previous);
                     }
+                    // A blocking syscall registered a waiter and then asked for
+                    // the switch; the dispatcher gives it to this task, which is
+                    // how the thread that parked becomes the thread that
+                    // resumes when something wakes it.
+                    if let Some(waiters) = self.waiters.as_ref() {
+                        if let Some(waiter) = waiters.claim_unclaimed(id) {
+                            if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
+                                task.waiter = Some(waiter);
+                            }
+                        }
+                        // A `FUTEX_WAKE` marks waiters woken and then yields, so
+                        // this is where the threads it woke go back on the ready
+                        // queue.
+                        let woken: Vec<usize> = self
+                            .tasks
+                            .iter()
+                            .filter(|task| {
+                                task.waiter
+                                    .map(|waiter| waiters.is_woken(waiter))
+                                    .unwrap_or(false)
+                            })
+                            .map(|task| task.id)
+                            .collect();
+                        for woken_id in woken {
+                            let waiter = self
+                                .tasks
+                                .iter_mut()
+                                .find(|task| task.id == woken_id)
+                                .and_then(|task| task.waiter.take());
+                            if let Some(waiter) = waiter {
+                                waiters.remove(waiter);
+                            }
+                            if self.tasks.iter().any(|task| task.id == woken_id)
+                                && !self.ready.contains(&woken_id)
+                            {
+                                self.ready.push_back(woken_id);
+                            }
+                        }
+                    }
                     self.switches += 1;
                     self.current = None;
                     self.ready.push_back(id);
@@ -309,6 +418,17 @@ impl ThreadDispatcher {
                 }
                 Err(error) => return Err(error),
             }
+        }
+        if self.pending() > 0 && self.parked() > 0 {
+            // Every thread is blocked on something nothing will wake. unidbg
+            // stops the emulator here; reporting it beats hanging.
+            return Err(RunError::Backend(crate::backend::BackendError::Other(
+                format!(
+                    "every thread is parked: {} of {} tasks are waiting",
+                    self.parked(),
+                    self.pending()
+                ),
+            )));
         }
         Ok(finished)
     }

@@ -589,17 +589,45 @@ impl<'a> Arm64SyscallTable<'a> {
     }
 
     fn futex(&self) -> i32 {
-        // Plan P4's contract: with no waiter machinery installed,
-        // `FUTEX_WAIT` returns `-EAGAIN` and `FUTEX_WAKE` returns the number of
-        // waiters woken, which is none. Both are the raw kernel returns, not
+        // Port of unidbg: the `FUTEX_WAIT`/`FUTEX_WAKE` arms of
+        // `AndroidSyscallHandler.futex`. Both are the raw kernel returns, not
         // `-1` with `errno` set, because that is what bionic's wrappers expect
-        // from a syscall. P7 installs the waiter machinery behind this.
+        // from a syscall. Every blocking primitive bionic has — `pthread_join`,
+        // `pthread_cond_wait`, a contended `pthread_mutex_lock` — is built on
+        // these two.
         const FUTEX_WAIT: i32 = 0;
         const FUTEX_WAKE: i32 = 1;
+        let address = self.arg_u64(0);
         let op = (self.arg_u64(1) as i32) & 0x7f;
+        let value = self.arg_u64(2) as u32;
         match op {
-            FUTEX_WAIT => -EAGAIN,
-            FUTEX_WAKE => 0,
+            FUTEX_WAIT => {
+                // `old != val` means the value changed between the guest's
+                // check and its call, so the wait is already satisfied.
+                let old = self
+                    .handler
+                    .memory()
+                    .pointer(address)
+                    .read_u32(0)
+                    .unwrap_or(u32::MAX);
+                if old != value {
+                    return -EAGAIN;
+                }
+                self.handler.waiters().wait(address);
+                // The dispatcher claims this waiter and parks the thread; the
+                // SVC dispatch raises the switch.
+                self.handler.request_switch();
+                0
+            }
+            FUTEX_WAKE => {
+                let woken = self.handler.waiters().wake(address, value as usize);
+                if woken > 0 {
+                    // unidbg yields here too, so the thread that was woken gets
+                    // to run before the waker carries on.
+                    self.handler.request_switch();
+                }
+                woken as i32
+            }
             _ => {
                 self.handler.memory().set_errno(EINVAL);
                 -EINVAL
