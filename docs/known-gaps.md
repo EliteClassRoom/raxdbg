@@ -163,11 +163,39 @@ registers that look like addresses (`r0`, `r2`, `r3`, `r4`, `r10`) are all
 libc code pointers around `0x1203fdbb`–`0x1203fdc2`, i.e. a table of function
 pointers, and `r9 = 0x12` is a small integer that would be an offset.
 
-The next step is a differential test, not more staring: run the bytes from
-`0x1202e600` to `0x1202e660` through our AArch32 adapter and through rax's own
-`A32UserCpu` on identical address spaces with this register file, and diff the
-results — that is the P1 `diff_rax_adapters` harness, and if rax's own adapter
-agrees with ours then the fault is in the guest's data, not in our loop.
+**A code hook that records every PC says the linear disassembly is wrong.**
+With a code hook over libc's range recording the last 24 program counters, the
+trace before the fault is:
+
+```
+0x1202e612 -> 0x1202e616   (+4, a 32-bit instruction at 0x612)
+0x1202e616 -> 0x1202e618   (+2)
+0x1202e618 -> 0x1202e61a   (+2)
+0x1202e61a -> 0x1202e61e   (+4)
+0x1202e61e -> 0x1202e622   (+4)
+0x1202e622 -> 0x1202e624   (+2)
+0x1202e624 -> 0x1202e626   (+2)     <- yaxpeax says 0x624 is `bne.w`, four bytes
+0x1202e626 -> 0x1202e628   (+2)
+0x1202e628 -> 0x1202e632   (+0xa, branch)
+0x1202e632 -> 0x1202e636   (+4)
+0x1202e636 <- FAULTED
+```
+
+yaxpeax, decoding linearly from `0x1202e61e`, puts a four-byte `bne.w` at
+`0x1202e624` and a two-byte `bgt` at `0x1202e634`. rax executed two-byte
+instructions at `0x624` and `0x626`, and a four-byte one at `0x632`. The two
+decoders disagree about where the instruction boundaries are, and rax's are the
+ones that actually ran — so **the "`ldr r7, [sp, 0x1c]` at `0x2e636`" above is a
+misaligned reading and must not be trusted**. Whatever faults at `0x90` is a
+different instruction than the one that linear disassembly shows there.
+
+That makes the next step a decoder comparison rather than a memory one: dump the
+raw bytes from `0x1202e620` to `0x1202e640`, decode them with both `yaxpeax-arm`
+and rax's `Decoder`/`ThumbDecoder`, and see which is right. If rax is mis-decoding
+a Thumb-2 instruction there, that is a rax bug to report or work around; if
+yaxpeax is, our disassembler is wrong for this encoding and P11's output is
+affected too. `crates/raxdbg-android/tests/arm32_parity.rs` and the code-hook
+trace above are the harness for it.
 
 ## P8 handoff: the replace hook works for a direct call
 
