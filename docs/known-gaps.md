@@ -126,13 +126,37 @@ Ruled out by experiment, so the next person does not repeat them:
   fixture's initialisers.
 * **Relocations are not the problem**: the arm32 `libc.so` resolves all of them.
 
-The remaining fault is a `NULL + 0x90` read inside arm32 bionic's initialiser
-before any relocation-sensitive code runs. The next step is to compare the
-arguments the loader passes to `DT_INIT`/`init_array` against unidbg's
-`AndroidElfLoader.callInitFunction` for the 32-bit case, and to trace which
-register is zero at the fault — `__libc_preinit` reads `__system_property_area__`
-and the auxv through pointers that a 32-bit-specific setup difference would
-leave null.
+**A real loader bug, found and fixed on the way**: `munmap_impl` errored when a
+neighbouring region was larger than what remained of the request
+(`munmap adjacent region size=0x7f000 exceeds remaining=0x8000`). unidbg's loop
+removes whole neighbours and stops as soon as the request is satisfied, so the
+last region it takes may be larger than the remainder. Erroring rejected a
+legitimate `munmap` and left the region tree inconsistent.
+
+**Where the fault stands.** With an event-memory hook dumping the register file
+at the fault, the state is:
+
+```
+FAULT addr=0x90 kind=Read
+  r0=0x1203fdc1 r1=0x2e r2=0x1203fdbb r3=0x1203fdc2 r4=0x1203fdbc
+  r5=0x5 r6=0x80 r7=0 r8=0 r9=0x12 r10=0x1203fdc1 r11=0x1 r12=0xffffffff
+  sp=0xe4fff660 lr=0x1202e613 pc=0x1202e636 cpsr=0x200b0030
+```
+
+`cpsr` says User mode with Thumb set, so the state is not the problem. The
+reported PC is libc offset `0x2e636`, which disassembles (yaxpeax, Thumb) to
+`ldr r7, [sp, 0x1c]` — and `sp + 0x1c` is `0xe4fff67c`, inside the mapped stack,
+so **the reported PC is not the instruction that faulted**: rax reports the
+fault address and a PC but not the access width, and here they disagree. The
+registers that look like addresses (`r0`, `r2`, `r3`, `r4`, `r10`) are all
+libc code pointers around `0x1203fdbb`–`0x1203fdc2`, i.e. a table of function
+pointers, and `r9 = 0x12` is a small integer that would be an offset.
+
+The next step is a differential test, not more staring: run the bytes from
+`0x1202e600` to `0x1202e660` through our AArch32 adapter and through rax's own
+`A32UserCpu` on identical address spaces with this register file, and diff the
+results — that is the P1 `diff_rax_adapters` harness, and if rax's own adapter
+agrees with ours then the fault is in the guest's data, not in our loop.
 
 ## P8 handoff: the replace hook works for a direct call
 

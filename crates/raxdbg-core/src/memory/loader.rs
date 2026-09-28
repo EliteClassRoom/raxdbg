@@ -363,18 +363,17 @@ impl Loader {
                 // The request covers this region and possibly its neighbours.
                 let mut address = start + removed.size;
                 let mut size = aligned - removed.size;
-                while size != 0 {
+                // unidbg removes whole neighbours and stops as soon as the
+                // request is satisfied, so the last region it takes may be
+                // larger than what was left to unmap. Erroring here instead
+                // rejected a legitimate `munmap` and left the region tree
+                // inconsistent, which is what broke the arm32 initialiser.
+                while size > 0 {
                     let Some(next) = self.memory_map.borrow_mut().remove(&address) else {
                         break;
                     };
-                    if next.size > size {
-                        return Err(MemoryError::Message(format!(
-                            "munmap adjacent region size={:#x} exceeds remaining={size:#x} at {address:#x}",
-                            next.size
-                        )));
-                    }
                     address += next.size;
-                    size -= next.size;
+                    size = size.saturating_sub(next.size);
                 }
                 return Ok(removed.prot.bits() as i32);
             }
