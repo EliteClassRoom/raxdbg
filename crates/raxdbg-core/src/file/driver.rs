@@ -387,6 +387,14 @@ impl StdoutFileIO {
 impl FileIO for StdoutFileIO {
     fn close(&mut self) {}
 
+    /// Every request succeeds, as unidbg's `SimpleFileIO.ioctl` answers for
+    /// `stdout`/`stderr`. That is what makes bionic's `isatty` true and its
+    /// stdio line-buffered, so a `printf("...\n")` reaches the host without an
+    /// explicit flush.
+    fn ioctl(&mut self, _request: u64, _argp: u64) -> i32 {
+        0
+    }
+
     fn write(&mut self, data: &[u8]) -> i32 {
         match self.sink.write_all(data) {
             Ok(()) => data.len() as i32,
@@ -554,6 +562,19 @@ impl StdinFileIO {
 
 impl FileIO for StdinFileIO {
     fn close(&mut self) {}
+
+    /// A terminal answers the termios requests; anything else is refused, as
+    /// the kernel would.
+    fn ioctl(&mut self, request: u64, _argp: u64) -> i32 {
+        const TCGETS: u64 = 0x5401;
+        const TCSETS: u64 = 0x5402;
+        const TCSETSW: u64 = 0x5403;
+        const TCSETSF: u64 = 0x5404;
+        match request {
+            TCGETS | TCSETS | TCSETSW | TCSETSF => 0,
+            _ => -crate::errno::ENOTTY,
+        }
+    }
 
     fn write(&mut self, _data: &[u8]) -> i32 {
         -EINVAL

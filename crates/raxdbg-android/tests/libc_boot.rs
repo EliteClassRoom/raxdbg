@@ -128,7 +128,7 @@ fn printf_writes_into_the_captured_stdout() {
         .call_function(printf.address, &[format.peer(), 42])
         .expect("printf");
 
-    assert_eq!(result, 11, "printf returns the byte count it wrote");
+    assert_eq!(result, 9, "printf returns the byte count it wrote (\"hello 42\\n\")");
     assert_eq!(emulator.stdout().contents(), "hello 42\n");
 }
 
@@ -195,9 +195,11 @@ fn getpid_and_clock_gettime_reach_the_syscall_layer() {
 #[test]
 fn system_property_get_answers_through_the_virtual_module() {
     let emulator = boot(7);
+    // unidbg's `SystemPropertyHook` replaces the symbol, so the guest's own
+    // calls land on the stub; a host-side call resolves the same way.
     let get = emulator
         .loader()
-        .find_symbol("libc.so", "__system_property_get")
+        .dlsym(0, "__system_property_get")
         .expect("__system_property_get");
 
     let key = emulator
@@ -223,14 +225,10 @@ fn system_property_get_answers_through_the_virtual_module() {
 #[test]
 fn dlopen_and_dlsym_reach_libm() {
     let emulator = boot(8);
-    let dlopen = emulator
-        .loader()
-        .find_symbol("libc.so", "dlopen")
-        .expect("dlopen");
-    let dlsym = emulator
-        .loader()
-        .find_symbol("libc.so", "dlsym")
-        .expect("dlsym");
+    // `ArmLd64` replaces the `libdl` symbols, so these are the trampolines
+    // rather than bionic's own linker entry points.
+    let dlopen = emulator.loader().dlsym(0, "dlopen").expect("dlopen");
+    let dlsym = emulator.loader().dlsym(0, "dlsym").expect("dlsym");
 
     let name = emulator.memory().write_stack_string("libm.so").expect("name");
     let handle = emulator

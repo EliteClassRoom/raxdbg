@@ -335,7 +335,12 @@ impl AndroidEmulator {
         address: u64,
         args: &[u64],
     ) -> Result<u64, EmulatorError> {
-        let sp = memory.get_stack_point() - 16;
+        // The ABI requires a 16-byte-aligned stack at a call boundary, and
+        // `write_stack_string` (which a caller uses to build arguments) aligns
+        // its own allocation to four bytes. bionic's `ldp`/`stp` take an
+        // alignment fault otherwise, which is what made `printf` fail.
+        let align = if is_64bit { 16 } else { 8 };
+        let sp = (memory.get_stack_point() - align) & !(align - 1);
         memory.set_stack_point(sp);
         let result = {
             let mut backend = backend.borrow_mut();
@@ -356,7 +361,7 @@ impl AndroidEmulator {
             };
             Ok::<u64, EmulatorError>(value)
         };
-        memory.set_stack_point(sp + 16);
+        memory.set_stack_point(sp + align);
         result
     }
 

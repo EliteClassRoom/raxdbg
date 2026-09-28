@@ -22,67 +22,32 @@ services. Highlights:
   property hook work, including a real parse of the bundled `__properties__`
   trie (`crates/raxdbg-android/tests/virtual_modules.rs`).
 
-## bionic boot: 6 of 9
+## bionic boot: green
 
-`cargo test -p raxdbg-android --test libc_boot`. Passing:
+`cargo test -p raxdbg-android --test libc_boot` — 9/9. `libc.so` maps,
+relocates, runs its `init_array`, and answers `malloc`/`free`, `strlen`,
+`memcpy`, `printf` (captured into the host sink), `getpid`, `clock_gettime`,
+`__system_property_get` (`ro.build.version.sdk` -> `"23"`) and
+`dlopen("libm.so")` + `dlsym("sin")`. Three bugs stood between the first boot
+attempt and this, each worth remembering:
 
-* `libc_loads_with_its_initialisers_run` — `libc.so` maps, relocates and runs
-  its `init_array` through the emulator's `call_function`;
-* `malloc_and_free_work_through_the_guest_libc`,
-  `malloc_through_the_memory_facade_uses_the_guest_allocator`;
-* `string_and_memory_functions_answer` (`strlen`, `memcpy`);
-* `getpid_and_clock_gettime_reach_the_syscall_layer`;
-* `the_loader_reports_no_unresolved_relocations`.
+1. **`AT_RANDOM`'s auxv value is a pointer, not the guard.** bionic's
+   `__libc_init_common` reads it and dereferences it, so `initializeTLS` must
+   write the guard slot's *address*.
+2. **SVC stub numbers belong to the SVC page.** `StubDispatch` kept its own
+   counter, so the `libdl` stubs were numbered 2, 3, 4... while the dispatch
+   looked them up in `SvcMemory`; they were never reached. Numbering now lives
+   in `SvcMemory::register_svc_numbered` alone.
+3. **A host-driven call must align the stack.** `write_stack_string` aligns to
+   four bytes, and `call_function` pushed 16 more, leaving SP 4 mod 16; bionic's
+   `ldp`/`stp` take an SP-alignment fault, which surfaced as a confusing
+   "unmapped write" inside the stack region. `call_function` now aligns to 16
+   (8 on arm32) before the call.
 
-Failing, with the reproduction:
-
-```
-cargo test -p raxdbg-android --test libc_boot printf -- --nocapture
-```
-
-### 1. `printf` and `__system_property_get` fault on a stack write
-
-`RunError::UnmappedMemory { addr: 0xe4fff704, .. }`, reported by the emulator's
-event-memory hook as an **unmapped write**. The address is inside the stack
-region, which the loader has mapped `rw` and which rax serves correctly:
-
-* `Loader::get_memory_map()` at the moment of the call lists
-  `0xe4b00000..0xe5000000 rw`;
-* `RaxBackend::mem_write(0xe4fff704, ..)` and the guest path
-  `AddressSpace::write(0xe4fff704, ..)` both succeed on a freshly mapped
-  5 MiB region in `crates/raxdbg-backend-rax` (verified with a scratch test
-  that has since been removed).
-
-Narrowed down since: the faulting call is libc's `enlarge` (offset `0x49f28`),
-whose `bl` at `0x49f30` targets the PLT entry for **`realloc`**
-(`R_AARCH64_JUMP_SLOT` at GOT `0xd86e0`). The write at `0xe4fff704` is the
-`str x0, [x19, #0x18]` at `0x49f38` — the FILE's buffer field — so `x19`, the
-`FILE*`, is `0xe4fff6ec`: a **stack address**, not `stdout` (`0x120db480`, which
-relocated correctly and reads back as `__sF[1]`).
-
-Two consequences, both worth checking first:
-
-1. **Something unmapped the stack in rax mid-call.** The region list still
-   lists `0xe4b00000..0xe5000000 rw` and a freshly mapped 5 MiB region is
-   writable end to end, so the two disagree only *during* the call. The prime
-   suspect is `Loader::munmap_impl`: it calls `guest.unmap(start, aligned)`
-   before looking at its own region tree, so one bogus guest `munmap` — from
-   bionic's allocator reacting to a bad pointer — takes the stack with it.
-2. **Whatever handed `enlarge` a stack address as a `FILE*`.** `stdout` itself
-   is fine, so the caller's frame is the thing to inspect: print `x19` and the
-   call stack at the fault (the debugger core in `raxdbg-core::debug` can
-   already do the breakpoint half).
-
-### 2. `dlopen("libm.so")` returns 0
-
-`cargo test -p raxdbg-android --test libc_boot dlopen -- --nocapture`. The
-`libdl` stub is reached (the SVC page lists `dlopen.256`), so the failure is
-inside `DlOpen::handle`: either the resolver rejects the name or
-`AndroidElfLoader::dlopen` returns `None`. Check that
-`AndroidResolver::resolve_library("libm.so")` finds
-`libs/android/sdk23/lib64/libm.so` through the *emulator's* resolver (the ELF
-loader test resolves it through a `DirectoryResolver`, which is a different
-path).
+One more, for output rather than correctness: `StdoutFileIO` must answer
+`ioctl` successfully (unidbg's `SimpleFileIO` does for `stdout`/`stderr`), or
+bionic's `isatty` is false and stdout stays block-buffered, so a `printf` with
+a newline never reaches the host.
 
 ## Not started
 
