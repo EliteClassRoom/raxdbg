@@ -7,5 +7,6 @@
 pub mod android_file;
 pub mod apk;
 pub mod elf;
+pub mod emulator;
 pub mod linux;
 pub mod syscall;

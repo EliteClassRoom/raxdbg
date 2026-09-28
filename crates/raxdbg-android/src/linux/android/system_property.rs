@@ -96,33 +96,12 @@ impl StubDispatch {
         memory: &dyn raxdbg_core::memory::Memory,
         svc: Box<dyn Svc>,
     ) -> Result<StubAddress, RegisterError> {
-        let kind = svc.kind();
-        let number = match kind {
-            SvcKind::Arm64 => {
-                let next = self.arm64_next.get() + 1;
-                self.arm64_next.set(next);
-                next
-            }
-            SvcKind::Arm => {
-                let next = self.arm_next.get() + 1;
-                self.arm_next.set(next);
-                next
-            }
-            SvcKind::Thumb => {
-                return Err(RegisterError(raxdbg_core::memory::MemoryError::Message(
-                    "Thumb stubs are not used by the property hook".into(),
-                )));
-            }
-        };
-        let bytes = kind.stub(number);
-        let label = format!("{}.{}", svc.name(), number);
-        let address = svc_memory
-            .allocate(bytes.len(), label)
+        // The stub numbers belong to the SVC page, not to this table: the run
+        // loop's dispatch looks them up there, so a stub numbered here would
+        // never be reached.
+        let (address, number) = svc_memory
+            .register_svc_numbered(memory, svc)
             .map_err(RegisterError)?;
-        memory
-            .write_bytes(address, &bytes)
-            .map_err(|error| RegisterError(error))?;
-        self.handlers.borrow_mut().insert(number, svc);
         Ok(StubAddress { address, number })
     }
 }

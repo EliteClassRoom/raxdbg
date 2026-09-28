@@ -239,11 +239,13 @@ impl AndroidElfLoader {
         program_name_pointer.write_pointer(0, program_name.peer())?;
 
         let auxv = memory.allocate_stack(0x100)?;
-        // AT_RANDOM is a pointer to 16 bytes of randomness on the stack.
+        // AT_RANDOM's *value* is a pointer to 16 bytes of randomness on the
+        // stack, which is why the guard slot's address is what goes in the
+        // array; bionic dereferences it in `__libc_init_common`.
         const AT_RANDOM: u64 = 25;
         const AT_PAGESZ: u64 = 6;
         auxv.write_pointer(0, AT_RANDOM)?;
-        auxv.write_pointer(pointer_size as u64, guard)?;
+        auxv.write_pointer(pointer_size as u64, stack_chk_guard.peer())?;
         auxv.write_pointer(pointer_size as u64 * 2, AT_PAGESZ)?;
         auxv.write_pointer(pointer_size as u64 * 3, PAGE_SIZE)?;
 

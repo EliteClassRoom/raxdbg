@@ -261,11 +261,20 @@ impl SvcMemory {
     /// Registers a call, allocating and writing its stub.
     ///
     /// Port of unidbg: `ARMSvcMemory.registerSvc`.
-    pub fn register_svc(
+    pub fn register_svc(&self, memory: &dyn Memory, svc: Box<dyn Svc>) -> Result<u64, MemoryError> {
+        self.register_svc_numbered(memory, svc).map(|(address, _)| address)
+    }
+
+    /// Registers a call, returning the stub's address and its number.
+    ///
+    /// The number is what the stub's `svc #N` carries and what the run loop's
+    /// dispatch looks up, so a caller that needs to drive the stub itself (a
+    /// test, or the debugger) must use this rather than guessing.
+    pub fn register_svc_numbered(
         &self,
         memory: &dyn Memory,
         svc: Box<dyn Svc>,
-    ) -> Result<u64, MemoryError> {
+    ) -> Result<(u64, i32), MemoryError> {
         let kind = svc.kind();
         let number = match kind {
             SvcKind::Thumb => {
@@ -323,7 +332,7 @@ impl SvcMemory {
         let address = self.allocate(code.len(), label)?;
         memory.write_bytes(address, &code)?;
         self.svc_map.borrow_mut().insert(number, svc);
-        Ok(address)
+        Ok((address, number))
     }
 
     /// Writes a NUL-terminated string into stub space.

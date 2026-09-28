@@ -674,6 +674,7 @@ dependencies = [
 name = "raxdbg-android"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "goblin 0.10.7",
  "hex",
  "log",
