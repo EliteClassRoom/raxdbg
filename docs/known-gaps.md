@@ -229,6 +229,25 @@ chain in `syscall::handler`'s resolver walk. The errno printed alongside the
 failure (2, `ENOENT`) may be stale -- it is the guest errno slot, which an
 earlier failed open would have set -- so do not treat it as the cause.
 
+**A real bug on that path, found and fixed.** Nobody called
+`UnixSyscallHandler::add_io_resolver`, so the handler's I/O chain was empty and
+*every* guest `open` of a bundled resource answered `ENOENT` --
+`/dev/__properties__`, `/proc/stat`, `/system/usr/share/zoneinfo/tzdata`.
+`AndroidResolver` is both the library resolver and the IOResolver in unidbg, and
+the emulator now shares the same object with both through
+`resolver::SharedResolver`. arm64 hid this because `__system_property_get` is
+answered by a hook; arm32's `__system_property_area_init` opens the file for
+real, which is why that ABI exposed it. `handler.resolve("/dev/__properties__")`
+answers `Success` where it answered `None`.
+
+**The initialiser still faults at `0x90` after that fix**, at the same PC, so
+there is at least one more link. The next thing to check is the guest's own
+`open` again now that the chain answers: if it still returns -1, the failure is
+between the guest's `svc` and the handler -- the arm32 number translation for
+`openat` (322) or `open` (5), or `read_path` truncating the string. If it now
+returns a descriptor, the property area is being built and the fault is later
+than it looked.
+
 That comparison has now been run (`tests/arm32_decoding.rs`, over the whole of
 libc) and the decoders agree, so this line of attack is closed. What is left is
 the fault itself: a read of `0x90` while `r0`/`r2`/`r3`/`r4`/`r10` all hold Thumb
