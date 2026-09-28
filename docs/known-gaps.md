@@ -99,6 +99,17 @@ lessons for whoever picks them up:
   carry every symbol the P6-P9 acceptance tests call; `libs/` carries both SDK
   levels. Nothing needs building to run a new test.
 
+## P6: one item is thinner than its name
+
+The plan's "VarArg/VaList" item is only half done. Arguments reach a native
+through `emulator.call_function(address, &[u64])`, which marshals registers and
+then the stack — that covers every non-variadic JNI method, which is all the
+fixture and the acceptance matrix use. What is *not* implemented is a real
+arm64 `va_list`: a variadic native that walks its arguments through
+`va_arg` would need the GPR/FPR/spill regions built at the call site. Nothing
+in the port calls one today; the work is bounded and belongs with whoever adds
+variadic JNI support.
+
 ## P9: what is done for arm32, and what the initialiser fault is not
 
 Done and tested:
