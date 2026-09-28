@@ -99,6 +99,54 @@ lessons for whoever picks them up:
   carry every symbol the P6-P9 acceptance tests call; `libs/` carries both SDK
   levels. Nothing needs building to run a new test.
 
+## P6 (JNI) handoff: the first piece is in
+
+`crates/raxdbg-android/src/dvm/hash.rs` is done and tested: the four `Hasher`
+variants (unidbg's default Java `String.hashCode`, FNV-1a, MurmurHash3 x86-32
+and xxHash32), each checked against a published vector, plus `Hashable` and the
+identity hash `DvmObject` uses. That is the foundation the rest of `dvm` is
+built on — every `jobject`/`jclass`/`jmethodID`/`jfieldID` is one of these
+hashes.
+
+The order that worked for the rest of the port, and that the remaining `dvm`
+work should follow:
+
+1. `dvm/object.rs` — `DvmObject` (type descriptor + hash), `StringObject`,
+   `NumberObject`, `BooleanObject`, `ArrayObject`, `ProxyObject`, and the three
+   reference maps (`local`/`global`/`weak`), with `delete_local_refs()` after
+   every host-driven call.
+2. `dvm/class.rs` — `DvmClass` (`natives_map`), `DvmMethod`/`DvmField` keyed by
+   `vm.hash("L<Class>;-><name><args>")`, and `find_native_function`, which
+   checks `natives_map` first and then searches the loaded modules for
+   `Java_<mangled>` (the `mangle_for_jni` rules: `_`->`_1`, `/` and `.`->`_`,
+   `;`->`_2`, `[`->`_3`, anything else `_0<hex4>`).
+3. `dvm/vararg.rs` — argument marshalling: arm64 takes `x1..x7` then the stack
+   with 16-byte alignment, arm32 takes `r1..r3` then the stack with unidbg's
+   padding rule. `call_function` in `emulator.rs` already sets `x0` and aligns
+   the stack, so this is the same shape.
+4. `dvm/jni_table.rs` — the `JNIEnv` table in the SVC page: 232 pointer-sized
+   slots, each implemented slot written with the address
+   `SvcMemory::register_svc` returns for that JNI function, and unimplemented
+   slots holding their own index as a bogus pointer (which is how unidbg makes
+   an unimplemented slot obvious). `JavaVM` is an 8-slot table with
+   `AttachCurrentThread` (4) and `GetEnv` (6).
+5. `dvm/jni.rs` — the `Jni` trait and its defaults, ported from
+   `AbstractJni`/`FallbackJni`; the fixture needs `FindClass`,
+   `GetStaticMethodID` (returning a method whose `CallStaticIntMethod` answers
+   7, which is what makes `seedPlusOne` return 8), `NewStringUTF`,
+   `GetStringUTFChars`/`ReleaseStringUTFChars`, `ExceptionCheck`, `ThrowNew`,
+   `NewGlobalRef`/`DeleteGlobalRef`/`DeleteLocalRef`, `NewObject` and
+   `CallIntMethod`.
+6. `dvm/module.rs` + `dvm/vm.rs` — `DalvikModule` (load a module into the VM)
+   and the VM that ties it together, including `JNI_OnLoad` (`0x10006`
+   expected, `0x10008` accepted, `JNI_ERR` an error) and
+   `call_static_jni_method(emulator, "add(II)I", args)`.
+
+The fixture is ready: `fixtures/prebuilt/arm64-v8a/libjnitest.so` exports
+`JNI_OnLoad` and the ten `Java_com_raxdbg_test_JniTest_*` entry points, and
+`crates/raxdbg-cli/tests/cli.rs` already asserts that a JNI signature reports
+the missing runtime, so the day `dvm` lands that assertion flips to a call.
+
 ## Not started
 
 * **P6 JNI (`dvm`)** — the fixture (`fixtures/prebuilt/arm64-v8a/libjnitest.so`)

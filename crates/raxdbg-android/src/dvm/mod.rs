@@ -1,1 +1,3 @@
-//! Placeholder: filled by the phase that owns it.
+//! The Java side of JNI: the `Jni` trait and its defaults.
+
+pub mod hash;
