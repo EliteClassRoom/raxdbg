@@ -7,11 +7,13 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use raxdbg_core::alloc::MemoryBlock;
 use raxdbg_core::backend::{
-    Backend, BackendError, BlockHook, CodeHook, ContextId, EventMemHook, HookId, InterruptHook,
-    MemoryFault, MemoryFaultKind, Prot, ReadHook, RunError, RunOutcome, UnmappedKind, WriteHook,
+    Backend, BackendError, BlockHook, CodeHook, ContextId, EventMemHook, GuestMemory, HookId,
+    InterruptHook, MemoryFault, MemoryFaultKind, Prot, ReadHook, RunError, RunOutcome,
+    UnmappedKind, WriteHook,
 };
 use raxdbg_core::memory::{
     HEAP_BASE, MAP_ANONYMOUS, MAP_FIXED, MMAP_BASE, Memory, PAGE_SIZE, STACK_BASE,
@@ -38,6 +40,88 @@ impl Region {
 }
 
 impl TestBackend {
+    /// Reads `buf`, ignoring guest permissions (raxdbg's host-side view).
+    fn read_raw(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryFault> {
+        for (index, slot) in buf.iter_mut().enumerate() {
+            let address = addr + index as u64;
+            let Some((base, region)) = self.region_at(address) else {
+                return Err(MemoryFault {
+                    addr: address,
+                    size: 1,
+                    kind: MemoryFaultKind::Unmapped,
+                });
+            };
+            *slot = region.data[(address - base) as usize];
+        }
+        Ok(())
+    }
+
+    /// Writes `data`, ignoring guest permissions.
+    fn write_raw(&mut self, addr: u64, data: &[u8]) -> Result<(), MemoryFault> {
+        for (index, byte) in data.iter().enumerate() {
+            let address = addr + index as u64;
+            let offset = self
+                .region_at(address)
+                .map(|(base, _)| (base, (address - base) as usize));
+            let Some((base, offset)) = offset else {
+                return Err(MemoryFault {
+                    addr: address,
+                    size: 1,
+                    kind: MemoryFaultKind::Unmapped,
+                });
+            };
+            self.regions
+                .get_mut(&base)
+                .expect("just found")
+                .data[offset] = *byte;
+        }
+        Ok(())
+    }
+
+    fn map(&mut self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        if addr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 || size == 0 {
+            return Err(BackendError::Map {
+                addr,
+                size,
+                reason: "misaligned or empty".into(),
+            });
+        }
+        if self
+            .regions
+            .iter()
+            .any(|(base, region)| addr < base + region.end() && addr + size > *base)
+        {
+            return Err(BackendError::Map {
+                addr,
+                size,
+                reason: "overlaps an existing mapping".into(),
+            });
+        }
+        self.regions.insert(
+            addr,
+            Region {
+                prot: perms,
+                data: vec![0u8; size as usize],
+            },
+        );
+        Ok(())
+    }
+
+    fn protect(&mut self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        for (base, region) in self.regions.iter_mut() {
+            if addr < *base + region.end() && addr + size > *base {
+                region.prot = perms;
+            }
+        }
+        Ok(())
+    }
+
+    fn unmap(&mut self, addr: u64, size: u64) -> Result<(), BackendError> {
+        self.regions
+            .retain(|base, region| !(addr < base + region.end() && addr + size > *base));
+        Ok(())
+    }
+
     fn region_at(&self, addr: u64) -> Option<(u64, &Region)> {
         self.regions
             .iter()
@@ -83,92 +167,23 @@ impl Backend for TestBackend {
     }
 
     fn mem_read_into(&self, addr: u64, buf: &mut [u8]) -> Result<(), BackendError> {
-        for (index, slot) in buf.iter_mut().enumerate() {
-            let address = addr + index as u64;
-            let Some((base, region)) = self.region_at(address) else {
-                return Err(BackendError::Memory(MemoryFault {
-                    addr: address,
-                    size: 1,
-                    kind: MemoryFaultKind::Unmapped,
-                }));
-            };
-            if !region.prot.contains(Prot::READ) {
-                return Err(BackendError::Memory(MemoryFault {
-                    addr: address,
-                    size: 1,
-                    kind: MemoryFaultKind::Permission,
-                }));
-            }
-            *slot = region.data[(address - base) as usize];
-        }
-        Ok(())
+        self.read_raw(addr, buf).map_err(BackendError::Memory)
     }
 
     fn mem_write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), BackendError> {
-        for (index, byte) in bytes.iter().enumerate() {
-            let address = addr + index as u64;
-            let Some((base, region)) = self.region_at(address) else {
-                return Err(BackendError::Memory(MemoryFault {
-                    addr: address,
-                    size: 1,
-                    kind: MemoryFaultKind::Unmapped,
-                }));
-            };
-            if !region.prot.contains(Prot::WRITE) {
-                return Err(BackendError::Memory(MemoryFault {
-                    addr: address,
-                    size: 1,
-                    kind: MemoryFaultKind::Permission,
-                }));
-            }
-            let offset = (address - base) as usize;
-            self.regions.get_mut(&base).unwrap().data[offset] = *byte;
-        }
-        Ok(())
+        self.write_raw(addr, bytes).map_err(BackendError::Memory)
     }
 
     fn mem_map(&mut self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
-        if addr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 || size == 0 {
-            return Err(BackendError::Map {
-                addr,
-                size,
-                reason: "misaligned or empty".into(),
-            });
-        }
-        if self
-            .regions
-            .iter()
-            .any(|(base, region)| addr < base + region.end() && addr + size > *base)
-        {
-            return Err(BackendError::Map {
-                addr,
-                size,
-                reason: "overlaps an existing mapping".into(),
-            });
-        }
-        self.regions.insert(
-            addr,
-            Region {
-                prot: perms,
-                data: vec![0u8; size as usize],
-            },
-        );
-        Ok(())
+        TestBackend::map(self, addr, size, perms)
     }
 
     fn mem_protect(&mut self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
-        for (base, region) in self.regions.iter_mut() {
-            if addr < *base + region.end() && addr + size > *base {
-                region.prot = perms;
-            }
-        }
-        Ok(())
+        TestBackend::protect(self, addr, size, perms)
     }
 
     fn mem_unmap(&mut self, addr: u64, size: u64) -> Result<(), BackendError> {
-        self.regions
-            .retain(|base, region| !(addr < base + region.end() && addr + size > *base));
-        Ok(())
+        TestBackend::unmap(self, addr, size)
     }
 
     fn hook_add_code(&mut self, _cb: Box<dyn CodeHook>, _begin: u64, _end: u64) -> HookId {
@@ -219,10 +234,124 @@ impl Backend for TestBackend {
     fn remove_jit_code_cache(&mut self, _begin: u64, _end: u64) {}
 }
 
-fn loader() -> (Rc<Loader>, Rc<RefCell<TestBackend>>) {
-    let backend = Rc::new(RefCell::new(TestBackend::default()));
-    let loader = Loader::new(backend.clone() as Rc<RefCell<dyn Backend>>, 8);
-    (loader, backend)
+/// A loader over a stand-in backend, plus the backend for assertions.
+///
+/// The backend is a `Backend` for the loader's register access and an
+/// `Arc<Mutex<..>>` shared with the `GuestMemory` handle, exactly the split
+/// `RaxBackend` uses.
+fn loader() -> (Rc<Loader>, Arc<parking_lot::Mutex<TestBackend>>) {
+    let space = Arc::new(parking_lot::Mutex::new(TestBackend::default()));
+    let guest: Arc<dyn GuestMemory> = Arc::new(TestMemory(Arc::clone(&space)));
+    let backend: Rc<RefCell<dyn Backend>> = Rc::new(RefCell::new(SharedBackend(Arc::clone(&space))));
+    (Loader::new(backend, guest, 8), space)
+}
+
+/// The `Backend` half: every memory call goes to the shared space.
+struct SharedBackend(Arc<parking_lot::Mutex<TestBackend>>);
+
+impl Backend for SharedBackend {
+    fn on_initialize(&mut self) {}
+    fn switch_user_mode(&mut self) {}
+    fn enable_vfp(&mut self) {}
+    fn reg_read(&self, reg: RegId) -> Result<u64, BackendError> {
+        self.0.lock().reg_read(reg)
+    }
+    fn reg_write(&mut self, reg: RegId, value: u64) -> Result<(), BackendError> {
+        self.0.lock().reg_write(reg, value)
+    }
+    fn reg_read_vector(&self, reg: RegId) -> Result<[u8; 16], BackendError> {
+        Err(BackendError::UnsupportedRegister(reg))
+    }
+    fn reg_write_vector(&mut self, reg: RegId, _v: [u8; 16]) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedRegister(reg))
+    }
+    fn mem_read(&self, addr: u64, size: usize) -> Result<Vec<u8>, BackendError> {
+        let mut buf = vec![0u8; size];
+        self.mem_read_into(addr, &mut buf)?;
+        Ok(buf)
+    }
+    fn mem_read_into(&self, addr: u64, buf: &mut [u8]) -> Result<(), BackendError> {
+        self.0.lock().read_raw(addr, buf).map_err(BackendError::Memory)
+    }
+    fn mem_write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), BackendError> {
+        self.0.lock().write_raw(addr, bytes).map_err(BackendError::Memory)
+    }
+    fn mem_map(&mut self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        TestBackend::map(&mut self.0.lock(), addr, size, perms)
+    }
+    fn mem_protect(&mut self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        TestBackend::protect(&mut self.0.lock(), addr, size, perms)
+    }
+    fn mem_unmap(&mut self, addr: u64, size: u64) -> Result<(), BackendError> {
+        TestBackend::unmap(&mut self.0.lock(), addr, size)
+    }
+    fn hook_add_code(&mut self, _cb: Box<dyn CodeHook>, _b: u64, _e: u64) -> HookId {
+        0
+    }
+    fn hook_add_block(&mut self, _cb: Box<dyn BlockHook>, _b: u64, _e: u64) -> HookId {
+        0
+    }
+    fn hook_add_read(&mut self, _cb: Box<dyn ReadHook + Send>, _b: u64, _e: u64) -> HookId {
+        0
+    }
+    fn hook_add_write(&mut self, _cb: Box<dyn WriteHook + Send>, _b: u64, _e: u64) -> HookId {
+        0
+    }
+    fn hook_add_event_mem(&mut self, _cb: Box<dyn EventMemHook>, _k: UnmappedKind) -> HookId {
+        0
+    }
+    fn hook_add_interrupt(&mut self, _cb: Box<dyn InterruptHook>) -> HookId {
+        0
+    }
+    fn hook_del(&mut self, _id: HookId) {}
+    fn emu_start(
+        &mut self,
+        _b: u64,
+        _u: u64,
+        _t: u64,
+        _c: u64,
+    ) -> Result<RunOutcome, RunError> {
+        Ok(RunOutcome::Stopped)
+    }
+    fn emu_stop(&mut self) {}
+    fn set_pending_error(&mut self, _error: RunError) {}
+    fn take_pending_error(&mut self) -> Option<RunError> {
+        None
+    }
+    fn is_running(&self) -> bool {
+        false
+    }
+    fn context_save(&mut self) -> ContextId {
+        0
+    }
+    fn context_restore(&mut self, _id: ContextId) {}
+    fn context_free(&mut self, _id: ContextId) {}
+    fn page_size(&self) -> usize {
+        PAGE_SIZE as usize
+    }
+    fn remove_jit_code_cache(&mut self, _b: u64, _e: u64) {}
+}
+
+/// The address-space half of the test backend, shared with the loader the way
+/// `RaxBackend::guest_memory` shares rax's.
+struct TestMemory(Arc<parking_lot::Mutex<TestBackend>>);
+
+impl GuestMemory for TestMemory {
+    fn read_raw(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryFault> {
+        self.0.lock().read_raw(addr, buf)
+    }
+    fn write_raw(&self, addr: u64, data: &[u8]) -> Result<(), MemoryFault> {
+        self.0.lock().write_raw(addr, data)
+    }
+    fn map(&self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        TestBackend::map(&mut self.0.lock(), addr, size, perms)
+    }
+    fn protect(&self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        TestBackend::protect(&mut self.0.lock(), addr, size, perms)
+    }
+    fn unmap(&self, addr: u64, size: u64) -> Result<(), BackendError> {
+        TestBackend::unmap(&mut self.0.lock(), addr, size)
+    }
 }
 
 #[test]
@@ -300,7 +429,7 @@ fn mprotect_splits_the_region_tree() {
     assert_eq!(regions[0].prot, Prot::READ);
     assert_eq!(regions[2].prot, Prot::READ);
     // A write into the protected page fails.
-    assert!(backend.borrow().mem_read(base, 1).is_ok());
+    assert!(backend.lock().mem_read(base, 1).is_ok());
     assert!(
         loader
             .write_bytes(base + 0x1000, &[1])
@@ -418,12 +547,12 @@ fn stack_allocation_moves_the_stack_pointer_and_the_guest_register() {
         .unwrap();
     loader.set_stack_point(STACK_BASE);
     assert_eq!(loader.get_stack_base(), STACK_BASE);
-    assert_eq!(backend.borrow().sp, STACK_BASE);
+    assert_eq!(backend.lock().sp, STACK_BASE);
 
     let pointer = loader.allocate_stack(0x100).unwrap();
     assert_eq!(pointer.peer(), STACK_BASE - 0x100);
     assert_eq!(loader.get_stack_point(), STACK_BASE - 0x100);
-    assert_eq!(backend.borrow().sp, STACK_BASE - 0x100);
+    assert_eq!(backend.lock().sp, STACK_BASE - 0x100);
 
     let string = loader.write_stack_string("abc").unwrap();
     assert_eq!(string.peer(), STACK_BASE - 0x100 - 4);

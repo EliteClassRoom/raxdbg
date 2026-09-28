@@ -18,7 +18,7 @@ use std::rc::Rc;
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 use goblin::elf::{Elf, dynamic, header};
 
-use raxdbg_core::backend::{Backend, Prot};
+use raxdbg_core::backend::{Backend, GuestMemory, Prot};
 use raxdbg_core::hook::HookListener;
 use raxdbg_core::memory::loader::{Loader, align, align_size};
 use raxdbg_core::memory::{
@@ -172,12 +172,13 @@ impl AndroidElfLoader {
     /// `AndroidElfLoader` constructor does.
     pub fn new(
         backend: Rc<RefCell<dyn Backend>>,
+        guest: std::sync::Arc<dyn GuestMemory>,
         is_64bit: bool,
         process_name: &str,
         seed: u64,
     ) -> Result<Rc<Self>, ElfError> {
         let pointer_size = if is_64bit { 8 } else { 4 };
-        let memory = Loader::new(Rc::clone(&backend), pointer_size);
+        let memory = Loader::new(Rc::clone(&backend), guest, pointer_size);
         let loader = Rc::new(AndroidElfLoader {
             memory,
             backend,

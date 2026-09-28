@@ -8,11 +8,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use std::rc::Weak;
 
 use crate::alloc::{GuestCall, MemoryBlock, MemoryTracker};
-use crate::backend::{Backend, Prot};
+use crate::backend::{Backend, BackendError, GuestMemory, Prot};
 use crate::memory::{
     HEAP_BASE, MAP_ANONYMOUS, MAP_FAILED, MAP_FIXED, MAX_THREADS, MMAP_BASE, MMapListener, Memory,
     MemoryError, MemoryMap, PAGE_SIZE,
@@ -59,6 +60,8 @@ pub(crate) struct LibcAllocator {
 /// indices and `errno`.
 pub struct Loader {
     pub(crate) backend: Rc<RefCell<dyn Backend>>,
+    /// The address space, reachable without borrowing the backend.
+    pub(crate) guest: Arc<dyn GuestMemory>,
     pub(crate) pointer_size: usize,
     pub(crate) page_size: u64,
     pub(crate) memory_map: RefCell<BTreeMap<u64, MemoryMap>>,
@@ -97,9 +100,14 @@ impl Loader {
     ///
     /// The loader is returned inside an `Rc` because every [`Pointer`] it hands
     /// out keeps a strong handle to it.
-    pub fn new(backend: Rc<RefCell<dyn Backend>>, pointer_size: usize) -> Rc<Self> {
+    pub fn new(
+        backend: Rc<RefCell<dyn Backend>>,
+        guest: Arc<dyn GuestMemory>,
+        pointer_size: usize,
+    ) -> Rc<Self> {
         Rc::new_cyclic(|self_ref| Loader {
             backend,
+            guest,
             pointer_size,
             page_size: PAGE_SIZE,
             memory_map: RefCell::new(BTreeMap::new()),
@@ -126,9 +134,14 @@ impl Loader {
             .expect("a loader is kept alive by the Rc it was created in")
     }
 
-    /// The backend this loader maps through.
+    /// The backend this loader maps through, for register access.
     pub fn backend(&self) -> &Rc<RefCell<dyn Backend>> {
         &self.backend
+    }
+
+    /// The address space, reachable without borrowing the backend.
+    pub fn guest_memory(&self) -> &Arc<dyn GuestMemory> {
+        &self.guest
     }
 
     /// Registers the guest libc's `malloc`/`free` so `Memory::malloc(len,
@@ -227,7 +240,7 @@ impl Loader {
         size: u64,
         prot: Prot,
     ) -> Result<(), MemoryError> {
-        self.backend.borrow_mut().mem_map(address, size, prot)?;
+        self.guest.map(address, size, prot)?;
         if let Some(listener) = self.listener.borrow().as_ref() {
             listener.on_map(address, size, prot);
         }
@@ -314,7 +327,7 @@ impl Loader {
     /// Port of unidbg: `AbstractLoader.munmap`.
     pub fn munmap_impl(&self, start: u64, length: usize) -> Result<i32, MemoryError> {
         let aligned = align_size(length as u64, self.page_size);
-        self.backend.borrow_mut().mem_unmap(start, aligned)?;
+        self.guest.unmap(start, aligned)?;
         if let Some(listener) = self.listener.borrow().as_ref() {
             listener.on_unmap(start, aligned);
         }
@@ -396,7 +409,7 @@ impl Loader {
             Some(listener) => listener.on_protect(address, aligned, prot),
             None => prot,
         };
-        self.backend.borrow_mut().mem_protect(address, aligned, prot)?;
+        self.guest.protect(address, aligned, prot)?;
 
         let prot_end = address + aligned;
         let affected: Vec<MemoryMap> = self
@@ -456,9 +469,7 @@ impl Loader {
         if address > current {
             self.map_region(current, address - current, Prot::READ.union(Prot::WRITE))?;
         } else if address < current {
-            self.backend
-                .borrow_mut()
-                .mem_unmap(address, current - address)?;
+            self.guest.unmap(address, current - address)?;
             if let Some(listener) = self.listener.borrow().as_ref() {
                 listener.on_unmap(address, current - address);
             }
@@ -534,17 +545,15 @@ impl Memory for Loader {
     }
 
     fn read_bytes(&self, address: u64, buf: &mut [u8]) -> Result<(), MemoryError> {
-        self.backend
-            .borrow()
-            .mem_read_into(address, buf)
-            .map_err(MemoryError::from)
+        self.guest
+            .read_raw(address, buf)
+            .map_err(|fault| MemoryError::Backend(BackendError::Memory(fault)))
     }
 
     fn write_bytes(&self, address: u64, data: &[u8]) -> Result<(), MemoryError> {
-        self.backend
-            .borrow_mut()
-            .mem_write(address, data)
-            .map_err(MemoryError::from)
+        self.guest
+            .write_raw(address, data)
+            .map_err(|fault| MemoryError::Backend(BackendError::Memory(fault)))
     }
 
     fn mmap(&self, length: usize, prot: Prot) -> Result<Pointer, MemoryError> {

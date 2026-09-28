@@ -262,6 +262,26 @@ impl fmt::Display for UnmappedKind {
     }
 }
 
+/// Host-side access to guest memory that does not borrow the backend.
+///
+/// A syscall handler runs with the backend already mutably borrowed by the run
+/// loop (plan P2.6), so it cannot reach memory through
+/// [`Backend::mem_read`]/[`Backend::mem_write`]: that would be a second borrow
+/// of the same cell. The address space itself is shared (`Arc` inside rax) and
+/// has no such restriction, so the loader holds one of these instead.
+pub trait GuestMemory: Send + Sync {
+    /// Reads `buf.len()` bytes, ignoring guest permissions.
+    fn read_raw(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryFault>;
+    /// Writes `data`, ignoring guest permissions.
+    fn write_raw(&self, addr: u64, data: &[u8]) -> Result<(), MemoryFault>;
+    /// Maps `[addr, addr + size)`.
+    fn map(&self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError>;
+    /// Changes the protection of `[addr, addr + size)`.
+    fn protect(&self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError>;
+    /// Unmaps `[addr, addr + size)`.
+    fn unmap(&self, addr: u64, size: u64) -> Result<(), BackendError>;
+}
+
 /// Guest memory as seen by a [`MemHookCtx`].
 pub trait GuestMemoryAccess {
     /// Reads `buf.len()` bytes from `addr`.

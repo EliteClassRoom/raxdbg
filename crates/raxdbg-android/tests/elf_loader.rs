@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use raxdbg_backend_rax::RaxBackend;
-use raxdbg_core::backend::Backend;
+use raxdbg_core::backend::{Backend, GuestMemory};
 use raxdbg_core::memory::Memory;
 use raxdbg_core::reg::RegId;
 use std::collections::BTreeMap;
@@ -25,12 +25,17 @@ use synthetic::{
     SHN_UNDEF, TYPE_FUNC, TYPE_OBJECT,
 };
 
-fn new_backend() -> Rc<RefCell<dyn Backend>> {
-    Rc::new(RefCell::new(RaxBackend::new_arm64(RaxBackend::default_space())))
+/// A backend plus the borrow-free handle to its address space that the loader
+/// needs (plan P2.6).
+fn new_backend() -> (Rc<RefCell<dyn Backend>>, std::sync::Arc<dyn GuestMemory>) {
+    let backend = RaxBackend::new_arm64(RaxBackend::default_space());
+    let guest = backend.guest_memory();
+    (Rc::new(RefCell::new(backend)), guest)
 }
 
 fn new_loader(seed: u64) -> Rc<AndroidElfLoader> {
-    AndroidElfLoader::new(new_backend(), true, "raxdbg", seed).expect("loader")
+    let (backend, guest) = new_backend();
+    AndroidElfLoader::new(backend, guest, true, "raxdbg", seed).expect("loader")
 }
 
 /// Resolves library names from an in-memory table, so a test can supply a

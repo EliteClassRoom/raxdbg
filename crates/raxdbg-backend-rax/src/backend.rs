@@ -12,9 +12,9 @@ use std::sync::Arc;
 use rax::user::cpu::Isa;
 use rax::user::mm::{AddressSpace, Mapping};
 use raxdbg_core::backend::{
-    Backend, BackendError, BlockHook, CodeHook, ContextId, EventMemHook, GuestMemoryAccess,
-    HookId, InterruptHook, MemoryFault, Prot, ReadHook, RunError, RunOutcome, UnmappedKind,
-    WriteHook,
+    Backend, BackendError, BlockHook, CodeHook, ContextId, EventMemHook, GuestMemory,
+    GuestMemoryAccess, HookId, InterruptHook, MemoryFault, Prot, ReadHook, RunError, RunOutcome,
+    UnmappedKind, WriteHook,
 };
 use raxdbg_core::reg::RegId;
 
@@ -137,6 +137,16 @@ impl RaxBackend {
         self.shared.space()
     }
 
+    /// A handle to the address space that does not borrow the backend.
+    ///
+    /// The loader holds one of these so a syscall handler can reach guest
+    /// memory while the run loop has the backend mutably borrowed (plan P2.6).
+    pub fn guest_memory(&self) -> Arc<dyn GuestMemory> {
+        Arc::new(SpaceHandle {
+            space: self.shared.space().clone(),
+        })
+    }
+
     /// The shared memory bridge, for hooks that need the same stop flag.
     pub fn shared(&self) -> &Arc<MemShared> {
         &self.shared
@@ -217,6 +227,53 @@ impl RaxBackend {
         }
         self.hooks.cpu().restore_event_hooks(taken);
         handled
+    }
+}
+
+/// The address space behind an `Arc`, so it can be shared with the loader.
+struct SpaceHandle {
+    space: AddressSpace,
+}
+
+impl GuestMemory for SpaceHandle {
+    fn read_raw(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryFault> {
+        self.space
+            .read_raw(addr, buf)
+            .map_err(|fault| memory_fault(fault, buf.len()))
+    }
+
+    fn write_raw(&self, addr: u64, data: &[u8]) -> Result<(), MemoryFault> {
+        self.space
+            .write_raw(addr, data)
+            .map_err(|fault| memory_fault(fault, data.len()))
+    }
+
+    fn map(&self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        self.space
+            .map(addr, size, Mapping::anonymous(perms_of(perms)))
+            .map_err(|e| BackendError::Map {
+                addr,
+                size,
+                reason: e.to_string(),
+            })
+    }
+
+    fn protect(&self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        self.space
+            .protect(addr, size, perms_of(perms))
+            .map_err(|e| BackendError::Map {
+                addr,
+                size,
+                reason: e.to_string(),
+            })
+    }
+
+    fn unmap(&self, addr: u64, size: u64) -> Result<(), BackendError> {
+        self.space.unmap(addr, size).map_err(|e| BackendError::Map {
+            addr,
+            size,
+            reason: e.to_string(),
+        })
     }
 }
 

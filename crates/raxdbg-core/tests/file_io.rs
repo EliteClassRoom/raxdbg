@@ -19,6 +19,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::rc::Rc;
 use raxdbg_core::backend::{
+    GuestMemory,
     Backend, BackendError, BlockHook, CodeHook, ContextId, EventMemHook, HookId, InterruptHook,
     MemoryFault, MemoryFaultKind, Prot, ReadHook, RunError, RunOutcome, UnmappedKind, WriteHook,
 };
@@ -232,9 +233,100 @@ impl Backend for TestBackend {
     fn remove_jit_code_cache(&mut self, _begin: u64, _end: u64) {}
 }
 
+/// The address-space half of the test backend, shared with the loader the way
+/// `RaxBackend::guest_memory` shares rax's.
+///
+/// It keeps its own region map because `Loader` holds it behind an
+/// `Arc<dyn GuestMemory>`, which must be `Send + Sync`, and the test's
+/// `Backend` is a plain `Rc<RefCell<..>>`.
+#[derive(Default)]
+struct TestMemory {
+    regions: parking_lot::Mutex<BTreeMap<u64, Region>>,
+}
+
+impl TestMemory {
+    fn region_at(&self, addr: u64) -> Option<(u64, u64)> {
+        self.regions
+            .lock()
+            .iter()
+            .find(|(base, region)| addr >= **base && addr < **base + region.end())
+            .map(|(base, region)| (*base, region.data.len() as u64))
+    }
+}
+
+impl GuestMemory for TestMemory {
+    fn read_raw(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryFault> {
+        let regions = self.regions.lock();
+        for (index, slot) in buf.iter_mut().enumerate() {
+            let address = addr + index as u64;
+            let Some((base, region)) = regions
+                .iter()
+                .find(|(base, region)| address >= **base && address < **base + region.end())
+            else {
+                return Err(MemoryFault {
+                    addr: address,
+                    size: 1,
+                    kind: MemoryFaultKind::Unmapped,
+                });
+            };
+            *slot = region.data[(address - base) as usize];
+        }
+        Ok(())
+    }
+
+    fn write_raw(&self, addr: u64, data: &[u8]) -> Result<(), MemoryFault> {
+        let mut regions = self.regions.lock();
+        for (index, byte) in data.iter().enumerate() {
+            let address = addr + index as u64;
+            let found = regions
+                .iter()
+                .find(|(base, region)| address >= **base && address < **base + region.end())
+                .map(|(base, _)| *base);
+            let Some(base) = found else {
+                return Err(MemoryFault {
+                    addr: address,
+                    size: 1,
+                    kind: MemoryFaultKind::Unmapped,
+                });
+            };
+            let offset = (address - base) as usize;
+            regions.get_mut(&base).expect("just found").data[offset] = *byte;
+        }
+        Ok(())
+    }
+
+    fn map(&self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        self.regions.lock().insert(
+            addr,
+            Region {
+                prot: perms,
+                data: vec![0u8; size as usize],
+            },
+        );
+        Ok(())
+    }
+
+    fn protect(&self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
+        for (base, region) in self.regions.lock().iter_mut() {
+            if addr < *base + region.end() && addr + size > *base {
+                region.prot = perms;
+            }
+        }
+        Ok(())
+    }
+
+    fn unmap(&self, addr: u64, size: u64) -> Result<(), BackendError> {
+        self.regions
+            .lock()
+            .retain(|base, region| !(addr < base + region.end() && addr + size > *base));
+        Ok(())
+    }
+}
+
 fn loader() -> Rc<Loader> {
     let backend = Rc::new(RefCell::new(TestBackend::default()));
-    Loader::new(backend as Rc<RefCell<dyn Backend>>, 8)
+    let guest: std::sync::Arc<dyn GuestMemory> = std::sync::Arc::new(TestMemory::default());
+    Loader::new(backend as Rc<RefCell<dyn Backend>>, guest, 8)
 }
 
 
