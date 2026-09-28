@@ -1,0 +1,298 @@
+//! Shared memory objects: the host files behind shared mappings.
+//!
+//! A shared mapping's pages are not copies. The frame arena attaches the
+//! host object itself, in extents, with a host `MAP_SHARED` mapping laid
+//! over the arena (see [`FrameArena::attach`](super::FrameArena::attach)),
+//! so the guest's stores reach the host page cache: the file sees them,
+//! `read` and `write` and every other mapping of the object agree with the
+//! mapping, and a forked process shares the pages as a Linux child does.
+//! Anonymous shared memory (`MAP_SHARED | MAP_ANONYMOUS`, a shared mapping
+//! of `/dev/zero`) is an object of its own: a Linux `memfd`, or an unlinked
+//! temporary file on other hosts, as Linux backs it with a `shmem` file.
+
+use std::fmt;
+
+use super::backing::SourceIdentity;
+
+/// A host object backing shared mappings.
+pub struct SharedObject {
+    file: super::mapped_file::MappedFile,
+    identity: SourceIdentity,
+    writable: bool,
+    anonymous: bool,
+    /// The System V segment it is, by identifier.
+    sysv: Option<i32>,
+    /// A size fixed at creation that the host maps no further than (a
+    /// Darwin POSIX shared memory object's).
+    limit: Option<u64>,
+}
+
+impl fmt::Debug for SharedObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedObject")
+            .field("identity", &self.identity)
+            .field("writable", &self.writable)
+            .field("anonymous", &self.anonymous)
+            .field("sysv", &self.sysv)
+            .finish()
+    }
+}
+
+fn identity_of(file: &std::fs::File) -> std::io::Result<SourceIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        Ok(SourceIdentity {
+            dev: m.dev(),
+            ino: m.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(SourceIdentity::default())
+    }
+}
+
+impl SharedObject {
+    /// A host file, mapped for writing when `writable` (the file must then
+    /// be open for reading and writing).
+    pub fn file(file: std::fs::File, writable: bool) -> std::io::Result<Self> {
+        Self::file_keeping(file, writable, None)
+    }
+
+    /// [`SharedObject::file`], keeping `keep` while it lives.
+    pub fn file_keeping(
+        file: std::fs::File,
+        writable: bool,
+        keep: Option<super::Keep>,
+    ) -> std::io::Result<Self> {
+        Ok(SharedObject {
+            identity: identity_of(&file)?,
+            file: super::mapped_file::MappedFile::keeping(file, keep),
+            writable,
+            anonymous: false,
+            sysv: None,
+            limit: None,
+        })
+    }
+
+    /// The host file of System V shared memory segment `id` (a shmem
+    /// object, as `/proc/<pid>/maps` shows it).
+    pub fn sysv(file: std::fs::File, writable: bool, id: i32) -> std::io::Result<Self> {
+        Ok(SharedObject {
+            identity: identity_of(&file)?,
+            file: super::mapped_file::MappedFile::new(file),
+            writable,
+            anonymous: true,
+            sysv: Some(id),
+            limit: None,
+        })
+    }
+
+    /// The System V segment it is, by identifier.
+    pub fn sysv_id(&self) -> Option<i32> {
+        self.sysv
+    }
+
+    /// A new anonymous object of `len` bytes, zero-filled
+    /// (`shmem_zero_setup`).
+    pub fn anonymous(len: u64) -> std::io::Result<Self> {
+        let file = anonymous_file()?;
+        file.set_len(len)?;
+        Ok(SharedObject {
+            identity: identity_of(&file)?,
+            file: super::mapped_file::MappedFile::new(file),
+            writable: true,
+            anonymous: true,
+            sysv: None,
+            limit: None,
+        })
+    }
+
+    /// A host object of fixed size `len` whose device and inode do not
+    /// identify it (a Darwin POSIX shared memory object reports zero for
+    /// both): it gets an identity of its own, so that its extents are never
+    /// taken for another object's, and is mapped no further than `len`
+    /// rounded up to a host page.
+    pub fn fixed(file: std::fs::File, writable: bool, len: u64) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        SharedObject {
+            identity: SourceIdentity {
+                dev: u64::MAX,
+                ino: NEXT.fetch_add(1, Ordering::Relaxed),
+            },
+            file: super::mapped_file::MappedFile::new(file),
+            writable,
+            anonymous: false,
+            sysv: None,
+            limit: Some(len),
+        }
+    }
+
+    /// How many bytes of the object from `start` (an extent's first byte)
+    /// the host maps: an extent's worth, or up to the end of a fixed-size
+    /// object rounded to a host page.
+    pub fn extent_len(&self, start: u64, extent: u64, host_page: u64) -> u64 {
+        match self.limit {
+            None => extent,
+            Some(len) => len
+                .saturating_sub(start)
+                .div_ceil(host_page)
+                .saturating_mul(host_page)
+                .min(extent),
+        }
+    }
+
+    /// Current size in bytes.
+    pub fn len(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Whether the object is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Device and inode, which also identify the object among others.
+    pub fn identity(&self) -> SourceIdentity {
+        self.identity
+    }
+
+    /// Whether mappings of it may be written.
+    pub fn writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Whether it is anonymous shared memory.
+    pub fn is_anonymous(&self) -> bool {
+        self.anonymous
+    }
+
+    /// The host file.
+    pub fn host_file(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// Zeroes `len` bytes from `offset`, within the object's size (a hole
+    /// punched with the size kept, as readers see it).
+    pub fn zero_range(&self, offset: u64, len: u64) -> std::io::Result<()> {
+        let end = offset.saturating_add(len).min(self.len());
+        let zeros = vec![0u8; 64 << 10];
+        let mut at = offset;
+        while at < end {
+            let n = ((end - at) as usize).min(zeros.len());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                self.file.write_all_at(&zeros[..n], at)?;
+            }
+            at += n as u64;
+        }
+        Ok(())
+    }
+
+    /// Reads up to `buf.len()` bytes at `offset` (short only at the end).
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let mut done = 0;
+            while done < buf.len() {
+                let n = self.file.read_at(&mut buf[done..], offset + done as u64)?;
+                if n == 0 {
+                    break;
+                }
+                done += n;
+            }
+            Ok(done)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (offset, buf);
+            Ok(0)
+        }
+    }
+}
+
+/// A new, empty, nameless host file: a `memfd` on Linux, an unlinked
+/// temporary file elsewhere.
+pub fn anonymous_file() -> std::io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+        // The raw system call, not glibc's wrapper: `memfd_create(3)` only
+        // exists from glibc 2.27, and older sysroots (the `cross` images'
+        // glibc) cannot link it. A kernel before 3.17 answers ENOSYS and
+        // the temporary file below stands in.
+        // SAFETY: memfd_create takes a NUL-terminated name and flags and
+        // returns a new descriptor this function then owns; the name is a
+        // static C string and outlives the call.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                c"rax-shmem".as_ptr(),
+                libc::MFD_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: `fd` is a fresh descriptor owned by nobody else, and
+            // a descriptor fits in a `c_int`.
+            return Ok(unsafe { std::fs::File::from_raw_fd(fd as libc::c_int) });
+        }
+    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let path = std::env::temp_dir().join(format!(
+            "rax-shmem-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_CLOEXEC);
+        }
+        match opts.open(&path) {
+            Ok(f) => {
+                std::fs::remove_file(&path)?;
+                return Ok(f);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp() -> std::fs::File {
+        let f = anonymous_file().unwrap();
+        f.set_len(3 * 4096).unwrap();
+        f
+    }
+
+    #[test]
+    fn fixed_objects_map_to_their_end_and_have_their_own_identity() {
+        let extent = 256 << 10;
+        let a = SharedObject::fixed(temp(), true, 5000);
+        let b = SharedObject::fixed(temp(), true, 5000);
+        assert_ne!(a.identity(), b.identity());
+        // 5000 bytes round up to two 4 KiB pages or one 16 KiB page.
+        assert_eq!(a.extent_len(0, extent, 4096), 8192);
+        assert_eq!(a.extent_len(0, extent, 16384), 16384);
+        assert_eq!(a.extent_len(extent, extent, 4096), 0);
+        let big = SharedObject::fixed(temp(), true, 3 * extent);
+        assert_eq!(big.extent_len(extent, extent, 4096), extent);
+        // An object that can grow maps whole extents.
+        let file = SharedObject::file(temp(), true).unwrap();
+        assert_eq!(file.extent_len(0, extent, 4096), extent);
+    }
+}

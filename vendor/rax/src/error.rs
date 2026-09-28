@@ -1,0 +1,54 @@
+#[path = "error_memory.rs"]
+mod memory;
+pub use memory::{GuestMemoryFault, MemoryAccessKind, MemoryFaultKind};
+
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "x86_64"))]
+    #[error("KVM error: {0}")]
+    Kvm(#[from] kvm_ioctls::Error),
+    #[error("Linux loader error: {0}")]
+    LinuxLoader(#[from] linux_loader::loader::Error),
+    #[error("Linux boot config error: {0}")]
+    LinuxBoot(#[from] linux_loader::configurator::Error),
+    #[error("Guest memory error: {0}")]
+    GuestMemory(#[from] vm_memory::GuestMemoryError),
+    #[error("Guest memory creation error: {0}")]
+    GuestMemoryCreate(#[from] vm_memory::mmap::FromRangesError),
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+    #[error("Device port range overlaps existing device: base=0x{base:x}, len=0x{len:x}")]
+    DeviceOverlap { base: u16, len: u16 },
+    #[error("Device MMIO range overlaps existing device: base=0x{base:x}, len=0x{len:x}")]
+    MmioOverlap { base: u64, len: u64 },
+    #[error("No device mapped for port=0x{port:x}, size={size}")]
+    DeviceNotFound { port: u16, size: u8 },
+    #[error("Kernel load error: {0}")]
+    KernelLoad(String),
+    #[error("Emulator error: {0}")]
+    GuestAccess(#[from] GuestMemoryFault),
+    #[error("invalid instruction at {pc:#x}: {diagnosis}")]
+    InvalidInstruction { pc: u64, diagnosis: String },
+    #[error("Emulator error: {diagnosis}")]
+    FaultDelivery {
+        fault: Box<Error>,
+        diagnosis: String,
+    },
+    #[error("Emulator error: {0}")]
+    Emulator(String),
+    #[error("Page fault at vaddr {vaddr:#x} (error_code={error_code:#x})")]
+    PageFault { vaddr: u64, error_code: u64 },
+    #[error("General protection fault (error_code={error_code:#x})")]
+    GeneralProtection { error_code: u64 },
+    /// An exception or software interrupt was reported to a user-mode
+    /// embedder instead of being delivered through guest descriptor tables.
+    /// The instruction did not retire; the vCPU records the full event.
+    #[error("guest event vector {vector} reported to the user-mode embedder")]
+    GuestEvent { vector: u8 },
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

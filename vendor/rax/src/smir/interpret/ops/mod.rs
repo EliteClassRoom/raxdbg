@@ -1,0 +1,31 @@
+//! execute_op dispatch groups
+
+mod arithmetic;
+mod avx10;
+mod binary;
+mod bit;
+mod data_movement;
+mod far_return;
+mod flags;
+mod fp;
+mod fp_compare;
+mod logic;
+mod memory;
+mod meta;
+mod opmask;
+mod scalar_fp_convert;
+mod scalar_fp_to_int;
+mod scalar_int_to_fp;
+mod shift;
+mod simd;
+mod sse4a;
+mod system;
+mod system_selector;
+mod unary;
+mod vector_compare;
+mod x86_alignment;
+mod x86_enter;
+mod x86_invpcid;
+mod x86_leave;
+mod x86_stack_flags;
+mod xop;

@@ -1,0 +1,558 @@
+//! Shared single-pass grouping and fail-closed semantic-shape validation for
+//! exact x86 source-byte replay.
+
+use std::collections::HashMap;
+
+use super::classifiers;
+use super::{X86InstructionBytes, X86NativeReplaySpan};
+use crate::smir::ir::ops::OpKind;
+use crate::smir::ir::types::{BlockId, GuestAddr, VReg};
+use crate::smir::ir::{SmirBlock, Terminator};
+
+fn count_virtual(map: &mut HashMap<VReg, usize>, reg: VReg) {
+    if matches!(reg, VReg::Virtual(_)) {
+        *map.entry(reg).or_insert(0) += 1;
+    }
+}
+
+/// Count every virtual definition and use visible to this basic block. Replay
+/// classifiers use these counts to prove that an elided temporary cannot
+/// escape its exact semantic group through another operation, a phi, or the
+/// terminator. Construction is O(N + P + T) time and O(V) space for N
+/// operations, P phi operands, T terminator operands, and V virtual registers.
+fn block_virtual_definition_use_counts(
+    block: &SmirBlock,
+) -> (HashMap<VReg, usize>, HashMap<VReg, usize>) {
+    let mut definitions = HashMap::new();
+    let mut uses = HashMap::new();
+    for phi in &block.phis {
+        count_virtual(&mut definitions, phi.dst);
+        for (_, source) in &phi.sources {
+            count_virtual(&mut uses, *source);
+        }
+    }
+    for op in &block.ops {
+        for destination in op.kind.dests() {
+            count_virtual(&mut definitions, destination);
+        }
+        for source in op.kind.source_vregs() {
+            count_virtual(&mut uses, source);
+        }
+    }
+    match &block.terminator {
+        Terminator::CondBranch { cond, .. } => count_virtual(&mut uses, *cond),
+        Terminator::Switch { index, .. } => count_virtual(&mut uses, *index),
+        Terminator::IndirectBranch { target, .. } => count_virtual(&mut uses, *target),
+        Terminator::IndirectBranchMem { addr, .. } => {
+            for reg in addr.regs() {
+                count_virtual(&mut uses, reg);
+            }
+        }
+        Terminator::Return { values } => {
+            for value in values {
+                count_virtual(&mut uses, *value);
+            }
+        }
+        Terminator::Call { target, args, .. } | Terminator::TailCall { target, args } => {
+            for reg in target.regs() {
+                count_virtual(&mut uses, reg);
+            }
+            for argument in args {
+                count_virtual(&mut uses, *argument);
+            }
+        }
+        Terminator::Branch { .. } | Terminator::Trap { .. } | Terminator::Unreachable => {}
+    }
+    (definitions, uses)
+}
+
+pub(super) fn x86_native_replay_spans_where(
+    block: &SmirBlock,
+    instruction_bytes: &HashMap<(BlockId, GuestAddr), X86InstructionBytes>,
+    classify: impl Fn(&X86InstructionBytes) -> Option<(bool, bool, bool)>,
+) -> HashMap<usize, X86NativeReplaySpan> {
+    let virtual_counts = std::cell::OnceCell::new();
+    let mut groups = HashMap::<GuestAddr, (usize, usize, bool)>::new();
+    for (index, op) in block.ops.iter().enumerate() {
+        groups
+            .entry(op.guest_pc)
+            .and_modify(|(_, end, contiguous)| {
+                if *end != index {
+                    *contiguous = false;
+                }
+                *end = index + 1;
+            })
+            .or_insert((index, index + 1, true));
+    }
+
+    groups
+        .into_iter()
+        .filter_map(|(guest_pc, (start, end, contiguous))| {
+            // Source replay executes the captured host instruction directly.
+            // A register-form encoding must therefore never replace an IR
+            // group that can access guest memory or enforce a memory-only
+            // alignment fault, even when provenance and IR are malformed.
+            if !contiguous
+                || block.ops[start..end].iter().any(|op| {
+                    op.kind.reads_memory()
+                        || op.kind.writes_memory()
+                        || matches!(
+                            &op.kind,
+                            OpKind::X86CheckAlignment { .. } | OpKind::X86CheckAlignmentAc { .. }
+                        )
+                })
+            {
+                return None;
+            }
+            let source_instruction = *instruction_bytes.get(&(block.id, guest_pc))?;
+            let replay_source = source_instruction
+                .legacy_high_byte_multiply_replay()
+                .map(|replay| replay.canonical_instruction)
+                .or_else(|| {
+                    source_instruction
+                        .legacy_high_byte_group3_test_replay()
+                        .map(|replay| replay.canonical_instruction)
+                })
+                .unwrap_or(source_instruction);
+            let replay_source = replay_source
+                .non_memory_prefix_canonical()
+                .unwrap_or(replay_source);
+            let replay_source = replay_source
+                .evex_scalar_fma_llig_canonical_ll0()
+                .unwrap_or(replay_source);
+            let replay_source = replay_source
+                .evex_scalar_fp_class_llig_canonical_ll0()
+                .unwrap_or(replay_source);
+            let (instruction, (needs_avx512vl, needs_avx512dq, needs_avx512fp16)) =
+                classify(&replay_source)
+                    .map(|requirements| (replay_source, requirements))
+                    .or_else(|| {
+                        let canonical = replay_source.vex_scalar_l1_canonical_l0()?;
+                        classify(&canonical).map(|requirements| (canonical, requirements))
+                    })?;
+            let high_byte_multiply = instruction.legacy_high_byte_multiply_replay();
+            let high_byte_group3_test = instruction.legacy_high_byte_group3_test_replay();
+            let high_byte_crc32 = instruction.legacy_high_byte_crc32_replay();
+            let high_byte_setcc = instruction.legacy_high_byte_setcc_replay();
+            if let Some(replay) = high_byte_group3_test {
+                let temporary = classifiers::x86_legacy_high_byte_group3_test_shape_temporary(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                if virtual_definitions.get(&temporary) != Some(&1)
+                    || virtual_uses.get(&temporary) != Some(&1)
+                {
+                    return None;
+                }
+            }
+            if let Some(replay) = high_byte_multiply {
+                let temporary = classifiers::x86_legacy_high_byte_multiply_shape_temporary(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                if virtual_definitions.get(&temporary) != Some(&1)
+                    || virtual_uses.get(&temporary) != Some(&1)
+                {
+                    return None;
+                }
+            }
+            if let Some(replay) = high_byte_crc32 {
+                let temporary = classifiers::x86_legacy_high_byte_crc32_shape_temporary(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                if virtual_definitions.get(&temporary) != Some(&1)
+                    || virtual_uses.get(&temporary) != Some(&1)
+                {
+                    return None;
+                }
+            }
+            if let Some(replay) = high_byte_setcc {
+                let requirements =
+                    classifiers::x86_legacy_high_byte_setcc_shape_virtual_requirements(
+                        &block.ops[start..end],
+                        replay,
+                    )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&1)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_aes_replay() {
+                let requirements = classifiers::x86_legacy_aes_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&1)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_blend_replay() {
+                let requirements = classifiers::x86_legacy_blend_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_scalar_xmm_movq_replay() {
+                let requirements =
+                    classifiers::x86_legacy_scalar_xmm_movq_shape_virtual_requirements(
+                        &block.ops[start..end],
+                        replay,
+                    )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_packed_fp_convert_replay()
+                && !classifiers::x86_legacy_packed_fp_convert_shape_matches(
+                    &block.ops[start..end],
+                    replay,
+                )
+            {
+                return None;
+            }
+            if let Some(replay) = instruction.legacy_register_scalar_fp_convert_replay()
+                && !classifiers::x86_legacy_scalar_fp_convert_shape_matches(
+                    &block.ops[start..end],
+                    replay,
+                )
+            {
+                return None;
+            }
+            if let Some(replay) = instruction.legacy_register_scalar_extract_replay() {
+                let requirements =
+                    classifiers::x86_legacy_scalar_extract_shape_virtual_requirements(
+                        &block.ops[start..end],
+                        replay,
+                    )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_scalar_insert_replay() {
+                let requirements =
+                    classifiers::x86_legacy_scalar_insert_shape_virtual_requirements(
+                        &block.ops[start..end],
+                        replay,
+                    )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_lane_shuffle_replay() {
+                let requirements = classifiers::x86_legacy_lane_shuffle_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_alignr_replay() {
+                let requirements = classifiers::x86_legacy_alignr_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_gfni_replay() {
+                let requirements = classifiers::x86_legacy_gfni_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary).copied().unwrap_or(0) != expected_uses
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_round_replay()
+                && !classifiers::x86_legacy_round_shape_matches(&block.ops[start..end], replay)
+            {
+                return None;
+            }
+            if let Some(replay) = instruction.legacy_register_dot_product_replay() {
+                let requirements = classifiers::x86_legacy_dot_product_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_insertps_replay() {
+                let requirements = classifiers::x86_legacy_insertps_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary).copied().unwrap_or(0)
+                        != expected_definitions
+                        || virtual_uses.get(&temporary).copied().unwrap_or(0) != expected_uses
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_pclmulqdq_replay() {
+                let requirements = classifiers::x86_legacy_pclmulqdq_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_ptest_replay() {
+                let requirements = classifiers::x86_legacy_ptest_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_packed_extend_replay() {
+                let requirements =
+                    classifiers::x86_legacy_packed_extend_shape_virtual_requirements(
+                        &block.ops[start..end],
+                        replay,
+                    )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_packed_shift_replay() {
+                let requirements = classifiers::x86_legacy_packed_shift_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_widening_dword_multiply_replay() {
+                let requirements =
+                    classifiers::x86_legacy_widening_dword_multiply_shape_virtual_requirements(
+                        &block.ops[start..end],
+                        replay,
+                    )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_definitions, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&expected_definitions)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction.legacy_register_fp_flag_compare_replay()
+                && !classifiers::x86_legacy_fp_flag_compare_shape_matches(
+                    &block.ops[start..end],
+                    replay,
+                )
+            {
+                return None;
+            }
+            if let Some(replay) = instruction.legacy_register_sha_replay() {
+                let requirements = classifiers::x86_legacy_sha_shape_virtual_requirements(
+                    &block.ops[start..end],
+                    replay,
+                )?;
+                let (virtual_definitions, virtual_uses) =
+                    virtual_counts.get_or_init(|| block_virtual_definition_use_counts(block));
+                for (temporary, expected_uses) in requirements {
+                    if virtual_definitions.get(&temporary) != Some(&1)
+                        || virtual_uses.get(&temporary) != Some(&expected_uses)
+                    {
+                        return None;
+                    }
+                }
+            }
+            if let Some(replay) = instruction
+                .legacy_mov_mask_stack_destination_replay()
+                .or_else(|| instruction.vex_mov_mask_stack_destination_replay())
+                && !classifiers::x86_mov_mask_stack_shape_matches(&block.ops[start..end], replay)
+            {
+                return None;
+            }
+            if let Some(replay) = instruction.legacy_movd_q_stack_replay()
+                && !classifiers::x86_legacy_movd_q_stack_shape_matches(
+                    &block.ops[start..end],
+                    replay,
+                )
+            {
+                return None;
+            }
+            if (instruction.is_legacy_register_packed_string_compare()
+                || instruction.is_vex_register_packed_string_compare())
+                && !classifiers::x86_register_packed_string_shape_matches(
+                    &block.ops[start..end],
+                    &instruction,
+                )
+            {
+                return None;
+            }
+            // VPERMIL2 is VEX encoded but belongs to AMD's XOP feature
+            // subset. Its dynamic guest-state guard must remain independently
+            // lowered before exact register replay replaces the remaining
+            // semantic graph.
+            let leading_mmx_marker = instruction
+                .legacy_register_scalar_extract_replay()
+                .is_some_and(|replay| replay.kind.touches_mmx())
+                || instruction
+                    .legacy_register_scalar_insert_replay()
+                    .is_some_and(|replay| replay.kind.touches_mmx())
+                || instruction
+                    .legacy_mov_mask_stack_destination_replay()
+                    .is_some_and(|replay| replay.touches_mmx())
+                || instruction
+                    .legacy_movd_q_stack_replay()
+                    .is_some_and(|replay| replay.touches_mmx());
+            let replay_start = if instruction.is_vex_register_vpermil2() {
+                if !matches!(block.ops[start].kind, OpKind::X86RequireXop)
+                    || block.ops[start].x86_hint.is_some()
+                {
+                    return None;
+                }
+                start.checked_add(1).filter(|candidate| *candidate < end)?
+            } else if leading_mmx_marker {
+                if !matches!(
+                    block.ops[start].kind,
+                    OpKind::X86X87Control {
+                        kind: crate::smir::ir::ops::X86X87ControlKind::EnterMmx,
+                        addr: None,
+                    }
+                ) || block.ops[start].x86_hint.is_some()
+                {
+                    return None;
+                }
+                start.checked_add(1).filter(|candidate| *candidate < end)?
+            } else {
+                start
+            };
+            // An exact MMX source replay replaces the arithmetic/conversion
+            // expansion, but its final EnterMmx operation must remain
+            // independently lowered so the guest x87 tag word commits at this
+            // instruction.
+            let leaves_mmx_marker = instruction
+                .legacy_register_packed_fp_convert_replay()
+                .is_some_and(|replay| replay.kind.touches_mmx())
+                || instruction
+                    .legacy_register_widening_dword_multiply_replay()
+                    .is_some_and(|replay| replay.mmx);
+            let replay_end = if leaves_mmx_marker {
+                end.checked_sub(1)
+                    .filter(|candidate| *candidate > replay_start)?
+            } else {
+                end
+            };
+            Some((
+                replay_start,
+                X86NativeReplaySpan {
+                    end: replay_end,
+                    instruction,
+                    needs_avx512vl,
+                    needs_avx512dq,
+                    needs_avx512fp16,
+                    preserve_mxcsr_de: instruction.evex_register_fp16_widen_preserves_mxcsr_de(),
+                },
+            ))
+        })
+        .collect()
+}

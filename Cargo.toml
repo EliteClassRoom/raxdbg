@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["raxdbg contributors"]
+description = "Rust port of unidbg's Android emulation on the rax CPU engine"
+
+[workspace.dependencies]
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+goblin = "0.10"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+yaxpeax-arm = "0.5"
+yaxpeax-arch = "0.3"
+hex = "0.4"
+parking_lot = "0.12"
+object = "0.40"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+raxdbg-core = { path = "crates/raxdbg-core" }
+raxdbg-backend-rax = { path = "crates/raxdbg-backend-rax" }
+raxdbg-android = { path = "crates/raxdbg-android" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# rax's `linux-loader` dependency pulls `vm-memory` with default features, whose
+# `rawfd` feature is `compile_error!` on Windows. rax's own manifest carries this
+# patch, but `[patch]` sections only take effect from the workspace root.
+[patch.crates-io]
+linux-loader = { git = "https://github.com/19h/linux-loader", rev = "f745b555942c4e840a784bca61e6f3976d101960" }
+# `vendor/rax` is rax at the pinned rev plus two public `CPACR_EL1` accessors
+# (see `vendor/rax/PATCHES.md`): without them rax traps every FP/SIMD
+# instruction at EL0, which real bionic code cannot run under.
+[patch."https://github.com/HexRaysSA/rax"]
+rax = { path = "vendor/rax" }

@@ -1,0 +1,15 @@
+[package]
+name = "raxdbg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Facade crate re-exporting the raxdbg crates"
+
+[dependencies]
+raxdbg-core.workspace = true
+raxdbg-backend-rax.workspace = true
+raxdbg-android.workspace = true
+
+[lints]
+workspace = true

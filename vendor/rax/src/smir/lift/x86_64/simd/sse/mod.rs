@@ -1,0 +1,22 @@
+//! SSE/SSE2/SSE3/SSSE3/SSE4 lifting
+
+mod compare;
+pub use compare::*;
+mod crypto;
+pub use crypto::*;
+mod fp;
+pub use fp::*;
+mod mem;
+pub use mem::*;
+mod mmx_xmm_transfer;
+pub use mmx_xmm_transfer::*;
+mod misc;
+pub use misc::*;
+mod mul;
+pub use mul::*;
+mod packed;
+pub use packed::*;
+mod shuffle;
+pub use shuffle::*;
+mod sse4a;
+pub use sse4a::*;

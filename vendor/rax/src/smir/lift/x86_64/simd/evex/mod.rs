@@ -1,0 +1,36 @@
+//! EVEX-encoded AVX-512 / AVX10 lifting
+
+mod align;
+pub use align::*;
+mod compare;
+pub use compare::*;
+mod compress_expand;
+pub use compress_expand::*;
+mod crypto;
+pub use crypto::*;
+mod fp;
+pub use fp::*;
+mod fp_approx;
+pub use fp_approx::*;
+mod fixup_imm;
+pub use fixup_imm::*;
+mod fp16_arithmetic;
+pub use fp16_arithmetic::*;
+mod funnel_shift;
+pub use funnel_shift::*;
+mod integer_pack;
+pub use integer_pack::*;
+mod mask_blend;
+pub use mask_blend::*;
+mod mem;
+pub use mem::*;
+mod misc;
+pub use misc::*;
+mod mul;
+pub use mul::*;
+mod packed;
+pub use packed::*;
+mod saturating_convert;
+pub use saturating_convert::*;
+mod shuffle;
+pub use shuffle::*;

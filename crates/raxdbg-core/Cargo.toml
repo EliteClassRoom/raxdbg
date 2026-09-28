@@ -1,0 +1,15 @@
+[package]
+name = "raxdbg-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core abstractions of raxdbg: backend contract, memory, pointer, modules, syscalls, threads"
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true

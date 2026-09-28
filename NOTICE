@@ -1,0 +1,11 @@
+raxdbg
+Copyright 2026 raxdbg contributors
+
+This product is a Rust port of unidbg (https://github.com/zhkl0228/unidbg),
+licensed under the Apache License, Version 2.0.
+
+It includes third-party software; see THIRD_PARTY_NOTICES.md for the full list
+of bundled binaries and their upstream projects.
+
+The CPU engine is rax (https://github.com/HexRaysSA/rax), used as a Rust library
+dependency (not vendored).

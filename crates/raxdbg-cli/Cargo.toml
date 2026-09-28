@@ -1,0 +1,21 @@
+[package]
+name = "raxdbg-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command line front end for raxdbg"
+
+[[bin]]
+name = "raxdbg"
+path = "src/main.rs"
+
+[dependencies]
+raxdbg-core.workspace = true
+raxdbg-backend-rax.workspace = true
+raxdbg-android.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,1070 @@
+//! Path-based system calls: opening, metadata, names, and directories.
+
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use super::super::abi::errno::Errno;
+use super::super::abi::errno_table::*;
+use super::super::abi::open::*;
+use super::super::abi::types::{Kstatfs, MAX_NON_LFS, Stat, Timespec, mode};
+use super::super::fs::fd::{FileObject, FileType, OpenFile};
+use super::super::fs::{self, join_guest};
+use super::super::fsnotify::bits::{IN_ATTRIB, IN_MODIFY};
+use super::super::procfs::{self, ProcEntry};
+use super::{Ctx, SysResult};
+
+/// `AT_FDCWD`.
+pub const AT_FDCWD: i32 = -100;
+/// `AT_SYMLINK_NOFOLLOW`.
+pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+/// `AT_EACCESS`.
+pub const AT_EACCESS: u32 = 0x200;
+/// `AT_REMOVEDIR`.
+pub const AT_REMOVEDIR: u32 = 0x200;
+/// `AT_SYMLINK_FOLLOW`.
+pub const AT_SYMLINK_FOLLOW: u32 = 0x400;
+/// `AT_NO_AUTOMOUNT`.
+pub const AT_NO_AUTOMOUNT: u32 = 0x800;
+/// `AT_EMPTY_PATH`.
+pub const AT_EMPTY_PATH: u32 = 0x1000;
+/// `AT_STATX_SYNC_TYPE`.
+pub const AT_STATX_SYNC_TYPE: u32 = 0x6000;
+
+/// What a path argument names.
+pub enum Target {
+    /// A synthesized `/proc` or `/sys` entry.
+    Proc(ProcEntry, String),
+    /// A host file-system object.
+    Host {
+        /// Guest path (absolute, lexically joined).
+        guest: String,
+        /// Host path.
+        host: PathBuf,
+    },
+    /// The descriptor itself (`AT_EMPTY_PATH` with an empty path).
+    Fd(Arc<OpenFile>),
+}
+
+/// The guest directory a relative path is resolved against.
+fn base_dir(c: &Ctx<'_>, dirfd: i32) -> Result<String, Errno> {
+    if dirfd == AT_FDCWD {
+        return Ok(c.p.vfs.cwd().to_string());
+    }
+    let file = c.p.fds.file(dirfd)?;
+    if file.ftype != FileType::Directory {
+        return Err(Errno(ENOTDIR));
+    }
+    Ok(match &file.host_path {
+        Some(h) => c.p.vfs.guest_path_of(h),
+        None => file.path.clone(),
+    })
+}
+
+/// Resolves a guest path string relative to `dirfd`.
+pub fn resolve_str(c: &Ctx<'_>, dirfd: i32, path: &str, follow: bool) -> Result<Target, Errno> {
+    let guest = if path.starts_with('/') {
+        join_guest("/", path)
+    } else {
+        join_guest(&base_dir(c, dirfd)?, path)
+    };
+    let threads = c.thread_refs();
+    if let Some(entry) = procfs::lookup(c.p, c.t, &threads, &guest) {
+        return Ok(Target::Proc(entry, guest));
+    }
+    if procfs::owned(c.p, &threads, &guest) {
+        return Err(Errno(ENOENT));
+    }
+    let host = c.p.vfs.host_path(&guest, follow);
+    Ok(Target::Host { guest, host })
+}
+
+/// Resolves a path argument, honoring `AT_EMPTY_PATH`.
+pub fn resolve(
+    c: &Ctx<'_>,
+    dirfd: i32,
+    path_addr: u64,
+    flags: u32,
+    follow: bool,
+) -> Result<Target, Errno> {
+    let raw = c.read_cstr_raw(path_addr, fs::PATH_MAX - 1)?;
+    if raw.is_empty() {
+        if flags & AT_EMPTY_PATH != 0 {
+            if dirfd == AT_FDCWD {
+                let cwd = c.p.vfs.cwd().to_string();
+                return resolve_str(c, AT_FDCWD, &cwd, true);
+            }
+            return Ok(Target::Fd(c.p.fds.file(dirfd)?));
+        }
+        return Err(Errno(ENOENT));
+    }
+    let path = fs::Vfs::path_str(&raw)?;
+    resolve_str(c, dirfd, &path, follow)
+}
+
+/// Metadata of a synthesized entry, owned by `ids` (effective UID and
+/// GID).
+fn proc_stat(ids: (u32, u32), e: &ProcEntry) -> Stat {
+    let (m, size) = match e {
+        ProcEntry::File(d) => (mode::S_IFREG | 0o444, d.len() as i64),
+        ProcEntry::Comm { .. } => (mode::S_IFREG | 0o644, 0),
+        ProcEntry::Link(t) => (mode::S_IFLNK | 0o777, t.len() as i64),
+        ProcEntry::Dir(_) => (mode::S_IFDIR | 0o555, 0),
+    };
+    let (sec, nsec) = super::super::host::clock_gettime(super::super::host::HostClock::Realtime);
+    let now = Timespec { sec, nsec };
+    Stat {
+        dev_major: 0,
+        dev_minor: 0x16,
+        ino: 0x5241_5800,
+        mode: m,
+        nlink: 1,
+        uid: ids.0,
+        gid: ids.1,
+        size,
+        blksize: 1024,
+        blocks: 0,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        ..Default::default()
+    }
+}
+
+/// Metadata of an open file.
+pub fn stat_file(c: &Ctx<'_>, file: &OpenFile) -> Result<Stat, Errno> {
+    stat_open(file, (c.p.creds.1, c.p.creds.3))
+}
+
+/// Metadata of an open file of a process whose effective UID and GID are
+/// `ids` (the owner of the inodes it creates).
+pub fn stat_open(file: &OpenFile, ids: (u32, u32)) -> Result<Stat, Errno> {
+    match &file.object {
+        FileObject::Mqueue(h) => Ok(super::mqueue::stat(&h.get()?)),
+        FileObject::Host(f) => Ok(fs::stat_from_metadata(&f.metadata()?)),
+        FileObject::PathOnly => {
+            let h = file.host_path.as_ref().ok_or(Errno(EBADF))?;
+            Ok(fs::stat_from_metadata(&std::fs::symlink_metadata(h)?))
+        }
+        FileObject::PipeRead(_) | FileObject::PipeWrite(_) => Ok(Stat {
+            dev_minor: 0xe,
+            mode: mode::S_IFIFO | 0o600,
+            nlink: 1,
+            uid: ids.0,
+            gid: ids.1,
+            blksize: 4096,
+            ..Default::default()
+        }),
+        // pidfs_init_inode: mode 0700 shown without a file type
+        // (anon_inode_getattr), owned by root, one inode per task.
+        FileObject::Anon(super::super::fs::anon::Anon::Pid(t)) => Ok(Stat {
+            dev_minor: super::pidfd::PIDFS_DEV_MINOR,
+            ino: t.ino(),
+            mode: 0o700,
+            nlink: 1,
+            blksize: 4096,
+            ..Default::default()
+        }),
+        // anon_inode_create_getfile: an io_uring's own anon_inode_fs inode,
+        // otherwise as below.
+        FileObject::Anon(super::super::fs::anon::Anon::Uring(r)) => Ok(Stat {
+            dev_minor: 0x10,
+            ino: r.ino,
+            mode: 0o600,
+            nlink: 1,
+            uid: ids.0,
+            gid: ids.1,
+            blksize: 4096,
+            ..Default::default()
+        }),
+        // alloc_anon_inode: mode 0600 without a file type, one link, the
+        // caller's IDs; the one anon_inode_fs inode all of them share (its
+        // device and inode numbers are fixed at boot).
+        FileObject::Anon(_) => Ok(Stat {
+            dev_minor: 0x10,
+            ino: 0x5241_5801,
+            mode: 0o600,
+            nlink: 1,
+            uid: ids.0,
+            gid: ids.1,
+            blksize: 4096,
+            ..Default::default()
+        }),
+        // sock_alloc: S_IFSOCK with every permission, the caller's IDs,
+        // on sockfs.
+        FileObject::Socket(s) => Ok(Stat {
+            dev_minor: 0x8,
+            ino: s.ino,
+            mode: mode::S_IFSOCK | 0o777,
+            nlink: 1,
+            uid: ids.0,
+            gid: ids.1,
+            blksize: 4096,
+            ..Default::default()
+        }),
+        FileObject::Synthetic(d) => Ok(proc_stat(
+            ids,
+            &if file.ftype == FileType::Directory {
+                ProcEntry::Dir(Vec::new())
+            } else {
+                ProcEntry::File(d.to_vec())
+            },
+        )),
+    }
+}
+
+/// Metadata of a resolved target.
+pub(super) fn stat_target(c: &Ctx<'_>, t: &Target, follow: bool) -> Result<Stat, Errno> {
+    match t {
+        Target::Fd(f) => stat_file(c, f),
+        Target::Proc(ProcEntry::Link(link), _) if follow => {
+            let target = resolve_str(c, AT_FDCWD, link, true)?;
+            stat_target(c, &target, true)
+        }
+        Target::Proc(e, _) => Ok(proc_stat((c.p.creds.1, c.p.creds.3), e)),
+        Target::Host { host, .. } => {
+            let m = if follow {
+                std::fs::metadata(host)?
+            } else {
+                std::fs::symlink_metadata(host)?
+            };
+            Ok(fs::stat_from_metadata(&m))
+        }
+    }
+}
+
+/// Opens a resolved target.
+pub(super) fn open_target(
+    c: &mut Ctx<'_>,
+    target: Target,
+    flags: u32,
+    create_mode: u32,
+) -> Result<Arc<OpenFile>, Errno> {
+    let layout = c.p.abi.open_flags();
+    let accmode = flags & O_ACCMODE;
+    // f_flags (build_open_how, build_open_flags, do_dentry_open): the
+    // valid open flags less the creation-time flags and O_CLOEXEC; an
+    // O_PATH open keeps only O_PATH, O_DIRECTORY, and O_NOFOLLOW. The
+    // caller has added O_LARGEFILE where the call forces it.
+    let valid = O_ACCMODE
+        | O_CREAT
+        | O_EXCL
+        | O_NOCTTY
+        | O_TRUNC
+        | O_APPEND
+        | O_NONBLOCK
+        | O_DSYNC
+        | O_SYNC_BIT
+        | FASYNC
+        | O_NOATIME
+        | O_CLOEXEC
+        | O_PATH
+        | O_TMPFILE_BIT
+        | layout.direct
+        | layout.largefile
+        | layout.directory
+        | layout.nofollow;
+    let status = if flags & O_PATH != 0 {
+        flags & (O_PATH | layout.directory | layout.nofollow)
+    } else {
+        flags & valid & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC)
+    };
+    match target {
+        Target::Fd(file) => Ok(file),
+        Target::Proc(ProcEntry::File(data), guest) => {
+            if accmode != O_RDONLY {
+                return Err(Errno(EACCES));
+            }
+            if flags & layout.directory != 0 {
+                return Err(Errno(ENOTDIR));
+            }
+            Ok(OpenFile::new(
+                FileObject::Synthetic(data.into()),
+                FileType::Regular,
+                guest,
+                None,
+                status,
+            ))
+        }
+        Target::Proc(ProcEntry::Comm { tid, text }, guest) => {
+            if flags & layout.directory != 0 {
+                return Err(Errno(ENOTDIR));
+            }
+            let f = OpenFile::new(
+                FileObject::Synthetic(text.into()),
+                FileType::Regular,
+                guest,
+                None,
+                status,
+            );
+            if accmode != O_RDONLY {
+                f.state.lock().unwrap().comm_of = Some(tid);
+            }
+            Ok(f)
+        }
+        Target::Proc(ProcEntry::Dir(entries), guest) => {
+            if accmode != O_RDONLY {
+                return Err(Errno(EISDIR));
+            }
+            let f = OpenFile::new(
+                FileObject::Synthetic(Arc::from(Vec::new())),
+                FileType::Directory,
+                guest,
+                None,
+                status,
+            );
+            f.state.lock().unwrap().dir = Some((entries, 0));
+            Ok(f)
+        }
+        Target::Proc(ProcEntry::Link(link), _) => {
+            if flags & layout.nofollow != 0 {
+                return Err(Errno(ELOOP));
+            }
+            // /proc/self/fd/N reopens the same object.
+            let target = resolve_str(c, AT_FDCWD, &link, true)?;
+            open_target(c, target, flags, create_mode)
+        }
+        Target::Host { guest, host } => {
+            if flags & O_TMPFILE_BIT != 0 {
+                return Err(Errno(EOPNOTSUPP));
+            }
+            if flags & O_PATH != 0 {
+                let m = if flags & layout.nofollow != 0 {
+                    std::fs::symlink_metadata(&host)?
+                } else {
+                    std::fs::metadata(&host)?
+                };
+                let ftype = fs::file_type_of(&m);
+                if flags & layout.directory != 0 && ftype != FileType::Directory {
+                    return Err(Errno(ENOTDIR));
+                }
+                return Ok(OpenFile::new(
+                    FileObject::PathOnly,
+                    ftype,
+                    guest,
+                    Some(host),
+                    status,
+                ));
+            }
+            let mut opts = std::fs::OpenOptions::new();
+            match accmode {
+                O_WRONLY => opts.write(true),
+                O_RDWR => opts.read(true).write(true),
+                _ => opts.read(true),
+            };
+            let mut custom = 0;
+            // generic_file_open (do_dentry_open) runs after the lookup and
+            // permission checks and before handle_truncate: without
+            // O_LARGEFILE a regular file past MAX_NON_LFS is EOVERFLOW and
+            // stays untruncated, so such an open truncates only after the
+            // size check.
+            let size_checked = status & layout.largefile == 0;
+            // Whether this open may create the file (it does not exist).
+            let creates = flags & O_CREAT != 0 && std::fs::metadata(&host).is_err();
+            if flags & O_CREAT != 0 {
+                if flags & O_EXCL != 0 {
+                    opts.create_new(true);
+                } else {
+                    custom |= libc::O_CREAT;
+                }
+                opts.mode(create_mode & 0o7777 & !c.p.umask);
+            }
+            if flags & O_TRUNC != 0 && !size_checked {
+                custom |= libc::O_TRUNC;
+            }
+            if flags & O_NONBLOCK != 0 {
+                custom |= libc::O_NONBLOCK;
+            }
+            if flags & layout.nofollow != 0 {
+                custom |= libc::O_NOFOLLOW;
+            }
+            if flags & layout.directory != 0 {
+                custom |= libc::O_DIRECTORY;
+            }
+            if flags & O_NOCTTY != 0 {
+                custom |= libc::O_NOCTTY;
+            }
+            opts.custom_flags(custom);
+            let file = opts.open(&host)?;
+            if size_checked && file.metadata().is_ok_and(|m| m.is_file()) {
+                if file.metadata()?.len() > MAX_NON_LFS as u64 {
+                    return Err(Errno(EOVERFLOW));
+                }
+                if flags & O_TRUNC != 0 {
+                    truncate_opened(&file, &host, accmode)?;
+                }
+            }
+            let bits = create_mode & 0o7777 & !c.p.umask;
+            if creates && bits & super::super::host::umask() != 0 {
+                file.set_permissions(std::fs::Permissions::from_mode(bits))?;
+            }
+            if flags & O_TRUNC != 0 && file.metadata().is_ok_and(|m| m.is_file()) {
+                c.p.space.truncated(fs::identity(&file)?, 0);
+            }
+            let meta = file.metadata()?;
+            let ftype = fs::file_type_of(&meta);
+            if flags & layout.directory != 0 && ftype != FileType::Directory {
+                return Err(Errno(ENOTDIR));
+            }
+            let open = OpenFile::new(
+                FileObject::Host(file),
+                ftype,
+                guest,
+                Some(host.clone()),
+                status,
+            );
+            // handle_truncate follows the open of an existing regular file.
+            let truncated = flags & O_TRUNC != 0 && !creates && ftype == FileType::Regular;
+            super::notify::opened(c, &open, &host, &meta, creates, truncated, false);
+            Ok(open)
+        }
+    }
+}
+
+/// Truncates the regular file just opened as `file` (`handle_truncate`),
+/// through a second, writable open when `accmode` is `O_RDONLY` (which
+/// `O_TRUNC` truncates as well, `may_open` having required write access).
+fn truncate_opened(
+    file: &std::fs::File,
+    host: &std::path::Path,
+    accmode: u32,
+) -> Result<(), Errno> {
+    if accmode == O_RDONLY {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(host)?
+            .set_len(0)?;
+    } else {
+        file.set_len(0)?;
+    }
+    Ok(())
+}
+
+/// `openat` (and `open`, `creat`, `openat2`) as a 64-bit kernel's native
+/// entry points run it: `force_o_largefile()` holds, so the file is opened
+/// with `O_LARGEFILE`.
+pub fn openat(c: &mut Ctx<'_>, dirfd: i32, path: u64, flags: u32, create_mode: u32) -> SysResult {
+    let largefile = c.p.abi.open_flags().largefile;
+    open_at(c, dirfd, path, flags | largefile, create_mode)
+}
+
+/// `compat_sys_openat` (and `compat_sys_open`): `O_LARGEFILE` only if the
+/// caller passes it.
+pub fn compat_openat(
+    c: &mut Ctx<'_>,
+    dirfd: i32,
+    path: u64,
+    flags: u32,
+    create_mode: u32,
+) -> SysResult {
+    open_at(c, dirfd, path, flags, create_mode)
+}
+
+fn open_at(c: &mut Ctx<'_>, dirfd: i32, path: u64, flags: u32, create_mode: u32) -> SysResult {
+    let file = open_file(c, dirfd, path, flags, create_mode)?;
+    super::io::install(c, file, flags & O_CLOEXEC != 0)
+}
+
+/// `do_filp_open`: the file `path` names, opened with `flags` (as they
+/// stand: no `O_LARGEFILE` is added) but not installed.
+pub(super) fn open_file(
+    c: &mut Ctx<'_>,
+    dirfd: i32,
+    path: u64,
+    flags: u32,
+    create_mode: u32,
+) -> Result<Arc<OpenFile>, Errno> {
+    let nofollow = flags & c.p.abi.open_flags().nofollow != 0;
+    let target = resolve(c, dirfd, path, 0, !nofollow)?;
+    open_target(c, target, flags, create_mode)
+}
+
+/// `openat2` with `struct open_how` (resolution restrictions are not
+/// supported and are rejected with `EINVAL`).
+pub fn openat2(c: &mut Ctx<'_>, dirfd: i32, path: u64, how: u64, size: u64) -> SysResult {
+    const OPEN_HOW_SIZE_VER0: u64 = 24;
+    if size < OPEN_HOW_SIZE_VER0 || size > 4096 {
+        return Err(Errno(if size > 4096 { E2BIG } else { EINVAL }));
+    }
+    let raw = c.read_mem(how, size as usize)?;
+    if raw[24..].iter().any(|&b| b != 0) {
+        return Err(Errno(E2BIG));
+    }
+    let flags = u64::from_le_bytes(raw[..8].try_into().unwrap());
+    let mode = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let resolve_flags = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+    let (flags, mode) = open_how_flags(c, flags, mode, resolve_flags)?;
+    openat(c, dirfd, path, flags, mode)
+}
+
+/// `build_open_flags` for a `struct open_how`: known flags only, a mode
+/// only with `O_CREAT` or `O_TMPFILE` and only permission bits, and no
+/// resolution restrictions (not supported); the flags and mode to open
+/// with.
+pub(super) fn open_how_flags(
+    c: &Ctx<'_>,
+    flags: u64,
+    mode: u64,
+    resolve_flags: u64,
+) -> Result<(u32, u32), Errno> {
+    let layout = c.p.abi.open_flags();
+    let valid = u64::from(
+        O_ACCMODE
+            | O_CREAT
+            | O_EXCL
+            | O_NOCTTY
+            | O_TRUNC
+            | O_APPEND
+            | O_NONBLOCK
+            | O_DSYNC
+            | FASYNC
+            | O_NOATIME
+            | O_CLOEXEC
+            | O_SYNC_BIT
+            | O_PATH
+            | O_TMPFILE_BIT
+            | layout.directory
+            | layout.nofollow
+            | layout.direct
+            | layout.largefile,
+    );
+    if flags & !valid != 0 || mode & !0o7777 != 0 {
+        return Err(Errno(EINVAL));
+    }
+    if mode != 0 && flags & u64::from(O_CREAT | O_TMPFILE_BIT) == 0 {
+        return Err(Errno(EINVAL));
+    }
+    if resolve_flags != 0 {
+        return Err(Errno(EINVAL));
+    }
+    Ok((flags as u32, mode as u32))
+}
+
+/// `vfs_fstatat`: the status of `path` relative to `dirfd`.
+pub(super) fn stat_at(c: &mut Ctx<'_>, dirfd: i32, path: u64, flags: u32) -> Result<Stat, Errno> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT) != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let target = resolve(c, dirfd, path, flags, follow)?;
+    stat_target(c, &target, follow)
+}
+
+/// `vfs_fstat`: the status of `fd`'s file.
+pub(super) fn stat_fd(c: &Ctx<'_>, fd: i32) -> Result<Stat, Errno> {
+    let file = c.p.fds.file(fd)?;
+    stat_file(c, &file)
+}
+
+/// `newfstatat` (and `stat`, `lstat`).
+pub fn fstatat(c: &mut Ctx<'_>, dirfd: i32, path: u64, buf: u64, flags: u32) -> SysResult {
+    let st = stat_at(c, dirfd, path, flags)?;
+    c.write_mem(buf, &st.encode(c.p.abi))?;
+    Ok(0)
+}
+
+/// `fstat`.
+pub fn fstat(c: &mut Ctx<'_>, fd: i32, buf: u64) -> SysResult {
+    let st = stat_fd(c, fd)?;
+    c.write_mem(buf, &st.encode(c.p.abi))?;
+    Ok(0)
+}
+
+/// `statx`.
+pub fn statx(c: &mut Ctx<'_>, dirfd: i32, path: u64, flags: u32, mask: u32, buf: u64) -> SysResult {
+    const STATX_RESERVED: u32 = 0x8000_0000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE) != 0
+        || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE
+        || mask & STATX_RESERVED != 0
+    {
+        return Err(Errno(EINVAL));
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let target = resolve(c, dirfd, path, flags, follow)?;
+    let st = stat_target(c, &target, follow)?;
+    c.write_mem(buf, &st.encode_statx())?;
+    Ok(0)
+}
+
+/// `faccessat`/`faccessat2` (and `access`).
+pub fn faccessat(c: &mut Ctx<'_>, dirfd: i32, path: u64, amode: u32, flags: u32) -> SysResult {
+    if amode & !7 != 0 || flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    match resolve(c, dirfd, path, flags, follow)? {
+        Target::Proc(ProcEntry::File(_), _) => {
+            // Synthesized files are readable only: W_OK and X_OK fail.
+            if amode & 3 != 0 {
+                return Err(Errno(EACCES));
+            }
+            Ok(0)
+        }
+        Target::Proc(..) => Ok(0),
+        Target::Fd(f) => match &f.host_path {
+            Some(h) => {
+                super::super::host::access(h, amode, flags & AT_EACCESS != 0, follow).map(|_| 0)
+            }
+            None => Ok(0),
+        },
+        Target::Host { host, .. } => {
+            super::super::host::access(&host, amode, flags & AT_EACCESS != 0, follow).map(|_| 0)
+        }
+    }
+}
+
+/// `readlinkat` (and `readlink`).
+pub fn readlinkat(c: &mut Ctx<'_>, dirfd: i32, path: u64, buf: u64, size: u64) -> SysResult {
+    if (size as i64) <= 0 {
+        return Err(Errno(EINVAL));
+    }
+    let bytes = match resolve(c, dirfd, path, AT_EMPTY_PATH, false)? {
+        Target::Proc(ProcEntry::Link(t), _) => t.into_bytes(),
+        Target::Proc(..) | Target::Fd(_) => return Err(Errno(EINVAL)),
+        Target::Host { host, .. } => {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::read_link(&host)?.as_os_str().as_bytes().to_vec()
+        }
+    };
+    let n = bytes.len().min(size as usize);
+    c.write_mem(buf, &bytes[..n])?;
+    Ok(n as u64)
+}
+
+/// `getcwd`: returns the length including the NUL.
+pub fn getcwd(c: &mut Ctx<'_>, buf: u64, size: u64) -> SysResult {
+    let mut cwd = c.p.vfs.cwd().as_bytes().to_vec();
+    cwd.push(0);
+    if (size as usize) < cwd.len() {
+        return Err(Errno(ERANGE));
+    }
+    c.write_mem(buf, &cwd)?;
+    Ok(cwd.len() as u64)
+}
+
+fn set_cwd_from(c: &mut Ctx<'_>, target: Target) -> SysResult {
+    match target {
+        Target::Host { host, .. } => {
+            let m = std::fs::metadata(&host)?;
+            if !m.is_dir() {
+                return Err(Errno(ENOTDIR));
+            }
+            let canonical = std::fs::canonicalize(&host)?;
+            let guest = c.p.vfs.guest_path_of(&canonical);
+            c.p.vfs.set_cwd(guest);
+            Ok(0)
+        }
+        Target::Proc(ProcEntry::Dir(_), guest) => {
+            c.p.vfs.set_cwd(guest);
+            Ok(0)
+        }
+        Target::Proc(ProcEntry::Link(link), _) => {
+            let t = resolve_str(c, AT_FDCWD, &link, true)?;
+            set_cwd_from(c, t)
+        }
+        Target::Proc(..) => Err(Errno(ENOTDIR)),
+        Target::Fd(f) => match &f.host_path {
+            Some(h) => {
+                let guest = c.p.vfs.guest_path_of(h);
+                let t = resolve_str(c, AT_FDCWD, &guest, true)?;
+                set_cwd_from(c, t)
+            }
+            None if f.ftype == FileType::Directory => {
+                c.p.vfs.set_cwd(f.path.clone());
+                Ok(0)
+            }
+            None => Err(Errno(ENOTDIR)),
+        },
+    }
+}
+
+/// `chdir`.
+pub fn chdir(c: &mut Ctx<'_>, path: u64) -> SysResult {
+    let target = resolve(c, AT_FDCWD, path, 0, true)?;
+    set_cwd_from(c, target)
+}
+
+/// `fchdir`.
+pub fn fchdir(c: &mut Ctx<'_>, fd: i32) -> SysResult {
+    let file = c.p.fds.file(fd)?;
+    if file.ftype != FileType::Directory {
+        return Err(Errno(ENOTDIR));
+    }
+    set_cwd_from(c, Target::Fd(file))
+}
+
+fn host_target(c: &Ctx<'_>, dirfd: i32, path: u64, follow: bool) -> Result<PathBuf, Errno> {
+    match resolve(c, dirfd, path, 0, follow)? {
+        Target::Host { host, .. } => Ok(host),
+        // Synthesized entries are read-only.
+        Target::Proc(..) | Target::Fd(_) => Err(Errno(EACCES)),
+    }
+}
+
+/// `mkdirat` (and `mkdir`).
+pub fn mkdirat(c: &mut Ctx<'_>, dirfd: i32, path: u64, perm: u32) -> SysResult {
+    let host = host_target(c, dirfd, path, false)?;
+    let bits = perm & 0o7777 & !c.p.umask;
+    std::fs::DirBuilder::new().mode(bits).create(&host)?;
+    fs::created_mode(&host, bits)?;
+    super::notify::created(c, &host, true);
+    Ok(0)
+}
+
+/// `mknodat` (and `mknod`; `do_mknodat`): a regular file, FIFO, or socket
+/// node, or a device node (with `CAP_MKNOD`, which only root has here),
+/// its permissions masked by the umask. The type is checked first
+/// (`may_mknod`: a directory is `EPERM`, an unknown type `EINVAL`), then the
+/// name (`filename_create`: `EEXIST` for an existing one, `ENOENT` for a
+/// new one with a trailing slash), then the device privilege. A host that
+/// refuses unprivileged socket nodes (macOS) gets one by binding a socket
+/// there.
+pub fn mknodat(c: &mut Ctx<'_>, dirfd: i32, path: u64, perm: u32, dev: u32) -> SysResult {
+    use mode::*;
+    let kind = perm & S_IFMT;
+    match kind {
+        0 | S_IFREG | S_IFCHR | S_IFBLK | S_IFIFO | S_IFSOCK => {}
+        S_IFDIR => return Err(Errno(EPERM)),
+        _ => return Err(Errno(EINVAL)),
+    }
+    let raw = c.read_cstr_raw(path, fs::PATH_MAX - 1)?;
+    let host = host_target(c, dirfd, path, false)?;
+    // The last component is looked up without its trailing slashes.
+    let bare = host.to_string_lossy().trim_end_matches('/').to_string();
+    if std::fs::symlink_metadata(if bare.is_empty() { "/" } else { &bare }).is_ok() {
+        return Err(Errno(EEXIST));
+    }
+    if raw.ends_with(b"/") {
+        return Err(Errno(ENOENT));
+    }
+    let bits = perm & 0o7777 & !c.p.umask;
+    let host_mode = |t: libc::mode_t| u32::from(t) | bits;
+    match kind {
+        0 | S_IFREG => {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(bits)
+                .open(&host)?;
+        }
+        S_IFIFO => super::super::host::mknod(&host, host_mode(libc::S_IFIFO), 0, 0)?,
+        S_IFSOCK => match super::super::host::mknod(&host, host_mode(libc::S_IFSOCK), 0, 0) {
+            Err(Errno(EPERM)) if cfg!(not(target_os = "linux")) => {
+                super::super::net::name::socket_node(&host)?;
+                std::fs::set_permissions(&host, std::fs::Permissions::from_mode(bits))?;
+            }
+            r => r?,
+        },
+        _ => {
+            // vfs_mknod: a whiteout (a character device 0:0) needs no
+            // privilege; may_create comes first.
+            let whiteout = kind == S_IFCHR && dev == 0;
+            if !whiteout && c.p.creds.1 != 0 {
+                let parent = host.parent().unwrap_or(std::path::Path::new("/"));
+                return Err(Errno(
+                    match super::super::host::access(parent, 3, true, true) {
+                        Err(e) => e.0,
+                        Ok(()) => EPERM,
+                    },
+                ));
+            }
+            // new_decode_dev.
+            let (major, minor) = ((dev & 0xfff00) >> 8, (dev & 0xff) | ((dev >> 12) & 0xfff00));
+            let t = if kind == S_IFCHR {
+                libc::S_IFCHR
+            } else {
+                libc::S_IFBLK
+            };
+            super::super::host::mknod(&host, host_mode(t), major, minor)?;
+        }
+    }
+    fs::created_mode(&host, bits)?;
+    super::notify::created(c, &host, false);
+    Ok(0)
+}
+
+/// `unlinkat` (and `unlink`, `rmdir`).
+pub fn unlinkat(c: &mut Ctx<'_>, dirfd: i32, path: u64, flags: u32) -> SysResult {
+    if flags & !AT_REMOVEDIR != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let host = host_target(c, dirfd, path, false)?;
+    let was = super::notify::before(c, &host);
+    if flags & AT_REMOVEDIR != 0 {
+        std::fs::remove_dir(&host)?;
+    } else {
+        // Linux reports EISDIR for unlink(dir); some hosts report EPERM.
+        if std::fs::symlink_metadata(&host)?.is_dir() {
+            return Err(Errno(EISDIR));
+        }
+        std::fs::remove_file(&host)?;
+    }
+    super::notify::removed(c, &host, was);
+    Ok(0)
+}
+
+/// `renameat2` (and `rename`, `renameat`).
+pub fn renameat2(
+    c: &mut Ctx<'_>,
+    olddir: i32,
+    old: u64,
+    newdir: i32,
+    new: u64,
+    flags: u32,
+) -> SysResult {
+    const RENAME_NOREPLACE: u32 = 1;
+    if flags & !RENAME_NOREPLACE != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let from = host_target(c, olddir, old, false)?;
+    let to = host_target(c, newdir, new, false)?;
+    if flags & RENAME_NOREPLACE != 0 && std::fs::symlink_metadata(&to).is_ok() {
+        return Err(Errno(EEXIST));
+    }
+    let moved = super::notify::moving(c, &from);
+    let target = super::notify::before(c, &to);
+    std::fs::rename(&from, &to)?;
+    // vfs_rename: two links of one inode are left as they are, unreported.
+    let same = matches!((moved, target), (Some((m, _)), Some((t, _))) if m.key == t.key);
+    if !same {
+        super::notify::renamed(c, &from, &to, moved, target);
+    }
+    Ok(0)
+}
+
+/// `linkat` (and `link`).
+pub fn linkat(
+    c: &mut Ctx<'_>,
+    olddir: i32,
+    old: u64,
+    newdir: i32,
+    new: u64,
+    flags: u32,
+) -> SysResult {
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let from = host_target(c, olddir, old, flags & AT_SYMLINK_FOLLOW != 0)?;
+    let to = host_target(c, newdir, new, false)?;
+    std::fs::hard_link(&from, &to)?;
+    super::notify::linked(c, &to);
+    Ok(0)
+}
+
+/// `symlinkat` (and `symlink`). The target is stored verbatim.
+pub fn symlinkat(c: &mut Ctx<'_>, target: u64, newdir: i32, linkpath: u64) -> SysResult {
+    let raw = c.read_cstr_raw(target, fs::PATH_MAX - 1)?;
+    if raw.is_empty() {
+        return Err(Errno(ENOENT));
+    }
+    let target = fs::Vfs::path_str(&raw)?;
+    let link = host_target(c, newdir, linkpath, false)?;
+    std::os::unix::fs::symlink(target, &link)?;
+    super::notify::created(c, &link, false);
+    Ok(0)
+}
+
+/// `fchmodat`/`fchmodat2` (and `chmod`).
+pub fn fchmodat(c: &mut Ctx<'_>, dirfd: i32, path: u64, perm: u32, flags: u32) -> SysResult {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let host = match resolve(c, dirfd, path, flags, follow)? {
+        Target::Host { host, .. } => host,
+        Target::Fd(f) => f.host_path.clone().ok_or(Errno(EBADF))?,
+        Target::Proc(..) => return Err(Errno(EPERM)),
+    };
+    if !follow && std::fs::symlink_metadata(&host)?.file_type().is_symlink() {
+        // Linux cannot change a symbolic link's mode.
+        return Err(Errno(EOPNOTSUPP));
+    }
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(perm & 0o7777))?;
+    super::notify::changed(c, &host, follow, IN_ATTRIB);
+    Ok(0)
+}
+
+/// `fchmod`.
+pub fn fchmod(c: &mut Ctx<'_>, fd: i32, perm: u32) -> SysResult {
+    let file = c.p.fds.file(fd)?;
+    match &file.object {
+        FileObject::Host(f) => {
+            if let Some(m) = &file.memfd {
+                m.check_mode(f.metadata()?.permissions().mode(), perm)?;
+            }
+            f.set_permissions(std::fs::Permissions::from_mode(perm & 0o7777))?;
+            super::notify::changed_file(&file, IN_ATTRIB);
+            Ok(0)
+        }
+        FileObject::PathOnly => Err(Errno(EBADF)),
+        // anon_inode_setattr (pidfs_setattr calls it too).
+        FileObject::Anon(_) => Err(Errno(EOPNOTSUPP)),
+        FileObject::Mqueue(h) => super::mqueue::chmod(c, h, perm),
+        _ => Ok(0),
+    }
+}
+
+fn opt_id(id: u32) -> Option<u32> {
+    (id != u32::MAX).then_some(id)
+}
+
+/// `fchownat` (and `chown`, `lchown`).
+pub fn fchownat(
+    c: &mut Ctx<'_>,
+    dirfd: i32,
+    path: u64,
+    uid: u32,
+    gid: u32,
+    flags: u32,
+) -> SysResult {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno(EINVAL));
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let host = match resolve(c, dirfd, path, flags, follow)? {
+        Target::Host { host, .. } => host,
+        Target::Fd(f) => f.host_path.clone().ok_or(Errno(EBADF))?,
+        Target::Proc(..) => return Err(Errno(EPERM)),
+    };
+    if follow {
+        std::os::unix::fs::chown(&host, opt_id(uid), opt_id(gid))?;
+    } else {
+        std::os::unix::fs::lchown(&host, opt_id(uid), opt_id(gid))?;
+    }
+    super::notify::changed(c, &host, follow, owner_mask(uid, gid));
+    Ok(0)
+}
+
+/// `fsnotify_change`'s mask for an ownership change: `ATTR_UID` or
+/// `ATTR_GID` are an attribute change; neither is nothing.
+fn owner_mask(uid: u32, gid: u32) -> u32 {
+    if opt_id(uid).is_some() || opt_id(gid).is_some() {
+        IN_ATTRIB
+    } else {
+        0
+    }
+}
+
+/// `fchown`.
+pub fn fchown(c: &mut Ctx<'_>, fd: i32, uid: u32, gid: u32) -> SysResult {
+    let file = c.p.fds.file(fd)?;
+    match &file.object {
+        FileObject::Host(f) => {
+            std::os::unix::fs::fchown(f, opt_id(uid), opt_id(gid))?;
+            super::notify::changed_file(&file, owner_mask(uid, gid));
+            Ok(0)
+        }
+        FileObject::PathOnly => Err(Errno(EBADF)),
+        // anon_inode_setattr.
+        FileObject::Anon(_) => Err(Errno(EOPNOTSUPP)),
+        FileObject::Mqueue(h) => super::mqueue::chown(c, h, uid, gid),
+        _ => Ok(0),
+    }
+}
+
+/// `truncate`.
+pub fn truncate(c: &mut Ctx<'_>, path: u64, len: i64) -> SysResult {
+    if len < 0 {
+        return Err(Errno(EINVAL));
+    }
+    let host = host_target(c, AT_FDCWD, path, true)?;
+    let m = std::fs::metadata(&host)?;
+    if m.is_dir() {
+        return Err(Errno(EISDIR));
+    }
+    // By path, as the guest asked: an open of the file would be one more
+    // thing a host watcher sees.
+    let p =
+        std::ffi::CString::new(host.as_os_str().as_encoded_bytes()).map_err(|_| Errno(EINVAL))?;
+    // SAFETY: a NUL-terminated path and a length.
+    if unsafe { libc::truncate(p.as_ptr(), len) } != 0 {
+        return Err(Errno::from(std::io::Error::last_os_error()));
+    }
+    use std::os::unix::fs::MetadataExt;
+    let identity = crate::user::mm::SourceIdentity {
+        dev: m.dev(),
+        ino: m.ino(),
+    };
+    c.p.space.truncated(identity, len as u64);
+    super::notify::changed(c, &host, true, IN_MODIFY);
+    Ok(0)
+}
+
+/// `EXT4_SUPER_MAGIC`, reported for host file systems.
+const EXT4_SUPER_MAGIC: u64 = 0xEF53;
+/// `PROC_SUPER_MAGIC`.
+const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+/// `ST_VALID` (`f_flags` is meaningful).
+const ST_VALID: u64 = 0x20;
+
+/// `struct kstatfs` of a file system of magic `kind`.
+fn kstatfs(kind: u64, st: &super::super::host::FsStats) -> Kstatfs {
+    Kstatfs {
+        kind,
+        bsize: st.bsize,
+        blocks: st.blocks,
+        bfree: st.bfree,
+        bavail: st.bavail,
+        files: st.files,
+        ffree: st.ffree,
+        fsid: [0, 0],
+        namelen: st.namemax,
+        frsize: st.frsize,
+        flags: ST_VALID | (st.flags & 0x3),
+    }
+}
+
+/// The statistics of a synthesized file system.
+fn synthetic_fs() -> super::super::host::FsStats {
+    super::super::host::FsStats {
+        bsize: 4096,
+        frsize: 4096,
+        namemax: 255,
+        ..Default::default()
+    }
+}
+
+/// `user_statfs`: the statistics of the file system holding `path`.
+pub(super) fn statfs_path(c: &mut Ctx<'_>, path: u64) -> Result<Kstatfs, Errno> {
+    match resolve(c, AT_FDCWD, path, 0, true)? {
+        Target::Proc(..) => Ok(kstatfs(PROC_SUPER_MAGIC, &synthetic_fs())),
+        Target::Host { host, .. } => Ok(kstatfs(
+            EXT4_SUPER_MAGIC,
+            &super::super::host::statvfs(&host)?,
+        )),
+        Target::Fd(_) => Err(Errno(ENOENT)),
+    }
+}
+
+/// `fd_statfs`: the statistics of the file system holding `fd`'s file.
+pub(super) fn statfs_fd(c: &Ctx<'_>, fd: i32) -> Result<Kstatfs, Errno> {
+    let file = c.p.fds.file(fd)?;
+    Ok(match &file.host_path {
+        Some(h) => kstatfs(EXT4_SUPER_MAGIC, &super::super::host::statvfs(h)?),
+        None if super::pidfd::target_of(&file).is_some() => {
+            kstatfs(super::pidfd::PID_FS_MAGIC, &synthetic_fs())
+        }
+        None => kstatfs(PROC_SUPER_MAGIC, &synthetic_fs()),
+    })
+}
+
+/// `statfs` (`struct statfs`, 120 bytes on every 64-bit ABI).
+pub fn statfs(c: &mut Ctx<'_>, path: u64, buf: u64) -> SysResult {
+    let k = statfs_path(c, path)?;
+    c.write_mem(buf, &k.encode())?;
+    Ok(0)
+}
+
+/// `fstatfs`.
+pub fn fstatfs(c: &mut Ctx<'_>, fd: i32, buf: u64) -> SysResult {
+    let k = statfs_fd(c, fd)?;
+    c.write_mem(buf, &k.encode())?;
+    Ok(0)
+}
+
+/// `umask`.
+pub fn umask(c: &mut Ctx<'_>, mask: u32) -> SysResult {
+    let old = c.p.umask;
+    c.p.umask = mask & 0o777;
+    Ok(u64::from(old))
+}

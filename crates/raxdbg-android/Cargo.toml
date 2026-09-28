@@ -1,0 +1,24 @@
+[package]
+name = "raxdbg-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Android emulation on top of raxdbg-core: ELF loader, syscalls, dvm (JNI), hooks, APK"
+
+[dependencies]
+raxdbg-core.workspace = true
+raxdbg-backend-rax.workspace = true
+log.workspace = true
+thiserror.workspace = true
+goblin.workspace = true
+zip.workspace = true
+yaxpeax-arm.workspace = true
+yaxpeax-arch.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+object.workspace = true
+
+[lints]
+workspace = true

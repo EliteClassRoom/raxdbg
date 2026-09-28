@@ -1,0 +1,1326 @@
+//! CPU-level native-JIT coverage for helper-backed VEX/EVEX memory sources.
+
+use super::*;
+use std::sync::Arc;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+#[path = "cpu_jit_vector_memory_source_tests/broadcast.rs"]
+mod broadcast;
+
+const DATA_BASE: u64 = 0x3000;
+const DISP: u64 = 0x20;
+
+fn long_mode_vcpu(memory: Arc<GuestMemoryMmap>) -> X86_64Vcpu {
+    let mut vcpu = X86_64Vcpu::new(0, memory);
+    vcpu.sregs.efer = 1 << 10;
+    vcpu.sregs.cs.l = true;
+    vcpu.regs.rflags = 0x8D7;
+    vcpu.mxcsr = 0xDFC5;
+    vcpu.set_jit_mem(true);
+    vcpu.set_jit_call(false);
+    vcpu
+}
+
+fn seed_architectural_state(vcpu: &mut X86_64Vcpu) {
+    vcpu.regs.rax = 0x0123_4567_89AB_CDEF;
+    vcpu.regs.rcx = 0x1111_2222_3333_4444;
+    vcpu.regs.rdx = 0x5555_6666_7777_8888;
+    vcpu.regs.rbx = DATA_BASE;
+    vcpu.regs.rsp = 0x9000;
+    vcpu.regs.rbp = 0xA000;
+    vcpu.regs.rsi = 0x9999_AAAA_BBBB_CCCC;
+    vcpu.regs.rdi = 0xDDDD_EEEE_FFFF_0000;
+    vcpu.regs.r8 = 0x0808_0808_0808_0808;
+    vcpu.regs.r9 = 0x0909_0909_0909_0909;
+    vcpu.regs.r10 = 0x1010_1010_1010_1010;
+    vcpu.regs.r11 = DATA_BASE;
+    vcpu.regs.r12 = 0x1212_1212_1212_1212;
+    vcpu.regs.r13 = 0x1313_1313_1313_1313;
+    vcpu.regs.r14 = 0x1414_1414_1414_1414;
+    vcpu.regs.r15 = 0x1515_1515_1515_1515;
+    vcpu.regs.xmm = std::array::from_fn(|register| {
+        [
+            0x0123_4567_89AB_CDEFu64.rotate_left((register * 7) as u32),
+            0xFEDC_BA98_7654_3210u64.rotate_right((register * 11) as u32),
+        ]
+    });
+    vcpu.regs.ymm_high = std::array::from_fn(|register| {
+        [
+            0x1111_2222_3333_4444u64.rotate_left((register * 5) as u32),
+            0xAAAA_BBBB_CCCC_DDDDu64.rotate_right((register * 3) as u32),
+        ]
+    });
+    vcpu.regs.zmm_high = std::array::from_fn(|register| {
+        std::array::from_fn(|word| {
+            0xF0E1_D2C3_B4A5_9687u64.rotate_left((register * 13 + word * 17) as u32)
+        })
+    });
+    vcpu.regs.zmm_ext = std::array::from_fn(|register| {
+        std::array::from_fn(|word| {
+            0x6996_F00F_3CC3_A55Au64.rotate_right((register * 19 + word * 23) as u32)
+        })
+    });
+    vcpu.regs.k = [
+        0x6996_F00F_3CC3_A55A,
+        0,
+        1,
+        0x0123_4567_89AB_CDEF,
+        0x5555_AAAA_3333_CCCC,
+        0x8000_0000_0000_0000,
+        0xF0F0_0F0F_A5A5_5A5A,
+        u64::MAX,
+    ];
+}
+
+fn gprs(regs: &crate::vm::vcpu::Registers) -> [u64; 16] {
+    [
+        regs.rax, regs.rcx, regs.rdx, regs.rbx, regs.rsp, regs.rbp, regs.rsi, regs.rdi, regs.r8,
+        regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15,
+    ]
+}
+
+fn assert_architectural_state_equal(
+    actual: &X86_64Vcpu,
+    expected: &crate::vm::vcpu::Registers,
+    expected_mxcsr: u32,
+    context: &str,
+) {
+    assert_eq!(gprs(&actual.regs), gprs(expected), "{context}: GPRs");
+    assert_eq!(actual.regs.xmm, expected.xmm, "{context}: XMM");
+    assert_eq!(
+        actual.regs.ymm_high, expected.ymm_high,
+        "{context}: YMM high"
+    );
+    assert_eq!(
+        actual.regs.zmm_high, expected.zmm_high,
+        "{context}: ZMM high"
+    );
+    assert_eq!(
+        actual.regs.zmm_ext, expected.zmm_ext,
+        "{context}: ZMM16-ZMM31"
+    );
+    assert_eq!(actual.regs.k, expected.k, "{context}: opmasks");
+    assert_eq!(actual.regs.rflags, expected.rflags, "{context}: RFLAGS");
+    assert_eq!(actual.mxcsr, expected_mxcsr, "{context}: MXCSR");
+    assert_eq!(actual.regs.rip, expected.rip, "{context}: RIP");
+}
+
+fn packed_f32_words(values: [f32; 16]) -> [u64; 8] {
+    std::array::from_fn(|word| {
+        u64::from(values[word * 2].to_bits()) | (u64::from(values[word * 2 + 1].to_bits()) << 32)
+    })
+}
+
+fn packed_f16_words(values: [u16; 32]) -> [u64; 8] {
+    std::array::from_fn(|word| {
+        u64::from(values[word * 4])
+            | (u64::from(values[word * 4 + 1]) << 16)
+            | (u64::from(values[word * 4 + 2]) << 32)
+            | (u64::from(values[word * 4 + 3]) << 48)
+    })
+}
+
+#[test]
+fn jit_verify_executes_unmasked_evex_packed_fma3_memory_source() {
+    if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+        eprintln!("skipping CPU JIT EVEX FMA3 memory verification: host lacks AVX-512F/BW");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231ps zmm17,zmm18,[rbx+0x40]; jmp next; hlt
+    // Intel full-tuple disp8 compression encodes the 64-byte displacement as 1.
+    let code = [0x62, 0xE2, 0x6D, 0x40, 0xB8, 0x4B, 0x01, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    let memory_words = packed_f32_words(std::array::from_fn(|lane| lane as f32 + 1.0));
+    let mut memory_bytes = [0u8; 64];
+    for (bytes, word) in memory_bytes.chunks_exact_mut(8).zip(memory_words) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    memory
+        .write_slice(&memory_bytes, GuestAddress(DATA_BASE + 64))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+    let destination = packed_f32_words(std::array::from_fn(|lane| 100.0 - lane as f32));
+    let source1 = packed_f32_words(std::array::from_fn(|lane| lane as f32 * 0.5 + 2.0));
+    for vcpu in [&mut direct, &mut verified] {
+        vcpu.regs.zmm_ext[1] = destination;
+        vcpu.regs.zmm_ext[2] = source1;
+    }
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(direct_steps <= 2, "direct execution missed HLT frontier");
+    }
+    assert_eq!(direct_steps, 2);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile EVEX packed FMA3 memory region")
+        .expect("helper-backed EVEX packed FMA3 must be native eligible");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified EVEX packed FMA3",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_evex_packed_fma3_memory_fault_preserves_destination_and_mxcsr() {
+    if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+        eprintln!("skipping CPU JIT EVEX FMA3 memory fault test: host lacks AVX-512F/BW");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231ps zmm17,zmm18,[rbx+0x40]; jmp next; hlt
+    let code = [0x62, 0xE2, 0x6D, 0x40, 0xB8, 0x4B, 0x01, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.rbx = 0x2_0000;
+    let before = vcpu.regs.clone();
+    let before_mxcsr = vcpu.mxcsr;
+
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile faulting EVEX packed FMA3 memory region")
+        .expect("dynamic faulting address must not prevent EVEX FMA3 admission");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    vcpu.jit_run_region_native(&region);
+
+    assert_architectural_state_equal(
+        &vcpu,
+        &before,
+        before_mxcsr,
+        "EVEX packed FMA3 fault deoptimization",
+    );
+    assert_eq!(vcpu.regs.rip, 0);
+}
+
+#[test]
+fn jit_verify_executes_unmasked_evex_packed_fp16_fma3_memory_source() {
+    if !std::is_x86_feature_detected!("avx512f")
+        || !std::is_x86_feature_detected!("avx512bw")
+        || !std::is_x86_feature_detected!("avx512fp16")
+    {
+        eprintln!(
+            "skipping CPU JIT EVEX FP16 FMA3 memory verification: \
+             host lacks AVX-512F/BW/FP16"
+        );
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231ph zmm17,zmm18,[rbx+0x40]; jmp next; hlt
+    // LLVM 23 independently emits 62 E6 6D 40 B8 4B 01 for the FMA. Intel
+    // full-tuple disp8 compression encodes the 64-byte displacement as 1.
+    let code = [0x62, 0xE6, 0x6D, 0x40, 0xB8, 0x4B, 0x01, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    let memory_words = packed_f16_words(std::array::from_fn(|lane| {
+        [0x4900, 0x4980, 0xCA00, 0xCA80][lane & 3]
+    }));
+    let mut memory_bytes = [0u8; 64];
+    for (bytes, word) in memory_bytes.chunks_exact_mut(8).zip(memory_words) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    memory
+        .write_slice(&memory_bytes, GuestAddress(DATA_BASE + 64))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+    let destination = packed_f16_words(std::array::from_fn(|lane| {
+        [0x3C00, 0xC000, 0x4200, 0xC400][lane & 3]
+    }));
+    let source1 = packed_f16_words(std::array::from_fn(|lane| {
+        [0x4000, 0x4200, 0xC400, 0xC500][lane & 3]
+    }));
+    for vcpu in [&mut direct, &mut verified] {
+        vcpu.regs.zmm_ext[1] = destination;
+        vcpu.regs.zmm_ext[2] = source1;
+    }
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(
+            direct_steps <= 2,
+            "direct FP16 execution missed HLT frontier"
+        );
+    }
+    assert_eq!(direct_steps, 2);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile EVEX packed FP16 FMA3 memory region")
+        .expect("helper-backed EVEX packed FP16 FMA3 must be native eligible");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified EVEX packed FP16 FMA3",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_evex_packed_fp16_fma3_memory_fault_preserves_destination_and_mxcsr() {
+    if !std::is_x86_feature_detected!("avx512f")
+        || !std::is_x86_feature_detected!("avx512bw")
+        || !std::is_x86_feature_detected!("avx512fp16")
+    {
+        eprintln!(
+            "skipping CPU JIT EVEX FP16 FMA3 memory fault test: \
+             host lacks AVX-512F/BW/FP16"
+        );
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231ph zmm17,zmm18,[rbx+0x40]; jmp next; hlt
+    let code = [0x62, 0xE6, 0x6D, 0x40, 0xB8, 0x4B, 0x01, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.rbx = 0x2_0000;
+    let before = vcpu.regs.clone();
+    let before_mxcsr = vcpu.mxcsr;
+
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile faulting EVEX packed FP16 FMA3 memory region")
+        .expect("dynamic faulting address must not prevent EVEX FP16 FMA3 admission");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    vcpu.jit_run_region_native(&region);
+
+    assert_architectural_state_equal(
+        &vcpu,
+        &before,
+        before_mxcsr,
+        "EVEX packed FP16 FMA3 fault deoptimization",
+    );
+    assert_eq!(vcpu.regs.rip, 0);
+}
+
+#[test]
+fn jit_verify_executes_unmasked_evex_scalar_fma3_memory_sources() {
+    if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+        eprintln!("skipping CPU JIT scalar EVEX FMA3 verification: host lacks AVX-512F/BW");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231ss xmm17,xmm18,[rbx+4]  with LLIG=3
+    // vfmadd231sd xmm17,xmm18,[rbx+8]  with LLIG=1
+    // jmp next; hlt
+    //
+    // LLVM 23 independently emits the canonical LLIG=0 forms as
+    // 62 E2 6D 00 B9 4B 01 and 62 E2 ED 00 B9 4B 01. The guest encodings vary
+    // LLIG; helper-backed replay canonicalizes the emitted stack forms.
+    let code = [
+        0x62, 0xE2, 0x6D, 0x60, 0xB9, 0x4B, 0x01, 0x62, 0xE2, 0xED, 0x20, 0xB9, 0x4B, 0x01, 0xEB,
+        0x00, 0xF4,
+    ];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    memory
+        .write_slice(&3.0f32.to_bits().to_le_bytes(), GuestAddress(DATA_BASE + 4))
+        .unwrap();
+    memory
+        .write_slice(&4.0f64.to_bits().to_le_bytes(), GuestAddress(DATA_BASE + 8))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+    for vcpu in [&mut direct, &mut verified] {
+        vcpu.regs.zmm_ext[1][0] = 1.5f64.to_bits();
+        vcpu.regs.zmm_ext[2][0] = 2.0f64.to_bits();
+    }
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(
+            direct_steps <= 3,
+            "direct scalar FMA execution missed HLT frontier"
+        );
+    }
+    assert_eq!(direct_steps, 3);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile scalar EVEX FMA3 memory region")
+        .expect("helper-backed scalar EVEX FMA3 must be native eligible");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified scalar EVEX FMA3",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_evex_scalar_fma3_memory_fault_preserves_destination_and_mxcsr() {
+    if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+        eprintln!("skipping CPU JIT scalar EVEX FMA3 fault test: host lacks AVX-512F/BW");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231sd xmm17,xmm18,[rbx+8]; jmp next; hlt
+    let code = [0x62, 0xE2, 0xED, 0x00, 0xB9, 0x4B, 0x01, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.rbx = 0x2_0000;
+    let before = vcpu.regs.clone();
+    let before_mxcsr = vcpu.mxcsr;
+
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile faulting scalar EVEX FMA3 memory region")
+        .expect("dynamic faulting address must not prevent scalar FMA3 admission");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    vcpu.jit_run_region_native(&region);
+
+    assert_architectural_state_equal(
+        &vcpu,
+        &before,
+        before_mxcsr,
+        "scalar EVEX FMA3 fault deoptimization",
+    );
+    assert_eq!(vcpu.regs.rip, 0);
+}
+
+#[test]
+fn jit_verify_executes_active_masked_evex_scalar_fma3_memory_sources() {
+    if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+        eprintln!("skipping CPU JIT masked scalar EVEX FMA3 verification: host lacks AVX-512F/BW");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231ss xmm17{k2},xmm18,[rbx+4]
+    // vfmadd231sd xmm19{k2}{z},xmm20,[rbx+8]
+    // jmp next; hlt
+    //
+    // LLVM 23 independently emits these canonical LLIG=0 encodings.
+    let code = [
+        0x62, 0xE2, 0x6D, 0x02, 0xB9, 0x4B, 0x01, 0x62, 0xE2, 0xDD, 0x82, 0xB9, 0x5B, 0x01, 0xEB,
+        0x00, 0xF4,
+    ];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    memory
+        .write_slice(&3.0f32.to_bits().to_le_bytes(), GuestAddress(DATA_BASE + 4))
+        .unwrap();
+    memory
+        .write_slice(&4.0f64.to_bits().to_le_bytes(), GuestAddress(DATA_BASE + 8))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+    for vcpu in [&mut direct, &mut verified] {
+        vcpu.regs.zmm_ext[1][0] =
+            (vcpu.regs.zmm_ext[1][0] & !u64::from(u32::MAX)) | u64::from(1.5f32.to_bits());
+        vcpu.regs.zmm_ext[2][0] =
+            (vcpu.regs.zmm_ext[2][0] & !u64::from(u32::MAX)) | u64::from(2.0f32.to_bits());
+        vcpu.regs.zmm_ext[3][0] = 1.25f64.to_bits();
+        vcpu.regs.zmm_ext[4][0] = 2.5f64.to_bits();
+        vcpu.regs.k[2] |= 1;
+    }
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(
+            direct_steps <= 3,
+            "direct masked scalar FMA execution missed HLT frontier"
+        );
+    }
+    assert_eq!(direct_steps, 3);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile active masked scalar EVEX FMA3 memory region")
+        .expect("helper-backed masked scalar EVEX FMA3 must be native eligible");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified active masked scalar EVEX FMA3",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_masked_evex_scalar_fma3_inactive_sources_suppress_unmapped_memory() {
+    if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+        eprintln!("skipping CPU JIT masked scalar EVEX FMA3 suppression: host lacks AVX-512F/BW");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // Both K1[0] predicates are clear. The merge-masked m32 and zero-masked
+    // m64 sources are outside guest memory and therefore must not be read.
+    // vfmadd231ss xmm17{k1},xmm18,[rbx+4]
+    // vfmadd231sd xmm19{k1}{z},xmm20,[rbx+8]
+    // jmp next; hlt
+    let code = [
+        0x62, 0xE2, 0x6D, 0x01, 0xB9, 0x4B, 0x01, 0x62, 0xE2, 0xDD, 0x81, 0xB9, 0x5B, 0x01, 0xEB,
+        0x00, 0xF4,
+    ];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.rbx = 0x2_0000;
+    vcpu.regs.k[1] &= !1;
+
+    let frontier = code.len() as u64 - 1;
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile suppressed masked scalar EVEX FMA3 memory region")
+        .expect("suppressed dynamic memory must remain native eligible");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+
+    // The verified runner compares native execution with the canonical SMIR
+    // interpreter. Either helper invocation would fault on the unmapped source.
+    vcpu.jit_run_region_verified(&region);
+    assert_eq!(vcpu.regs.rip, frontier);
+}
+
+#[test]
+fn jit_masked_evex_scalar_fma3_guards_observe_live_prior_opmask_updates() {
+    if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+        eprintln!("skipping CPU JIT masked scalar EVEX FMA3 live-K test: host lacks AVX-512F/BW");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // K2 starts clear, then KXNORQ makes it active before the mapped source.
+    // K3 starts active, then KXORQ clears it before the unmapped source.
+    // Reading either stale GuestRegs mask would therefore diverge or fault.
+    //
+    // kxnorq k2,k2,k2
+    // vfmadd231ss xmm17{k2},xmm18,[rbx+4]
+    // kxorq k3,k3,k3
+    // vfmadd231ss xmm19{k3}{z},xmm20,[r11+4]
+    // jmp next; hlt
+    //
+    // LLVM 23 independently emits all four instruction encodings.
+    let code = [
+        0xC4, 0xE1, 0xEC, 0x46, 0xD2, 0x62, 0xE2, 0x6D, 0x02, 0xB9, 0x4B, 0x01, 0xC4, 0xE1, 0xE4,
+        0x47, 0xDB, 0x62, 0xC2, 0x5D, 0x83, 0xB9, 0x5B, 0x01, 0xEB, 0x00, 0xF4,
+    ];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    memory
+        .write_slice(&3.0f32.to_bits().to_le_bytes(), GuestAddress(DATA_BASE + 4))
+        .unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.r11 = 0x2_0000;
+    vcpu.regs.zmm_ext[1][0] =
+        (vcpu.regs.zmm_ext[1][0] & !u64::from(u32::MAX)) | u64::from(1.5f32.to_bits());
+    vcpu.regs.zmm_ext[2][0] =
+        (vcpu.regs.zmm_ext[2][0] & !u64::from(u32::MAX)) | u64::from(2.0f32.to_bits());
+    vcpu.regs.zmm_ext[3][0] =
+        (vcpu.regs.zmm_ext[3][0] & !u64::from(u32::MAX)) | u64::from(1.25f32.to_bits());
+    vcpu.regs.zmm_ext[4][0] =
+        (vcpu.regs.zmm_ext[4][0] & !u64::from(u32::MAX)) | u64::from(2.5f32.to_bits());
+    vcpu.regs.k[2] &= !1;
+    vcpu.regs.k[3] |= 1;
+
+    let frontier = code.len() as u64 - 1;
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile live-K masked scalar EVEX FMA3 memory region")
+        .expect("opmask updates and masked scalar memory sources must share a native region");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    vcpu.jit_run_region_verified(&region);
+    assert_eq!(
+        vcpu.regs.zmm_ext[1][0] & u64::from(u32::MAX),
+        u64::from(7.5f32.to_bits()),
+        "KXNORQ-updated K2 must activate the mapped scalar source"
+    );
+    assert_eq!(
+        vcpu.regs.zmm_ext[3][0] & u64::from(u32::MAX),
+        0,
+        "KXORQ-updated K3 must suppress and zero the unmapped scalar source"
+    );
+    assert_eq!(vcpu.regs.k[2], u64::MAX);
+    assert_eq!(vcpu.regs.k[3], 0);
+    assert_eq!(vcpu.regs.rip, frontier);
+}
+
+#[test]
+fn jit_masked_evex_scalar_fma3_active_fault_is_noncommitting() {
+    if !std::is_x86_feature_detected!("avx512f") || !std::is_x86_feature_detected!("avx512bw") {
+        eprintln!("skipping CPU JIT masked scalar EVEX FMA3 fault: host lacks AVX-512F/BW");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231sd xmm19{k2},xmm20,[rbx+8]; jmp next; hlt
+    let code = [0x62, 0xE2, 0xDD, 0x02, 0xB9, 0x5B, 0x01, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.rbx = 0x2_0000;
+    vcpu.regs.k[2] |= 1;
+    let before = vcpu.regs.clone();
+    let before_mxcsr = vcpu.mxcsr;
+
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile faulting masked scalar EVEX FMA3 memory region")
+        .expect("dynamic active fault address must not prevent masked scalar admission");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    vcpu.jit_run_region_native(&region);
+
+    assert_architectural_state_equal(
+        &vcpu,
+        &before,
+        before_mxcsr,
+        "masked scalar EVEX FMA3 active-fault deoptimization",
+    );
+    assert_eq!(vcpu.regs.rip, 0);
+}
+
+#[test]
+fn jit_verify_executes_unmasked_evex_scalar_fp16_fma3_memory_source() {
+    if !std::is_x86_feature_detected!("avx512f")
+        || !std::is_x86_feature_detected!("avx512bw")
+        || !std::is_x86_feature_detected!("avx512fp16")
+    {
+        eprintln!(
+            "skipping CPU JIT scalar EVEX FP16 FMA3 verification: \
+             host lacks AVX-512F/BW/FP16"
+        );
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231sh xmm17,xmm18,[rbx+2] with LLIG=2; jmp next; hlt.
+    // LLVM 23 independently emits the canonical LLIG=0 FMA as
+    // 62 E6 6D 00 B9 4B 01.
+    let code = [0x62, 0xE6, 0x6D, 0x40, 0xB9, 0x4B, 0x01, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    memory
+        .write_slice(&0x4200u16.to_le_bytes(), GuestAddress(DATA_BASE + 2))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+    for vcpu in [&mut direct, &mut verified] {
+        vcpu.regs.zmm_ext[1][0] = (vcpu.regs.zmm_ext[1][0] & !u64::from(u16::MAX)) | 0x3C00;
+        vcpu.regs.zmm_ext[2][0] = (vcpu.regs.zmm_ext[2][0] & !u64::from(u16::MAX)) | 0x4000;
+    }
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(
+            direct_steps <= 2,
+            "direct scalar FP16 execution missed HLT frontier"
+        );
+    }
+    assert_eq!(direct_steps, 2);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile scalar EVEX FP16 FMA3 memory region")
+        .expect("helper-backed scalar EVEX FP16 FMA3 must be native eligible");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified scalar EVEX FP16 FMA3",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_evex_scalar_fp16_fma3_memory_fault_preserves_destination_and_mxcsr() {
+    if !std::is_x86_feature_detected!("avx512f")
+        || !std::is_x86_feature_detected!("avx512bw")
+        || !std::is_x86_feature_detected!("avx512fp16")
+    {
+        eprintln!(
+            "skipping CPU JIT scalar EVEX FP16 FMA3 fault test: \
+             host lacks AVX-512F/BW/FP16"
+        );
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231sh xmm17,xmm18,[rbx+2]; jmp next; hlt
+    let code = [0x62, 0xE6, 0x6D, 0x00, 0xB9, 0x4B, 0x01, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.rbx = 0x2_0000;
+    let before = vcpu.regs.clone();
+    let before_mxcsr = vcpu.mxcsr;
+
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile faulting scalar EVEX FP16 FMA3 memory region")
+        .expect("dynamic faulting address must not prevent scalar FP16 FMA3 admission");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    vcpu.jit_run_region_native(&region);
+
+    assert_architectural_state_equal(
+        &vcpu,
+        &before,
+        before_mxcsr,
+        "scalar EVEX FP16 FMA3 fault deoptimization",
+    );
+    assert_eq!(vcpu.regs.rip, 0);
+}
+
+#[test]
+fn jit_verify_executes_active_masked_evex_scalar_fp16_fma3_memory_source() {
+    if !std::is_x86_feature_detected!("avx512f")
+        || !std::is_x86_feature_detected!("avx512bw")
+        || !std::is_x86_feature_detected!("avx512fp16")
+    {
+        eprintln!(
+            "skipping CPU JIT masked scalar EVEX FP16 FMA3 verification: \
+             host lacks AVX-512F/BW/FP16"
+        );
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vfmadd231sh xmm17{k2}{z},xmm18,[rbx+2]; jmp next; hlt.
+    // LLVM 23 independently emits 62 E6 6D 82 B9 4B 01.
+    let code = [0x62, 0xE6, 0x6D, 0x82, 0xB9, 0x4B, 0x01, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    memory
+        .write_slice(&0x4200u16.to_le_bytes(), GuestAddress(DATA_BASE + 2))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+    for vcpu in [&mut direct, &mut verified] {
+        vcpu.regs.zmm_ext[1][0] = (vcpu.regs.zmm_ext[1][0] & !u64::from(u16::MAX)) | 0x3C00;
+        vcpu.regs.zmm_ext[2][0] = (vcpu.regs.zmm_ext[2][0] & !u64::from(u16::MAX)) | 0x4000;
+        vcpu.regs.k[2] |= 1;
+    }
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(
+            direct_steps <= 2,
+            "direct masked scalar FP16 execution missed HLT frontier"
+        );
+    }
+    assert_eq!(direct_steps, 2);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile active masked scalar EVEX FP16 FMA3 memory region")
+        .expect("helper-backed masked scalar EVEX FP16 FMA3 must be native eligible");
+    assert!(region.uses_vector);
+    assert!(!region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified active masked scalar EVEX FP16 FMA3",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_verify_executes_chained_c4_c5_wig_logic_memory_sources_with_avx_only_state() {
+    if !std::is_x86_feature_detected!("avx") {
+        eprintln!("skipping CPU JIT VEX memory-logic verification: host lacks AVX");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vandps xmm0,xmm1,[rbx+0x20]       (C5, scratch=2)
+    // vorpd ymm15,ymm0,[r11+0x20]       (C4.W0, high destination, scratch=1)
+    // vxorps ymm9,ymm9,[r11+0x20]       (C4.W1 ignored, alias, scratch=0)
+    // jmp next; hlt
+    let code = [
+        0xC5, 0xF0, 0x54, 0x43, 0x20, 0xC4, 0x41, 0x7D, 0x56, 0x7B, 0x20, 0xC4, 0x41, 0xB4, 0x57,
+        0x4B, 0x20, 0xEB, 0x00, 0xF4,
+    ];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    let source: [u8; 32] = std::array::from_fn(|index| (index as u8).wrapping_mul(0x3D) ^ 0xA5);
+    memory
+        .write_slice(&source, GuestAddress(DATA_BASE + DISP))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(direct_steps <= 4, "direct execution missed HLT frontier");
+    }
+    assert_eq!(direct_steps, 4);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile VEX memory-logic region")
+        .expect("helper-backed VEX memory logic must be native eligible");
+    assert!(region.uses_vector);
+    assert!(region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified chained logic",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_verify_executes_packed_integer_logic_memory_sources_with_avx2_gate() {
+    if !std::is_x86_feature_detected!("avx2") {
+        eprintln!("skipping CPU JIT VEX integer memory-logic verification: host lacks AVX2");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vpand xmm2,xmm3,[r11+0x20]       (VEX.128 requires AVX)
+    // vpxor ymm14,ymm2,[r11+0x20]      (VEX.256 requires AVX2)
+    // jmp next; hlt
+    let code = [
+        0xC4, 0xC1, 0x61, 0xDB, 0x53, 0x20, 0xC4, 0x41, 0x6D, 0xEF, 0x73, 0x20, 0xEB, 0x00, 0xF4,
+    ];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    let source: [u8; 32] = std::array::from_fn(|index| (index as u8).wrapping_mul(0xA7) ^ 0x5C);
+    memory
+        .write_slice(&source, GuestAddress(DATA_BASE + DISP))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(direct_steps <= 3, "direct execution missed HLT frontier");
+    }
+    assert_eq!(direct_steps, 3);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile VEX integer memory-logic region")
+        .expect("helper-backed VEX integer memory logic must be native eligible");
+    assert!(region.uses_vector);
+    assert!(region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified packed-integer logic",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_verify_executes_wrapping_and_saturating_integer_arithmetic_memory_sources() {
+    if !std::is_x86_feature_detected!("avx2") {
+        eprintln!("skipping CPU JIT VEX integer memory-arithmetic verification: host lacks AVX2");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vpaddsb xmm2,xmm3,[rbx+0x20]     (C5, signed saturation, scratch=0)
+    // vpsubusb xmm15,xmm0,[r11+0x20]  (C4.W0, unsigned saturation, scratch=1)
+    // vpaddq ymm9,ymm9,[r11+0x20]      (C4.W1 ignored, wrapping, scratch=0)
+    // vpsubsw ymm14,ymm2,[r11+0x20]    (C4.W0, signed saturation, scratch=0)
+    // jmp next; hlt
+    let code = [
+        0xC5, 0xE1, 0xEC, 0x53, 0x20, 0xC4, 0x41, 0x79, 0xD8, 0x7B, 0x20, 0xC4, 0x41, 0xB5, 0xD4,
+        0x4B, 0x20, 0xC4, 0x41, 0x6D, 0xE9, 0x73, 0x20, 0xEB, 0x00, 0xF4,
+    ];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    let source: [u8; 32] = std::array::from_fn(|index| match index % 8 {
+        0 => 0x01,
+        1 => 0x7F,
+        2 => 0x80,
+        3 => 0xFF,
+        4 => 0x55,
+        5 => 0xAA,
+        6 => 0x00,
+        _ => index as u8,
+    });
+    memory
+        .write_slice(&source, GuestAddress(DATA_BASE + DISP))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(direct_steps <= 5, "direct execution missed HLT frontier");
+    }
+    assert_eq!(direct_steps, 5);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile VEX integer memory-arithmetic region")
+        .expect("helper-backed VEX integer arithmetic must be native eligible");
+    assert!(region.uses_vector);
+    assert!(region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified packed-integer arithmetic",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_verify_executes_packed_fp_arithmetic_memory_sources_with_mxcsr_state() {
+    if !std::is_x86_feature_detected!("avx") {
+        eprintln!("skipping CPU JIT VEX FP memory-arithmetic verification: host lacks AVX");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vaddps xmm0,xmm1,[rbx+0x20]     (C5, binary32, scratch=2)
+    // vmulpd ymm15,ymm2,[r11+0x20]    (C4.W0, binary64, scratch=1)
+    // vdivps ymm9,ymm9,[r11+0x20]     (C4.W1 ignored, alias, scratch=0)
+    // vminpd xmm14,xmm2,[r11+0x20]    (C4.W0, binary64, scratch=0)
+    // jmp next; hlt
+    let code = [
+        0xC5, 0xF0, 0x58, 0x43, 0x20, 0xC4, 0x41, 0x6D, 0x59, 0x7B, 0x20, 0xC4, 0x41, 0xB4, 0x5E,
+        0x4B, 0x20, 0xC4, 0x41, 0x69, 0x5D, 0x73, 0x20, 0xEB, 0x00, 0xF4,
+    ];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    let source_words = [
+        0x4000_0000_3F80_0000u64,
+        0x4080_0000_4040_0000,
+        0xBF80_0000_C000_0000,
+        0x3F00_0000_3E80_0000,
+    ];
+    let mut source = [0u8; 32];
+    for (bytes, word) in source.chunks_exact_mut(8).zip(source_words) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    memory
+        .write_slice(&source, GuestAddress(DATA_BASE + DISP))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory);
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+    for vcpu in [&mut direct, &mut verified] {
+        vcpu.regs.xmm[1] = [0; 2];
+        vcpu.regs.xmm[2] = [0x3FF0_0000_0000_0000; 2];
+        vcpu.regs.ymm_high[2] = [0x3FF0_0000_0000_0000; 2];
+        vcpu.regs.xmm[9] = [source_words[0], source_words[1]];
+        vcpu.regs.ymm_high[9] = [source_words[2], source_words[3]];
+    }
+    let masked_mxcsr = verified.mxcsr;
+    for exception_mask in 7..=12 {
+        verified.mxcsr = masked_mxcsr & !(1 << exception_mask);
+        assert!(
+            verified
+                .jit_compile_region()
+                .expect("reject unmasked VEX FP memory-arithmetic region")
+                .is_none(),
+            "MXCSR exception mask bit {exception_mask} was not enforced"
+        );
+    }
+    verified.mxcsr = masked_mxcsr;
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(direct_steps <= 5, "direct execution missed HLT frontier");
+    }
+    assert_eq!(direct_steps, 5);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile VEX FP memory-arithmetic region")
+        .expect("helper-backed VEX FP arithmetic must be native eligible");
+    assert!(region.uses_vector);
+    assert!(region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified packed-FP arithmetic",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_verify_executes_scalar_fp_arithmetic_memory_sources_with_exact_merge_state() {
+    if !std::is_x86_feature_detected!("avx") {
+        eprintln!("skipping CPU JIT scalar VEX FP memory verification: host lacks AVX");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vaddss xmm0,xmm1,[rbx+0x20]     (C5, binary32, scratch=2)
+    // vmulsd xmm15,xmm2,[r11+0x20]    (C4.W0, binary64, scratch=1)
+    // vdivss xmm9,xmm9,[r11+0x20]     (C4.W1 ignored, alias, scratch=0)
+    // vminsd xmm14,xmm2,[r11+0x20]    (C4.W0, binary64, scratch=0)
+    // jmp next; hlt
+    let code = [
+        0xC5, 0xF2, 0x58, 0x43, 0x20, 0xC4, 0x41, 0x6B, 0x59, 0x7B, 0x20, 0xC4, 0x41, 0xB2, 0x5E,
+        0x4B, 0x20, 0xC4, 0x41, 0x6B, 0x5D, 0x73, 0x20, 0xEB, 0x00, 0xF4,
+    ];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+    let source = 0x4000_0000_3F80_0000u64.to_le_bytes();
+    memory
+        .write_slice(&source, GuestAddress(DATA_BASE + DISP))
+        .unwrap();
+
+    let mut direct = long_mode_vcpu(memory.clone());
+    let mut verified = long_mode_vcpu(memory.clone());
+    seed_architectural_state(&mut direct);
+    seed_architectural_state(&mut verified);
+    for vcpu in [&mut direct, &mut verified] {
+        vcpu.regs.xmm[1][0] =
+            (vcpu.regs.xmm[1][0] & 0xFFFF_FFFF_0000_0000) | u64::from(2.0f32.to_bits());
+        vcpu.regs.xmm[2][0] = 3.0f64.to_bits();
+        vcpu.regs.xmm[9][0] =
+            (vcpu.regs.xmm[9][0] & 0xFFFF_FFFF_0000_0000) | u64::from(4.0f32.to_bits());
+    }
+
+    let masked_mxcsr = verified.mxcsr;
+    for exception_mask in 7..=12 {
+        verified.mxcsr = masked_mxcsr & !(1 << exception_mask);
+        assert!(
+            verified
+                .jit_compile_region()
+                .expect("reject unmasked scalar VEX FP memory region")
+                .is_none(),
+            "scalar MXCSR exception mask bit {exception_mask} was not enforced"
+        );
+    }
+    verified.mxcsr = masked_mxcsr;
+
+    let l1_memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    let l1_code = [0xC5, 0xF6, 0x58, 0x43, 0x20, 0xEB, 0x00, 0xF4];
+    l1_memory.write_slice(&l1_code, GuestAddress(0)).unwrap();
+    l1_memory
+        .write_slice(&source, GuestAddress(DATA_BASE + DISP))
+        .unwrap();
+    let mut l1_direct = long_mode_vcpu(l1_memory.clone());
+    let mut l1_verified = long_mode_vcpu(l1_memory);
+    seed_architectural_state(&mut l1_direct);
+    seed_architectural_state(&mut l1_verified);
+    for vcpu in [&mut l1_direct, &mut l1_verified] {
+        vcpu.regs.xmm[1][0] =
+            (vcpu.regs.xmm[1][0] & 0xFFFF_FFFF_0000_0000) | u64::from(2.0f32.to_bits());
+    }
+    let l1_frontier = l1_code.len() as u64 - 1;
+    while l1_direct.regs.rip != l1_frontier {
+        assert!(l1_direct.step().unwrap().is_none());
+    }
+    let l1_region = l1_verified
+        .jit_compile_region()
+        .expect("compile canonical VEX.L=1 scalar memory region")
+        .expect("VEX.L=1 scalar memory region must canonicalize to native VEX.L=0");
+    assert!(l1_region.uses_vector);
+    assert!(l1_region.avx_ymm16_vector_state);
+    l1_verified.jit_run_region_verified(&l1_region);
+    assert_architectural_state_equal(
+        &l1_verified,
+        &l1_direct.regs,
+        l1_direct.mxcsr,
+        "canonical VEX.L=1 scalar-FP arithmetic",
+    );
+    assert_eq!(l1_verified.regs.rip, l1_frontier);
+
+    let frontier = code.len() as u64 - 1;
+    let mut direct_steps = 0usize;
+    while direct.regs.rip != frontier {
+        assert!(direct.step().unwrap().is_none());
+        direct_steps += 1;
+        assert!(direct_steps <= 5, "direct execution missed HLT frontier");
+    }
+    assert_eq!(direct_steps, 5);
+
+    let region = verified
+        .jit_compile_region()
+        .expect("compile scalar VEX FP memory-arithmetic region")
+        .expect("helper-backed scalar VEX FP arithmetic must be native eligible");
+    assert!(region.uses_vector);
+    assert!(region.avx_ymm16_vector_state);
+    assert!(!region.narrow_vector_opmasks);
+
+    verified.jit_run_region_verified(&region);
+    assert_architectural_state_equal(
+        &verified,
+        &direct.regs,
+        direct.mxcsr,
+        "verified scalar-FP arithmetic",
+    );
+    assert_eq!(verified.regs.rip, frontier);
+}
+
+#[test]
+fn jit_fp_arithmetic_memory_fault_preserves_destination_and_mxcsr() {
+    if !std::is_x86_feature_detected!("avx") {
+        eprintln!("skipping CPU JIT VEX FP memory-arithmetic fault test: host lacks AVX");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vdivpd ymm14,ymm2,[r11+0x20]; jmp next; hlt
+    let code = [0xC4, 0x41, 0x6D, 0x5E, 0x73, 0x20, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.r11 = 0x2_0000;
+    let before = vcpu.regs.clone();
+    let before_mxcsr = vcpu.mxcsr;
+
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile faulting VEX FP memory-arithmetic region")
+        .expect("dynamic faulting address must not prevent native admission");
+    assert!(region.uses_vector);
+    assert!(region.avx_ymm16_vector_state);
+    vcpu.jit_run_region_native(&region);
+
+    assert_architectural_state_equal(
+        &vcpu,
+        &before,
+        before_mxcsr,
+        "FP-arithmetic fault deoptimization",
+    );
+    assert_eq!(vcpu.regs.rip, 0);
+}
+
+#[test]
+fn jit_scalar_fp_arithmetic_memory_fault_preserves_destination_and_mxcsr() {
+    if !std::is_x86_feature_detected!("avx") {
+        eprintln!("skipping CPU JIT scalar VEX FP memory fault test: host lacks AVX");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vdivsd xmm14,xmm2,[r11+0x20] with WIG=1; jmp next; hlt
+    let code = [0xC4, 0x41, 0xEB, 0x5E, 0x73, 0x20, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.r11 = 0x2_0000;
+    let before = vcpu.regs.clone();
+    let before_mxcsr = vcpu.mxcsr;
+
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile faulting scalar VEX FP memory region")
+        .expect("dynamic faulting address must not prevent scalar native admission");
+    assert!(region.uses_vector);
+    assert!(region.avx_ymm16_vector_state);
+    vcpu.jit_run_region_native(&region);
+
+    assert_architectural_state_equal(
+        &vcpu,
+        &before,
+        before_mxcsr,
+        "scalar FP-arithmetic fault deoptimization",
+    );
+    assert_eq!(vcpu.regs.rip, 0);
+}
+
+#[test]
+fn jit_integer_arithmetic_memory_fault_exits_without_architectural_commit() {
+    if !std::is_x86_feature_detected!("avx2") {
+        eprintln!("skipping CPU JIT VEX integer memory-arithmetic fault test: host lacks AVX2");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vpsubusb ymm14,ymm2,[r11+0x20]; jmp next; hlt
+    let code = [0xC4, 0x41, 0x6D, 0xD8, 0x73, 0x20, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.r11 = 0x2_0000;
+    let before = vcpu.regs.clone();
+    let before_mxcsr = vcpu.mxcsr;
+
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile faulting VEX integer memory-arithmetic region")
+        .expect("dynamic faulting address must not prevent native admission");
+    assert!(region.uses_vector);
+    assert!(region.avx_ymm16_vector_state);
+    vcpu.jit_run_region_native(&region);
+
+    assert_architectural_state_equal(
+        &vcpu,
+        &before,
+        before_mxcsr,
+        "integer-arithmetic fault deoptimization",
+    );
+    assert_eq!(vcpu.regs.rip, 0);
+}
+
+#[test]
+fn jit_memory_logic_fault_exits_at_instruction_without_architectural_commit() {
+    if !std::is_x86_feature_detected!("avx") {
+        eprintln!("skipping CPU JIT VEX memory-logic fault test: host lacks AVX");
+        return;
+    }
+
+    let memory =
+        Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap());
+    // vandps xmm0,xmm1,[rbx+0x20]; jmp next; hlt
+    let code = [0xC5, 0xF0, 0x54, 0x43, 0x20, 0xEB, 0x00, 0xF4];
+    memory.write_slice(&code, GuestAddress(0)).unwrap();
+
+    let mut vcpu = long_mode_vcpu(memory);
+    seed_architectural_state(&mut vcpu);
+    vcpu.regs.rbx = 0x2_0000;
+    let before = vcpu.regs.clone();
+    let before_mxcsr = vcpu.mxcsr;
+
+    let region = vcpu
+        .jit_compile_region()
+        .expect("compile faulting VEX memory-logic region")
+        .expect("faulting address is dynamic and must not prevent native admission");
+    assert!(region.uses_vector);
+    assert!(region.avx_ymm16_vector_state);
+    vcpu.jit_run_region_native(&region);
+
+    assert_architectural_state_equal(&vcpu, &before, before_mxcsr, "fault deoptimization");
+    assert_eq!(vcpu.regs.rip, 0);
+}

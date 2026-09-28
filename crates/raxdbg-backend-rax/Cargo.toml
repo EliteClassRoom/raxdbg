@@ -1,0 +1,22 @@
+[package]
+name = "raxdbg-backend-rax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "rax CPU backend for raxdbg: user-mode ARM64/ARM32 adapters, run loop, hooks, context"
+
+[dependencies]
+raxdbg-core.workspace = true
+log.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+
+# `default-features = false` drops `kvm` (Linux-only) and `smir-jit` (Unix-only W^X).
+rax = { git = "https://github.com/HexRaysSA/rax", rev = "c468ca32087553bb6c16aad10c17c08fee24ce95", default-features = false }
+
+[dev-dependencies]
+parking_lot.workspace = true
+
+[lints]
+workspace = true
