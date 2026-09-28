@@ -18,7 +18,7 @@ pub mod breakpoint;
 pub mod history;
 pub mod trace;
 
-pub use breakpoint::{BreakControl, BreakPoint, Breaker, BreakerImpl};
+pub use breakpoint::{BreakCallback, BreakControl, BreakPoint, Breaker, BreakerImpl};
 pub use history::{CodeHistory, HistoryEntry};
 pub use trace::{
     AssemblyCodeDumper, Disassembler, MemTraceEvent, NoopDisassembler, TraceCode, TraceMemory,

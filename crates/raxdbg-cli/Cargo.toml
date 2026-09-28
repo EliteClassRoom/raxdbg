@@ -16,6 +16,8 @@ raxdbg-backend-rax.workspace = true
 raxdbg-android.workspace = true
 log.workspace = true
 env_logger.workspace = true
+yaxpeax-arm.workspace = true
+yaxpeax-arch.workspace = true
 
 [lints]
 workspace = true

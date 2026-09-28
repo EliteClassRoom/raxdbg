@@ -6,6 +6,7 @@
 
 pub mod android_file;
 pub mod apk;
+pub mod debug;
 pub mod dvm;
 pub mod elf;
 pub mod emulator;

@@ -104,6 +104,7 @@ impl AndroidEmulator {
         is_64bit: bool,
         process_name: &str,
         root_dir: Option<PathBuf>,
+        libs_dir: Option<PathBuf>,
         sdk: u32,
         seed: u64,
     ) -> Result<Rc<Self>, EmulatorError> {
@@ -137,7 +138,10 @@ impl AndroidEmulator {
         let syscall = AndroidSyscallHandler::new(Rc::clone(&loader), is_64bit, None)?;
         let stdout = syscall.borrow().stdout_sink();
 
-        let mut resolver = AndroidResolver::new(sdk, is_64bit)?;
+        let mut resolver = match libs_dir {
+            Some(dir) => AndroidResolver::with_libs_dir(sdk, is_64bit, dir),
+            None => AndroidResolver::new(sdk, is_64bit)?,
+        };
         if let Some(root) = root_dir {
             resolver.set_root_dir(root);
         }
@@ -464,6 +468,7 @@ pub struct AndroidEmulatorBuilder {
     root_dir: Option<PathBuf>,
     sdk: u32,
     seed: u64,
+    libs_dir: Option<PathBuf>,
 }
 
 impl Default for AndroidEmulatorBuilder {
@@ -474,6 +479,7 @@ impl Default for AndroidEmulatorBuilder {
             root_dir: None,
             sdk: 23,
             seed: 0,
+            libs_dir: None,
         }
     }
 }
@@ -515,6 +521,12 @@ impl AndroidEmulatorBuilder {
         self
     }
 
+    /// Reads the bundled libraries from `dir` instead of the default tree.
+    pub fn libs_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.libs_dir = Some(dir.into());
+        self
+    }
+
     /// Seeds the random source, so a run is reproducible.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = seed;
@@ -527,6 +539,7 @@ impl AndroidEmulatorBuilder {
             self.is_64bit,
             &self.process_name,
             self.root_dir,
+            self.libs_dir,
             self.sdk,
             self.seed,
         )

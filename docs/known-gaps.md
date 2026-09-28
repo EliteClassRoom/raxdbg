@@ -49,6 +49,35 @@ One more, for output rather than correctness: `StdoutFileIO` must answer
 bionic's `isatty` is false and stdout stays block-buffered, so a `printf` with
 a newline never reaches the host.
 
+## CLI, console and unwinder: green
+
+`cargo test -p raxdbg-cli --test cli` — 8/8, and the plan's headline end state
+works:
+
+```console
+$ cargo run -p raxdbg-cli -- run fixtures/prebuilt/arm64-v8a/libctest.so --call "hello()V"
+hello 42
+hello() = 0x0 (0)
+```
+
+`info` prints the module table with dependencies, exports and any unresolved
+relocations; `trace` prints the instructions a call ran (with `yaxpeax-arm`
+disassembly) or the memory accesses; `debug` opens the console (registers,
+breakpoints, memory, disassembly, backtrace, `where`, `modules`, `symbols`,
+`call`); `--leak-check` reports the live mappings, and `--libs-dir` / `--root` /
+`--sdk` / `--abi` / `--seed` / `--stdout` all work.
+
+Two honest limits, both visible in the output rather than hidden:
+
+* a `--call` with a JNI signature (`echo(Ljava/lang/String;)Ljava/lang/String;`)
+  reports that it needs the `dvm` runtime, which is not ported yet; a plain C
+  symbol name works today.
+* the leak report's guest backtrace is empty when the allocation happens inside
+  a syscall, because the run loop has the backend mutably borrowed there
+  (plan P2.6). The fix is for the syscall handler to publish the caller's PC
+  through a `Cell` the tracker reads; the regions themselves are reported
+  either way.
+
 ## Handoff notes for the remaining phases
 
 The five phases below were each delegated to a subagent with a full brief; every

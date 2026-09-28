@@ -291,3 +291,9 @@ void log_print(void) {
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+/* Deliberately leaks 4096 bytes, so the CLI's --leak-check has something to
+ * report with a guest backtrace. */
+void leak(void) {
+    void *block = malloc(4096);
+    (void)block;
+}
