@@ -14,3 +14,5 @@ pub mod memory;
 pub mod pointer;
 pub mod reg;
 pub mod svc;
+pub mod thread;
+pub mod unwind;
