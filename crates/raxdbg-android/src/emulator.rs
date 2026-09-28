@@ -149,6 +149,17 @@ impl AndroidEmulator {
         let resolver_trait: Rc<dyn crate::android_file::LibraryResolver> =
             Rc::clone(&resolver) as Rc<dyn crate::android_file::LibraryResolver>;
         loader.set_library_resolver(resolver_trait);
+        // The same resolver serves guest paths: without this the syscall
+        // handler's I/O chain is empty and every `open` of a bundled resource
+        // -- `/dev/__properties__` above all -- answers ENOENT. arm64 hid it
+        // because `__system_property_get` is answered by a hook, but arm32's
+        // `__system_property_area_init` opens the file for real.
+        syscall
+            .borrow()
+            .unix_handler()
+            .add_io_resolver(Box::new(crate::linux::android::resolver::SharedResolver(
+                Rc::clone(&resolver),
+            )));
 
         let emulator = Rc::new(AndroidEmulator {
             backend: Rc::clone(&backend),

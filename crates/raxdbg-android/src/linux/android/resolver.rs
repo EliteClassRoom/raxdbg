@@ -5,6 +5,7 @@
 //! out of its own jar resources, raxdbg reads the same tree from `libs/` on
 //! disk (`tools/fetch-libs.ps1` populates it).
 
+use std::rc::Rc;
 use std::path::{Path, PathBuf};
 
 use raxdbg_core::file::driver::{create_driver_file, is_null_path};
@@ -230,6 +231,27 @@ impl IOResolver for AndroidResolver {
             Some(io) => FileResult::Fallback(io),
             None => FileResult::NotFound,
         }
+    }
+}
+
+/// The emulator's resolver, as the syscall handler's I/O chain sees it.
+///
+/// unidbg's `AndroidResolver` implements both `LibraryResolver` and
+/// `IOResolver`, and the emulator hands the *same* object to both: the library
+/// side loads `.so`s out of `libs/`, and the I/O side serves guest paths such as
+/// `/dev/__properties__`, `/proc/stat` and
+/// `/system/usr/share/zoneinfo/tzdata` out of the same tree. This wrapper shares
+/// the `Rc` rather than cloning the resolver, so a later `set_root_dir` is seen
+/// by both.
+pub struct SharedResolver(pub Rc<AndroidResolver>);
+
+impl IOResolver for SharedResolver {
+    fn resolve(
+        &self,
+        pathname: &str,
+        oflags: i32,
+    ) -> raxdbg_core::file::FileResult<Box<dyn raxdbg_core::file::FileIO>> {
+        self.0.resolve(pathname, oflags)
     }
 }
 
