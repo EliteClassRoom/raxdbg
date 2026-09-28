@@ -240,6 +240,23 @@ answered by a hook; arm32's `__system_property_area_init` opens the file for
 real, which is why that ABI exposed it. `handler.resolve("/dev/__properties__")`
 answers `Success` where it answered `None`.
 
+**arm32 boots on SDK 23.** With `sdk(23)` the arm32 libc loads, every
+relocation resolves, the thread pointer is readable at EL0, an `svc` reaches the
+handler through `r7`, and `malloc`/`free` round-trip through real bionic. So the
+`0x90` fault above is **SDK 19-specific**, and `AndroidEmulatorBuilder::for_32bit`
+now defaults to 23 like `for_64bit`; `sdk(19)` still faults and is the open item
+on that front.
+
+**The fixture's init_array entry is called unrelocated.** With libc booted, the
+arm32 fixture fails differently: `initialiser 0x32821: unmapped memory access at
+0x32820`. `0x32821` is a raw virtual address — Thumb, and the fixture's own
+`init_array` entry — so the entry was never relocated and the loader called it
+in place. The same fixture loads on arm64, so this is in the 32-bit path: check
+whether the `init_array` pointer is read at the module's pointer size and
+whether the `R_ARM_RELATIVE`/`R_ARM_ABS32` that should rewrite it is applied
+before `module_init_functions` is consulted. Two `#[ignore]`d tests in
+`tests/arm32_parity.rs` cover it.
+
 **The initialiser still faults at `0x90` after that fix**, at the same PC, so
 there is at least one more link. The next thing to check is the guest's own
 `open` again now that the chain answers: if it still returns -1, the failure is

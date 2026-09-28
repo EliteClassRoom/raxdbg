@@ -506,10 +506,15 @@ impl AndroidEmulatorBuilder {
     }
 
     /// A builder for a 32-bit guest.
+    ///
+    /// The SDK defaults to 23, as it does for 64-bit. Both bundled trees have
+    /// an `sdk23`, and 23 is what the fixtures (NDK 26) and most unidbg users
+    /// target; `sdk(19)` selects the older tree explicitly. See
+    /// `docs/known-gaps.md` for why 19 does not boot arm32 yet.
     pub fn for_32bit() -> Self {
         AndroidEmulatorBuilder {
             is_64bit: false,
-            sdk: 19,
+            sdk: 23,
             ..Default::default()
         }
     }

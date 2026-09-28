@@ -1,17 +1,20 @@
 //! ARM32 parity tests (plan P9).
 //!
-//! **Status**: the syscall-number translation is in and tested
-//! (`syscall/arm32.rs`), and the pieces the initialiser depends on are verified
-//! independently below — the thread pointer is set and readable at EL0, the
-//! stack pointer is correct, the fixture's relocations all resolve, and a
-//! hand-written arm32 syscall reaches the handler through `r7`.
+//! **Status**: arm32 bionic boots on SDK 23. The libc loads with every
+//! relocation resolved, the thread pointer is set and readable at EL0, a
+//! hand-written `svc` reaches the handler through `r7`, and `malloc`/`free`
+//! round-trip through the real libc. Those are the tests below, and they pass.
 //!
-//! What does not work yet is arm32 bionic's own initialiser: it faults on a
-//! `NULL + 0x90` read (`unmapped memory access at 0x90 ... from pc
-//! 0x1202e636`, libc offset `0x2e636`) before any of the tests that need a
-//! booted libc can run. `docs/known-gaps.md` records what has been ruled out
-//! and where to look next. Those tests are `#[ignore]`d rather than deleted so
-//! the goal stays visible and `cargo test -- --ignored` reports the state.
+//! What does not work is the *fixture*: its initialiser is called at a raw
+//! virtual address (`0x32821`, with the fault at `0x32820`), so the
+//! `init_array` entry was not relocated. That is arm32-specific — the same
+//! fixture loads on arm64 — and it is the one thing between this and
+//! `libctest.so` running on `armeabi-v7a`. Those two tests are `#[ignore]`d
+//! with that reason rather than deleted.
+//!
+//! SDK 19 is a separate matter: its arm32 libc faults in
+//! `__system_property_area_init`, which is why `for_32bit()` defaults to 23.
+//! `docs/known-gaps.md` has both.
 //!
 //! The AArch32 backend, run loop and differential tests landed with P1; what
 //! these tests cover is the *Android* half for `armeabi-v7a`: the same ELF
@@ -37,6 +40,7 @@ fn workspace_path(relative: &str) -> std::path::PathBuf {
 fn boot() -> Rc<AndroidEmulator> {
     let emulator = AndroidEmulatorBuilder::for_32bit()
         .process_name("raxdbg-arm32")
+        .sdk(23)
         .seed(13)
         .build()
         .expect("emulator");
@@ -51,7 +55,6 @@ fn load_fixture(emulator: &Rc<AndroidEmulator>, name: &str) {
 }
 
 #[test]
-#[ignore = "arm32 bionic's initialiser faults on a NULL+0x90 read; see docs/known-gaps.md"]
 fn the_arm32_libc_loads_with_its_dependencies() {
     let emulator = boot();
     let infos = emulator.loader().module_infos();
@@ -69,7 +72,6 @@ fn the_arm32_libc_loads_with_its_dependencies() {
 }
 
 #[test]
-#[ignore = "needs a booted arm32 libc; see docs/known-gaps.md"]
 fn the_thread_pointer_is_where_arm32_expects_it() {
     let emulator = boot();
     let tls = emulator
@@ -122,7 +124,7 @@ fn the_guest_reads_the_thread_pointer_through_cp15() {
 }
 
 #[test]
-#[ignore = "needs a booted arm32 libc; see docs/known-gaps.md"]
+#[ignore = "the fixture's init_array entry is called unrelocated; see docs/known-gaps.md"]
 fn the_arm32_fixture_loads_and_its_symbols_resolve() {
     let emulator = boot();
     load_fixture(&emulator, "libctest.so");
@@ -140,7 +142,7 @@ fn the_arm32_fixture_loads_and_its_symbols_resolve() {
 }
 
 #[test]
-#[ignore = "needs a booted arm32 libc; see docs/known-gaps.md"]
+#[ignore = "the fixture's init_array entry is called unrelocated; see docs/known-gaps.md"]
 fn the_arm32_fixture_runs_a_plain_function() {
     let emulator = boot();
     load_fixture(&emulator, "libctest.so");
@@ -155,7 +157,6 @@ fn the_arm32_fixture_runs_a_plain_function() {
 }
 
 #[test]
-#[ignore = "needs a booted arm32 libc; see docs/known-gaps.md"]
 fn an_arm32_syscall_reaches_the_handler_through_r7() {
     let emulator = boot();
     // `mov r7, #20` (getpid) ; `svc #0` ; `bx lr` — the syscall number comes
@@ -180,7 +181,6 @@ fn an_arm32_syscall_reaches_the_handler_through_r7() {
 }
 
 #[test]
-#[ignore = "needs a booted arm32 libc; see docs/known-gaps.md"]
 fn an_arm32_malloc_round_trip_through_bionic() {
     let emulator = boot();
     let malloc = emulator
