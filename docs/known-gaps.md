@@ -201,6 +201,34 @@ ones that actually ran — so **the "`ldr r7, [sp, 0x1c]` at `0x2e636`" above is
 misaligned reading and must not be trusted**. Whatever faults at `0x90` is a
 different instruction than the one that linear disassembly shows there.
 
+**The chain is now traced to a single failing call.** Calling the pieces
+directly on arm32:
+
+```
+__system_property_area_init()          -> 0xffffffff  (-1)
+__system_property_area__  before/after -> 0x0 / 0x0   (still null)
+guest open("/dev/__properties__", O_RDWR) -> -1
+```
+
+`0x90` is the trie read past a null `prop_area`: the header is 128 bytes
+(`bytes_used`, `serial`, `magic`, `version`, `reserved[28]`), so `prop_area +
+0x80 + 0x10` is `0x90`. The `r12 = 0xffffffff` seen at the fault is that failed
+`__system_property_area_init` return value still sitting in the register. So the
+fault is not in the CPU, the decoder, the loader or the initialiser arguments --
+it is that the arm32 guest cannot open the properties file, and then walks the
+null area anyway.
+
+The file *is* there: `libs/android/sdk19/dev/__properties__` and
+`libs/android/sdk23/dev/__properties__` both exist, and `AndroidResolver::resource`
+trims the leading `/` before joining, so the path it builds is right. Note that
+`for_32bit()` defaults to sdk 19 while `for_64bit()` defaults to 23, so a 32-bit
+run looks under `sdk19/`. What is *not* yet known is which link drops it: the
+next step is to call `emulator.resolver().resolve("/dev/__properties__", 2)`
+directly and see whether it answers `NotFound` or `Fallback`, then follow the
+chain in `syscall::handler`'s resolver walk. The errno printed alongside the
+failure (2, `ENOENT`) may be stale -- it is the guest errno slot, which an
+earlier failed open would have set -- so do not treat it as the cause.
+
 That comparison has now been run (`tests/arm32_decoding.rs`, over the whole of
 libc) and the decoders agree, so this line of attack is closed. What is left is
 the fault itself: a read of `0x90` while `r0`/`r2`/`r3`/`r4`/`r10` all hold Thumb
