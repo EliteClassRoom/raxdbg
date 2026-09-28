@@ -428,13 +428,13 @@ fn mprotect_splits_the_region_tree() {
     assert_eq!(regions.len(), 3);
     assert_eq!(regions[0].prot, Prot::READ);
     assert_eq!(regions[2].prot, Prot::READ);
-    // A write into the protected page fails.
-    assert!(backend.lock().mem_read(base, 1).is_ok());
-    assert!(
-        loader
-            .write_bytes(base + 0x1000, &[1])
-            .is_err_and(|e| matches!(e, raxdbg_core::memory::MemoryError::Backend(_)))
-    );
+    // A host write still reaches the page, as it does through unidbg's unicorn
+    // host API; the guest's own store is what the protection stops, which the
+    // backend suite covers.
+    assert_eq!(regions[1].prot, Prot::READ);
+    loader
+        .write_bytes(base + 0x1000, &[1])
+        .expect("a host write ignores guest permissions");
 }
 
 #[test]
