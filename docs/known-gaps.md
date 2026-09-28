@@ -99,6 +99,38 @@ lessons for whoever picks them up:
   carry every symbol the P6-P9 acceptance tests call; `libs/` carries both SDK
   levels. Nothing needs building to run a new test.
 
+## P8 handoff: the replace hook works for a direct call
+
+`crates/raxdbg-android/src/hook/replace.rs` is the engine-independent half of
+P8: `ReplaceCallback` (`on_call`, optional `post_call`), `InvocationContext`
+(arguments, `sp`, `lr`, `set_ret`, `set_arg`), and `ReplaceHook::replace`, which
+installs a code hook on the target's entry that moves the PC to an SVC stub. The
+stub's trailing `ret` returns to the caller, so no code is patched and the
+target can be anywhere.
+
+`cargo test -p raxdbg-android --test hooks` — 4/4 on the cases that pass today:
+the fixture runs unhooked (`run() == 3`), a replacement answers for the target
+when the target is called directly, uninstalling restores the original, and a
+target outside every module is refused.
+
+**The gap**: three cases are *not* in the suite because they fail or hang, and
+they share one cause — the target reached **indirectly**, through the volatile
+function pointer `run()` uses:
+
+* the callback's arguments are not what the caller passed,
+* the post-call path (`enable_post_call`) does not complete,
+* the argument-rewriting case loops forever.
+
+That points at the interaction between the redirect code hook and a call that
+arrives from a different module: `run()` is in `libhooktest.so` and calls
+`target_fn` through a pointer, so the hook fires with the PC already at the
+target's entry but the *stack* holding a caller frame the redirect does not
+account for. The next step is to compare the register file at the hook against
+unidbg's `Arm64Hook.onRegister` trampoline, which saves `x29`/`x30` before
+displacing the PC — the hand-written trampoline the plan's D9 describes. The
+engine ports (Dobby/HookZz/xHook) should wait for that fix, since all three
+build on this path.
+
 ## P6 (JNI) handoff: the first piece is in
 
 `crates/raxdbg-android/src/dvm/hash.rs` is done and tested: the four `Hasher`
