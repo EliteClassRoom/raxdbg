@@ -11,10 +11,12 @@
 //! thread-stack area, which is what keeps `pthread_internal_t` and the TLS block
 //! on the thread's own memory.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use raxdbg_core::backend::{Backend, RunError};
 use raxdbg_core::memory::MemoryError;
+use raxdbg_core::memory::loader::Loader;
 use raxdbg_core::svc::{Svc, SvcKind, SvcMemory};
 use raxdbg_core::thread::ThreadDispatcher;
 
@@ -49,6 +51,8 @@ impl Svc for ThreadExitStub {
 /// The exit stub's address and the loader's thread-stack allocator.
 #[derive(Debug)]
 pub struct ThreadRuntime {
+    allocated: RefCell<Vec<(usize, Rc<Loader>)>>,
+    is_64bit: bool,
     exit_stub: u64,
     number: i32,
     svc: Rc<SvcMemory>,
@@ -80,6 +84,8 @@ impl ThreadRuntime {
             Box::new(ThreadExitStub { kind }),
         )?;
         Ok(ThreadRuntime {
+            allocated: RefCell::new(Vec::new()),
+            is_64bit: emulator.is_64bit(),
             exit_stub,
             number,
             svc,
@@ -95,6 +101,33 @@ impl ThreadRuntime {
     /// The SVC number the exit stub uses.
     pub fn exit_number(&self) -> i32 {
         self.number
+    }
+
+    /// Releases every stack this runtime handed out.
+    ///
+    /// The loader caps threads at `MAX_THREADS`, and a host-driven call that
+    /// parks and resumes allocates a stack per attempt, so they have to go back
+    /// or the sixteenth join is the last one that works.
+    pub fn free_all_stacks(&self) {
+        let taken = std::mem::take(&mut *self.allocated.borrow_mut());
+        for (index, memory) in taken {
+            memory.free_thread_index_impl(index);
+        }
+    }
+
+    /// The thread-stack indices this runtime has taken out.
+    pub fn allocated_indices(&self) -> Vec<usize> {
+        self.allocated.borrow().iter().map(|(index, _)| *index).collect()
+    }
+
+    /// The guest's pointer size, which is how far apart the entry code's two
+    /// operands sit on a thread's stack.
+    pub fn word_size(&self) -> u64 {
+        if self.is_64bit {
+            8
+        } else {
+            4
+        }
     }
 
     /// A dispatcher whose tasks return through this runtime's exit stub, with
@@ -121,6 +154,9 @@ impl ThreadRuntime {
         // The thread-stack pointer is the *top* of the thread's area, and the
         // ABI wants it 16-byte aligned at a call boundary.
         let sp = stack.peer() & !0xf;
+        self.allocated
+            .borrow_mut()
+            .push((index, emulator.memory().clone()));
         Ok(sp)
     }
 

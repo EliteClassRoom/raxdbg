@@ -7,6 +7,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use raxdbg_android::android_file::ElfLibraryFile;
 use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder};
 use raxdbg_android::hook::{ReplaceCallback, ReplaceHook};
 use raxdbg_core::memory::Memory;
@@ -337,4 +338,33 @@ fn every_engine_is_reachable_through_the_resolver() {
             .unwrap_or_else(|| panic!("dlsym({symbol}) in {module}"));
         assert_ne!(entry.address, 0, "{symbol} resolved in {module}");
     }
+}
+
+/// `hello()` in `libctest.so` calls `printf`, which is a different path from
+/// anything else these tests touch -- it goes through the whole stdio machinery
+/// rather than arithmetic on a register.
+#[test]
+fn hello_from_the_ctest_fixture_prints_through_bionic() {
+    let emulator = AndroidEmulatorBuilder::for_64bit()
+        .process_name("raxdbg-printf")
+        .seed(5)
+        .build()
+        .expect("emulator");
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root")
+        .join("fixtures/prebuilt/arm64-v8a/libctest.so");
+    let file = ElfLibraryFile::open(&path).expect("open");
+    emulator.load(Box::new(file), false).expect("load");
+    let hello = emulator
+        .loader()
+        .find_symbol("libctest.so", "hello")
+        .expect("hello");
+    match emulator.call_function(hello.address, &[]) {
+        Ok(value) => assert_eq!(value, 0, "hello returns void"),
+        Err(error) => panic!("hello: {error}"),
+    }
+    let printed = emulator.stdout().contents();
+    assert!(printed.contains("hello 42"), "{printed}");
 }

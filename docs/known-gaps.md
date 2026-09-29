@@ -164,6 +164,40 @@ prints `hello 42`. SDK 19's arm32 libc still faults in
 `__system_property_area_init` on a null `prop_area` read, so `--sdk 19` with a
 32-bit guest does not work. The tree is bundled and arm64's SDK 19 is fine.
 
+## P7: the last link is a parked joiner receiving its result
+
+Everything up to the join works, and each piece is tested:
+
+* `pthread_create` is replaced -- through a `HookListener`, because libc really
+  exports it and a stub in the SVC page is not a replacement until something
+  points the symbol at it -- and the handler reads the routine and its argument
+  the way `pthread_create`'s own signature lays them out, writes the thread's id
+  into the caller's `pthread_t`, and records the thread. A test asserts
+  `ThreadJoin::threads()` holds one entry with the fixture's own start routine.
+* `pthread_join` is replaced the same way, registers a waiter and returns
+  `RunError::ThreadSwitch`, so the caller parks rather than spinning. A test
+  asserts the waiter exists and knows its result slot.
+* `ThreadRuntime::free_all_stacks` gives the loader's thread-stack indices back
+  after a run; without it a call that parks and resumes runs out on the
+  sixteenth attempt, because the loader caps threads at `MAX_THREADS`.
+
+What does not work is the end of the chain: the thread runs and returns 7, the
+joiner is parked, and the value never reaches it, so the call ends with
+`ThreadSwitch`. `ThreadJoin::deliver_result` writes the value into the joiner's
+`retval` and wakes its waiter, and `ThreadDispatcher::set_resume_value` puts a
+value in `x0` when a *task* resumes -- but the parked thread here is the
+host-driven call, whose context is the live one, so neither path applies. The
+missing piece is to give the caller its own task: `call_function_driven` should
+run it through the dispatcher like any other, so a switch parks it and a wake
+resumes it with the value.
+
+Three tests in `tests/thread_fixture.rs` are `#[ignore]`d with that reason rather
+than deleted, because they are the statement of what the port has to achieve:
+`thread_value()` returning 7 through a real `pthread_create`/`pthread_join`,
+`counter()` with two threads interleaving, and `errno_per_thread`. The two that
+do pass are the fixture loading with every relocation resolved and `hello()`
+printing through bionic's stdio.
+
 ## P6: one item is thinner than its name
 
 The plan's "VarArg/VaList" item is only half done. Arguments reach a native

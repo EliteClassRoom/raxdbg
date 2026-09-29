@@ -117,6 +117,13 @@ pub struct ThreadDispatcher {
     /// The futex registry, when the emulator installed one. A task parked on a
     /// waiter does not run again until that waiter is woken.
     waiters: Option<Rc<Waiters>>,
+    /// A value to put in `x0`/`r0` when a task resumes.
+    ///
+    /// A parked task resumes *after* the syscall that parked it, so the value
+    /// that syscall owes its caller has to arrive that way. `pthread_join` is
+    /// the case that needs it: the joiner parks inside the replacement, the
+    /// thread runs, and the thread's result becomes the join's return value.
+    resume_values: std::collections::HashMap<usize, u64>,
 }
 
 impl ThreadDispatcher {
@@ -134,6 +141,7 @@ impl ThreadDispatcher {
             is_64bit,
             switches: 0,
             waiters: None,
+            resume_values: std::collections::HashMap::new(),
         }
     }
 
@@ -162,6 +170,11 @@ impl ThreadDispatcher {
         if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
             task.waiter = Some(waiter);
         }
+    }
+
+    /// Sets the value `id`'s task will see in `x0`/`r0` when it resumes.
+    pub fn set_resume_value(&mut self, id: usize, value: u64) {
+        self.resume_values.insert(id, value);
     }
 
     /// Runs `on_finish` for each parked joiner whose thread has just finished,
@@ -347,6 +360,12 @@ impl ThreadDispatcher {
                 TaskState::Running => {
                     let context = context.expect("a running task has a saved context");
                     backend.context_restore(context);
+                    // The syscall this task parked in owed its caller a value,
+                    // and resuming happens *after* it, so the value goes in now.
+                    if let Some(value) = self.resume_values.remove(&id) {
+                        let register = if self.is_64bit { RegId::X(0) } else { RegId::R(0) };
+                        backend.reg_write(register, value)?;
+                    }
                 }
                 TaskState::Finished => continue,
             }

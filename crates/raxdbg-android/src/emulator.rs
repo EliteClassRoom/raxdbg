@@ -87,6 +87,8 @@ pub struct AndroidEmulator {
     stdout: std::sync::Arc<crate::syscall::SharedSink>,
     /// The thread entry point and the `clone`/`pthread_join` replacements.
     thread_start: std::cell::RefCell<Option<Rc<crate::thread::join::ThreadStart>>>,
+    /// The threads `clone` has been asked for.
+    thread_join: std::cell::RefCell<Option<Rc<crate::thread::join::ThreadJoin>>>,
 }
 
 impl std::fmt::Debug for AndroidEmulator {
@@ -177,6 +179,7 @@ impl AndroidEmulator {
             },
             stdout,
             thread_start: std::cell::RefCell::new(None),
+            thread_join: std::cell::RefCell::new(None),
         });
 
         emulator.setup_traps()?;
@@ -264,8 +267,10 @@ impl AndroidEmulator {
         // make threads (plan P7). The entry code is precomputed (plan D9).
         let start = crate::thread::join::install_entry(self)
             .map_err(EmulatorError::Memory)?;
-        crate::thread::join::install(self, &start).map_err(EmulatorError::Memory)?;
+        let joint = crate::thread::join::install(self, &start).map_err(EmulatorError::Memory)?;
         *self.thread_start.borrow_mut() = Some(Rc::new(start));
+        joint.set_memory(Rc::clone(self.loader.memory()));
+        *self.thread_join.borrow_mut() = Some(joint);
         AndroidModule::register(&self.loader)?;
         SystemProperties::register(&self.loader)?;
         JniGraphics::register(&self.loader)?;
@@ -300,6 +305,11 @@ impl AndroidEmulator {
     /// that installs its own would be testing a second copy.
     pub fn thread_start(&self) -> Option<Rc<crate::thread::join::ThreadStart>> {
         self.thread_start.borrow().clone()
+    }
+
+    /// The threads `clone` has been asked for, and which of them may be joined.
+    pub fn thread_join(&self) -> Option<Rc<crate::thread::join::ThreadJoin>> {
+        self.thread_join.borrow().clone()
     }
 
     pub fn loader(&self) -> &Rc<AndroidElfLoader> {
@@ -361,6 +371,124 @@ impl AndroidEmulator {
     /// Port of unidbg: `AbstractARM64Emulator.eFunc` / `AbstractARMEmulator.eEntry`:
     /// the link register is set to the trap page and the run stops there, so
     /// the callee's `ret` ends the call.
+    /// Calls a guest function, running the threads it creates.
+    ///
+    /// A `pthread_join` (or a futex wait) parks its caller: the syscall cannot
+    /// make progress, so it asks for a `ThreadSwitch` and something else has to
+    /// run. That "something" is the thread the guest just created, so the call
+    /// has to be able to pick up where it left off. This is the same shape as
+    /// unidbg, where a `ThreadContextSwitchException` unwinds to a dispatcher
+    /// that is running the caller as a task of its own.
+    ///
+    /// The loop is bounded: a join that is never woken is a deadlock, and
+    /// spinning forever would hide it.
+    pub fn call_function_driven(self: &Rc<Self>, address: u64, args: &[u64]) -> Result<u64, EmulatorError> {
+        const MAX_SWITCHES: usize = 4096;
+        for _ in 0..MAX_SWITCHES {
+            match self.call_function(address, args) {
+                Ok(value) => return Ok(value),
+                Err(EmulatorError::Run(RunError::ThreadSwitch)) => {
+                    if !self.run_pending_threads()? {
+                        // Nothing is runnable, so the parked caller can never be
+                        // woken. That is a deadlock, and saying so beats hanging.
+                        return Err(EmulatorError::Run(RunError::ThreadSwitch));
+                    }
+                    // A finished thread's result is the value the parked syscall
+                    // owes its caller. The caller's own context is the live one
+                    // -- the dispatcher ran the *other* threads -- so the value
+                    // goes straight into its return register, which is what the
+                    // guest sees when the `svc` returns.
+                    if let Some(value) = self.take_join_result() {
+                        let register = if self.is_64bit {
+                            RegId::X(0)
+                        } else {
+                            RegId::R(0)
+                        };
+                        self.backend.borrow_mut().reg_write(register, value)?;
+                    }
+                    // Nothing to wake means nothing to wait for, so the loop
+                    // would spin until its bound. Say so instead.
+                    if !self.join_has_waiter() {
+                        return Err(EmulatorError::Run(RunError::ThreadSwitch));
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        Err(EmulatorError::Run(RunError::ThreadSwitch))
+    }
+
+    /// Takes the result a finished thread produced for a joiner, if one is
+    /// waiting.
+    fn take_join_result(self: &Rc<Self>) -> Option<u64> {
+        let join = self.thread_join.borrow().clone()?;
+        join.results().last().copied()
+    }
+
+    /// Whether a `pthread_join` is still waiting for a thread.
+    fn join_has_waiter(&self) -> bool {
+        self.thread_join
+            .borrow()
+            .as_ref()
+            .map(|join| !join.joins().is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Runs the threads `pthread_create` has made, and reports whether any ran.
+    fn run_pending_threads(self: &Rc<Self>) -> Result<bool, EmulatorError> {
+        let Some(join) = self.thread_join.borrow().clone() else {
+            return Ok(false);
+        };
+        let Some(start) = self.thread_start.borrow().clone() else {
+            return Ok(false);
+        };
+        let pending = join.take_pending();
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        let runtime = crate::thread::ThreadRuntime::install(self).map_err(EmulatorError::Memory)?;
+        let waiters = self
+            .syscall
+            .borrow()
+            .unix_handler()
+            .waiters()
+            .clone();
+        let mut dispatcher = runtime.dispatcher(self);
+        dispatcher.set_waiters(Rc::clone(&waiters));
+
+        for thread in &pending {
+            let stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
+            // The clone replacement put the routine and its argument at the top
+            // of the child's stack, which is where the entry code reads them.
+            self.loader
+                .memory()
+                .pointer(stack)
+                .write_pointer(0, thread.start_routine)
+                .map_err(EmulatorError::Memory)?;
+            self.loader
+                .memory()
+                .pointer(stack + runtime.word_size())
+                .write_pointer(0, thread.arg)
+                .map_err(EmulatorError::Memory)?;
+            dispatcher.create(start.entry, &[], stack);
+        }
+        let results = {
+            let mut backend = self.backend.borrow_mut();
+            dispatcher.run(&mut *backend).map_err(EmulatorError::Run)?
+        };
+        // Each thread's result is the value its joiner parked waiting for, and
+        // waking that joiner is what lets the call resume.
+        for (_, value) in results {
+            join.complete_one(value);
+            join.deliver_result(&waiters, value);
+        }
+        // The threads have run, so their stacks go back: the loader caps threads
+        // at MAX_THREADS, and a call that parks and resumes would otherwise run
+        // out of them.
+        runtime.free_all_stacks();
+        Ok(true)
+    }
+
     pub fn call_function(&self, address: u64, args: &[u64]) -> Result<u64, EmulatorError> {
         AndroidEmulator::call_function_on(
             &self.backend,

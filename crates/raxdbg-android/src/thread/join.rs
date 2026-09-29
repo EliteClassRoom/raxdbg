@@ -104,6 +104,7 @@ pub struct PendingThread {
 
 /// The threads `clone` has been asked for.
 pub struct ThreadJoin {
+    memory: RefCell<Option<Rc<raxdbg_core::memory::loader::Loader>>>,
     is_64bit: bool,
     /// The id `pthread_join` writes for the most recent thread.
     value_ptr: Cell<u64>,
@@ -112,6 +113,10 @@ pub struct ThreadJoin {
     visitor: RefCell<Option<Rc<dyn ThreadJoinVisitor>>>,
     /// Each joiner parked on a waiter, with the address its result belongs at.
     joined: RefCell<Vec<(usize, u64)>>,
+    /// Created threads the dispatcher has not run yet.
+    pending: RefCell<Vec<PendingThread>>,
+    /// What the finished threads returned, in the order they finished.
+    finished: RefCell<Vec<u64>>,
 }
 
 impl std::fmt::Debug for ThreadJoin {
@@ -124,15 +129,24 @@ impl std::fmt::Debug for ThreadJoin {
 }
 
 impl ThreadJoin {
+    /// Gives the registry the guest memory facade, so a finished thread's result
+    /// can be written into its joiner's `retval`.
+    pub fn set_memory(&self, memory: Rc<raxdbg_core::memory::loader::Loader>) {
+        *self.memory.borrow_mut() = Some(memory);
+    }
+
     /// Builds the replacement set for one emulator.
     pub fn new(is_64bit: bool) -> Rc<ThreadJoin> {
         Rc::new(ThreadJoin {
+            memory: RefCell::new(None),
             is_64bit,
             value_ptr: Cell::new(0),
             threads: RefCell::new(Vec::new()),
             next_id: Cell::new(0),
             visitor: RefCell::new(None),
             joined: RefCell::new(Vec::new()),
+            pending: RefCell::new(Vec::new()),
+            finished: RefCell::new(Vec::new()),
         })
     }
 
@@ -145,27 +159,39 @@ impl ThreadJoin {
         *self.visitor.borrow_mut() = Some(visitor);
     }
 
-    /// The threads created so far.
-    pub fn threads(&self) -> Vec<PendingThread> {
-        self.threads.borrow().clone()
-    }
-
     /// The id `pthread_join` writes for the most recent thread.
     pub fn value(&self) -> u64 {
         self.value_ptr.get()
     }
 
-    fn internal_offsets(&self) -> (u64, u64) {
-        internal_offsets(self.is_64bit)
+    /// The threads created so far.
+    pub fn threads(&self) -> Vec<PendingThread> {
+        self.threads.borrow().clone()
+    }
+
+    /// The threads created but not yet run, taken so the dispatcher runs each
+    /// of them once.
+    pub fn take_pending(&self) -> Vec<PendingThread> {
+        std::mem::take(&mut *self.pending.borrow_mut())
+    }
+
+    /// Records that a created thread has run to completion, with `result`.
+    pub fn complete_one(&self, result: u64) {
+        self.finished.borrow_mut().push(result);
+    }
+
+    /// What the finished threads returned, in the order they finished.
+    pub fn results(&self) -> Vec<u64> {
+        self.finished.borrow().clone()
     }
 
     /// Records that `waiter` is a joiner whose thread result belongs at
-    /// `retval`, to be written when the thread finishes.
+    /// `retval`.
     pub fn note_joined(&self, waiter: usize, retval: u64) {
         self.joined.borrow_mut().push((waiter, retval));
     }
 
-    /// The `retval` a waiter is waiting for, if any.
+    /// The `retval` a waiter is waiting for, if it is a joiner.
     pub fn join_target(&self, waiter: usize) -> Option<u64> {
         self.joined
             .borrow()
@@ -174,9 +200,44 @@ impl ThreadJoin {
             .map(|(_, retval)| *retval)
     }
 
-    /// The waiters that are joiners, with their result slots.
+    /// The joiners still waiting, with the address each one's result goes to.
     pub fn joins(&self) -> Vec<(usize, u64)> {
         self.joined.borrow().clone()
+    }
+
+    /// Wakes a joiner and hands it a finished thread's result.
+    ///
+    /// The join replacement registered a waiter and asked for a switch; the
+    /// thread has now finished, so that waiter is woken and the value goes into
+    /// the `retval` the guest passed to `pthread_join`. Nothing else can do
+    /// this: a waiter stays asleep until something wakes it, and a joiner that
+    /// is never woken is a deadlock.
+    pub fn deliver_result(
+        &self,
+        waiters: &raxdbg_core::thread::Waiters,
+        result: u64,
+    ) -> bool {
+        let waiting: Vec<(usize, u64)> = self
+            .joins()
+            .into_iter()
+            .filter(|(waiter, _)| !waiters.is_woken(*waiter))
+            .collect();
+        for (waiter, retval) in waiting {
+            waiters.wake(waiter as u64, 1);
+            let Some(memory) = self.memory.borrow().clone() else {
+                continue;
+            };
+            let written = if self.is_64bit {
+                memory.pointer(retval).write_u64(0, result)
+            } else {
+                memory.pointer(retval).write_u32(0, result as u32)
+            };
+            if written.is_ok() {
+                self.joined.borrow_mut().retain(|(id, _)| *id != waiter);
+                return true;
+            }
+        }
+        false
     }
 
     /// Records a thread and returns its id.
@@ -188,12 +249,14 @@ impl ThreadJoin {
             Some(visitor) => visitor.can_join(start_routine, id),
             None => true,
         };
-        self.threads.borrow_mut().push(PendingThread {
+        let thread = PendingThread {
             id,
             start_routine,
             arg,
             joinable,
-        });
+        };
+        self.pending.borrow_mut().push(thread.clone());
+        self.threads.borrow_mut().push(thread);
         id
     }
 }
@@ -208,54 +271,52 @@ struct CloneStub {
     kind: SvcKind,
     join: Rc<ThreadJoin>,
     memory: Rc<raxdbg_core::memory::loader::Loader>,
+    /// Whether this stands in for `pthread_create` or for the raw `clone`.
+    pthread_create: bool,
 }
 
 impl Svc for CloneStub {
     fn handle(&mut self, backend: &mut dyn Backend) -> Result<i64, RunError> {
-        let (internal, child_stack) = if self.kind == SvcKind::Arm64 {
-            (
-                backend.reg_read(RegId::X(2))?,
-                backend.reg_read(RegId::X(1))?,
-            )
-        } else {
-            (
-                backend.reg_read(RegId::R(2))?,
-                backend.reg_read(RegId::R(1))?,
-            )
-        };
-        if internal == 0 {
-            return Ok(0);
-        }
-        let (start_offset, arg_offset) = self.join.internal_offsets();
+        // Which function this is decides how the arguments are read.
+        //
+        // `pthread_create(pthread_t* thread, const pthread_attr_t* attr,
+        //                 void* (*start)(void*), void* arg)` has the routine
+        // and its argument in the third and fourth registers, and the
+        // `pthread_t` the caller supplies is where the thread's id belongs.
+        //
+        // The raw `clone(fn, child_stack, flags, arg)` wrapper has the routine
+        // in the first and no `pthread_t` at all; the internal block only exists
+        // once bionic's `__clone` has built it, which is why `ClonePatcher64`
+        // reads it at +0x60 and +0x68 rather than taking an argument.
         let kind = self.kind;
-        let read_memory = self.memory.clone();
-        let read = move |address: u64| -> Result<u64, RunError> {
+        let read = |register: u8| -> Result<u64, RunError> {
             let result = if kind == SvcKind::Arm64 {
-                read_memory.pointer(address).read_u64(0)
+                backend.reg_read(RegId::X(register))
             } else {
-                read_memory.pointer(address).read_u32(0).map(u64::from)
+                backend.reg_read(RegId::R(register))
             };
-            result.map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))
+            result.map_err(RunError::Backend)
         };
-        let write_memory = self.memory.clone();
-        let write = move |address: u64, value: u64| -> Result<(), RunError> {
-            let result = if kind == SvcKind::Arm64 {
-                write_memory.pointer(address).write_u64(0, value)
-            } else {
-                write_memory.pointer(address).write_u32(0, value as u32)
-            };
-            result.map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))
+        let (thread, start_routine, arg, child_stack) = if self.pthread_create {
+            (read(0)?, read(2)?, read(3)?, 0u64)
+        } else {
+            let internal = read(3)?;
+            let (start_offset, arg_offset) = internal_offsets(self.kind == SvcKind::Arm64);
+            let routine = self.read_pointer(internal + start_offset)?;
+            let argument = self.read_pointer(internal + arg_offset)?;
+            (internal, routine, argument, read(1)?)
         };
-        let start_routine = read(internal + start_offset)?;
-        let arg = read(internal + arg_offset)?;
         if start_routine == 0 {
             return Ok(0);
         }
-        // Where the entry code will look: the top of the child's stack.
-        let width = if self.kind == SvcKind::Arm64 { 8 } else { 4 };
-        write(child_stack, start_routine)?;
-        write(child_stack + width as u64, arg)?;
-        self.join.record(start_routine, arg);
+        let id = self.join.record(start_routine, arg);
+        if thread != 0 {
+            self.write_pointer(thread, id)?;
+        }
+        if child_stack != 0 {
+            self.write_pointer(child_stack, start_routine)?;
+            self.write_pointer(child_stack + self.word_size(), arg)?;
+        }
         Ok(0)
     }
 
@@ -264,7 +325,43 @@ impl Svc for CloneStub {
     }
 
     fn name(&self) -> &str {
-        "clone"
+        if self.pthread_create {
+            "pthread_create"
+        } else {
+            "clone"
+        }
+    }
+}
+
+impl CloneStub {
+    fn word_size(&self) -> u64 {
+        if self.kind == SvcKind::Arm64 {
+            8
+        } else {
+            4
+        }
+    }
+
+    fn read_pointer(&self, address: u64) -> Result<u64, RunError> {
+        let result = if self.kind == SvcKind::Arm64 {
+            self.memory.pointer(address).read_u64(0)
+        } else {
+            self.memory.pointer(address).read_u32(0).map(u64::from)
+        };
+        result.map_err(|error| {
+            RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+        })
+    }
+
+    fn write_pointer(&self, address: u64, value: u64) -> Result<(), RunError> {
+        let result = if self.kind == SvcKind::Arm64 {
+            self.memory.pointer(address).write_u64(0, value)
+        } else {
+            self.memory.pointer(address).write_u32(0, value as u32)
+        };
+        result.map_err(|error| {
+            RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+        })
     }
 }
 
@@ -321,6 +418,45 @@ impl Svc for PthreadJoinStub {
 
     fn name(&self) -> &str {
         "pthread_join"
+    }
+}
+
+/// Sends libc's `clone` and `pthread_join` to this module's stubs.
+///
+/// Port of unidbg: `ThreadJoin23`'s `inlineHook.replace(clone, ...)` and its
+/// `ReplaceCallback` for `pthread_join`. A stub in the SVC page is not a
+/// replacement until something points the symbol at it, and the only thing
+/// that can is a hook listener.
+#[derive(Debug)]
+struct ThreadJoinHook {
+    clone_stub: u64,
+    join_stub: u64,
+}
+
+impl raxdbg_core::hook::HookListener for ThreadJoinHook {
+    fn hook(
+        &self,
+        _svc_memory: &SvcMemory,
+        library_name: Option<&str>,
+        symbol_name: &str,
+        _address: u64,
+    ) -> u64 {
+        if library_name != Some("libc.so") {
+            return 0;
+        }
+        match symbol_name {
+            // `pthread_create` rather than `clone`: bionic's `clone` is the
+            // raw syscall wrapper and never builds a `pthread_internal_t`, so
+            // the offsets unidbg reads (+0x60/+0x68 on arm64) are only there by
+            // the time `pthread_create` has called its own setup. unidbg
+            // replaces the syscall-level `clone` because unidbg's loader
+            // reaches it before bionic's wrapper; here the guest reaches
+            // bionic's wrapper, so the replacement has to sit where the
+            // structure exists.
+            "pthread_create" | "clone" => self.clone_stub,
+            "pthread_join" => self.join_stub,
+            _ => 0,
+        }
     }
 }
 
@@ -431,15 +567,16 @@ pub fn install(
     };
     let join = Rc::clone(&start.join);
 
-    svc.register_svc_numbered(
+    let (clone_stub, _number) = svc.register_svc_numbered(
         memory.as_ref(),
         Box::new(CloneStub {
             kind,
             join: Rc::clone(&join),
             memory: Rc::clone(memory),
+            pthread_create: true,
         }),
     )?;
-    svc.register_svc_numbered(
+    let (join_stub, _number) = svc.register_svc_numbered(
         memory.as_ref(),
         Box::new(PthreadJoinStub {
             kind,
@@ -448,6 +585,14 @@ pub fn install(
             waiters: emulator.syscall().borrow().unix_handler().waiters().clone(),
         }),
     )?;
+    // Registering a stub is not enough: libc really exports `clone` and
+    // `pthread_join`, so a guest call would go to bionic's own. The loader asks
+    // its hook listeners before it keeps its answer, and that is where a libc
+    // function gets replaced -- the same mechanism the atexit module uses.
+    emulator.loader().add_hook_listener(Rc::new(ThreadJoinHook {
+        clone_stub,
+        join_stub,
+    }) as Rc<dyn raxdbg_core::hook::HookListener>);
     Ok(join)
 }
 
