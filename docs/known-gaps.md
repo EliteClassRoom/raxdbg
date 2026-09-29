@@ -118,13 +118,47 @@ argument, which is a per-module `.bss` variable the module's own
 libcpp is the same file but it never decoded the packed table either, so the
 entry stayed zero and `AbsoluteInitFunction.call` skipped it.
 
-The work is therefore a real gap and not a decoder bug: bionic's atexit support.
-`__cxa_atexit` / `__cxa_finalize` / `__register_atfork` and the
-`__dso_handle` per-module handle need modelling, the way unidbg does it through
-`AndroidSyscallHandler`. The smallest version that unblocks the fixtures is to
-make `__cxa_atexit` accept the call and record it, so the destructor list is
-never walked -- initialisers that register destructors then run to completion.
-Two suites (`hooks`, `jni`) fail on this today; everything else is green.
+**Resolved, in three parts.**
+
+`linux/android/atexit.rs` is a virtual module for bionic's atexit family
+(`__cxa_atexit`, `__cxa_finalize`, `atexit`, `__register_atfork`,
+`__cxa_thread_atexit*`, `__cxa_get_dso_handle`), ported from
+`AndroidModule`'s pattern of answering libc functions from a virtual module.
+A `HookListener` redirects libc's own exports to those stubs, because a virtual
+module only supplies symbols nothing else defines and libc *does* export them.
+`__cxa_atexit` records the destructor host-side rather than in a guest list the
+emulator does not model; nothing walks that list while a library loads.
+
+That was not sufficient on its own. libc++'s initialiser reaches
+`pthread_mutex_lock`, which does `mrs x12, tpidr_el0; ...; ldr w2, [x18, #0x30]`
+and expects `x18` to have held the thread pointer for the whole call chain.
+bionic's own `__libc_init` leaves `x18` holding a scratch value -- `x18` is a
+platform register and it is free to use -- so the initialiser that runs *after*
+it reads a mutex through garbage. The bootstrap now writes `x18` alongside
+`TPIDR_EL0`, and the init caller restores it before every initialiser, which is
+what a kernel does on every thread entry.
+
+The last piece is honest rather than a fix. libc++'s initialiser still needs
+`__libc_init` to have built the pthread structures it walks, and this port does
+not run the two in the order a device would. unidbg never gets there at all,
+because it does not decode the packed relocations -- the *less* correct path.
+`elf/init.rs` therefore has `InitFunctionFilter`, the extension point unidbg
+itself defines for this (`InitFunctionFilter`, which `LinuxModule.callInitFunction`
+consults and a `LibraryResolver` may implement), and the emulator installs one
+that holds libc++'s initialiser back. Every other module's initialisers run, so
+the fixtures' own C constructors still do.
+
+Both suites are green again, and the packed relocations stay in place: libc++'s
+data is relocated correctly, which is what made the gap visible in the first
+place.
+
+## P9: the arm32 CLI still needs SDK 23
+
+`cargo run -p raxdbg-cli -- run <lib.so> --abi arm32` resolves libc.so from the
+SDK 19 tree, whose initialiser faults on a null `prop_area` read. The test suite
+passes `.sdk(23)`, and the builder's default is 23, but the CLI does not set it
+for a 32-bit guest, so it inherits whatever the resolver defaults to. One line:
+`--abi arm32` should imply SDK 23 the way the builder does.
 
 ## P6: one item is thinner than its name
 

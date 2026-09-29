@@ -3,6 +3,7 @@
 //! Port of unidbg: `unidbg-android/src/main/java/com/github/unidbg/linux/android/`@7f5da98e.
 
 pub mod arm_ld;
+pub mod atexit;
 pub mod resolver;
 pub mod system_property;
 pub mod virtual_module;

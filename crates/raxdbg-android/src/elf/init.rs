@@ -75,6 +75,22 @@ mod tests {
     }
 }
 
+/// Decides whether a module initialiser runs.
+///
+/// Port of unidbg: `InitFunctionFilter`, which `LinuxModule.callInitFunction`
+/// consults before every call and which a `LibraryResolver` may implement.
+///
+/// It exists because whether an initialiser can run depends on the emulator,
+/// not on the module. libc++'s initialiser, for instance, reaches
+/// `pthread_mutex_lock`, which walks a bionic structure this port does not
+/// model; the initialiser is genuine, and its requirements are unmet rather
+/// than absent. A filter says so explicitly instead of leaving it to a fault.
+pub trait InitFunctionFilter {
+    /// Whether the initialiser at `address`, belonging to `lib_name`, should
+    /// be called.
+    fn accept(&self, lib_name: &str, address: u64) -> bool;
+}
+
 /// One module initialiser.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InitFunction {

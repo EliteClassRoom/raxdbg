@@ -244,6 +244,18 @@ impl AndroidEmulator {
         self.loader
             .add_hook_listener(Rc::new(property_hook) as Rc<dyn raxdbg_core::hook::HookListener>);
 
+        // bionic's atexit family, so a library initialiser that registers a
+        // destructor does not walk a list the emulator never built.
+        crate::linux::android::atexit::AtExitModule::register(&self.loader)?;
+        // libc++'s initialiser is genuine, and unidbg runs it too -- it just
+        // never gets there, because unidbg does not decode the packed
+        // relocations that give libc++'s init_array a value. Decoding them is
+        // the more correct behaviour, and it makes the initialiser run into
+        // `pthread_mutex_lock`, which walks a bionic pthread structure this
+        // port does not model. The filter says exactly that, so the skip is a
+        // decision rather than a fault. See docs/known-gaps.md.
+        self.loader
+            .set_init_function_filter(Rc::new(SkipCxxInit));
         AndroidModule::register(&self.loader)?;
         SystemProperties::register(&self.loader)?;
         JniGraphics::register(&self.loader)?;
@@ -440,6 +452,16 @@ struct InitCallerAdapter {
 
 impl InitCaller for InitCallerAdapter {
     fn call_init(&self, address: u64) -> Result<(), ElfError> {
+        // `x18` is the thread pointer on AAPCS64 and bionic's own startup leaves
+        // it holding a scratch value, so a module initialised after it would
+        // read a mutex through garbage. A real kernel has it right on every
+        // thread entry; this is the equivalent for an initialiser call.
+        if self.is_64bit {
+            let pointer = self.backend.borrow().reg_read(RegId::TpidrEl0)?;
+            if pointer != 0 {
+                self.backend.borrow_mut().reg_write(RegId::X(18), pointer)?;
+            }
+        }
         AndroidEmulator::call_function_on(
             &self.backend,
             &self.memory,
@@ -450,6 +472,23 @@ impl InitCaller for InitCallerAdapter {
         )
         .map(|_| ())
         .map_err(|error| ElfError::Message(format!("initialiser {address:#x}: {error}")))
+    }
+}
+
+/// Holds libc++'s initialiser back until the pthread internals are modelled.
+///
+/// Port of unidbg: `InitFunctionFilter`, which exists for exactly this kind of
+/// decision. libc++ reaches `pthread_mutex_lock` from its initialiser, and
+/// `__libc_init` -- which is what builds the structures it walks -- is a
+/// separate initialiser this port does not run in the same order a device
+/// would. Skipping is honest about that; faulting is not.
+struct SkipCxxInit;
+
+impl crate::elf::init::InitFunctionFilter for SkipCxxInit {
+    fn accept(&self, lib_name: &str, _address: u64) -> bool {
+        // Only libc++ is held back. Every other module's initialisers run, and
+        // the fixture's own C constructors are what the tests depend on.
+        !lib_name.contains("libc++")
     }
 }
 

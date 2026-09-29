@@ -15,6 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use crate::elf::init::InitFunctionFilter;
 use crate::elf::packed;
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 use goblin::elf::{Elf, dynamic, header};
@@ -155,6 +156,8 @@ pub struct AndroidElfLoader {
     max_so_name: RefCell<Option<String>>,
     max_size_of_so: Cell<u64>,
     init_caller: RefCell<Option<Rc<dyn InitCaller>>>,
+    /// Gates which initialisers run, as unidbg's `InitFunctionFilter` does.
+    init_filter: RefCell<Option<Rc<dyn InitFunctionFilter>>>,
     rng: RefCell<Rng>,
 }
 
@@ -194,6 +197,7 @@ impl AndroidElfLoader {
             max_so_name: RefCell::new(None),
             max_size_of_so: Cell::new(0),
             init_caller: RefCell::new(None),
+            init_filter: RefCell::new(None),
             rng: RefCell::new(Rng::new(seed)),
         });
         loader.setup_stack(process_name)?;
@@ -280,6 +284,15 @@ impl AndroidElfLoader {
         let mut backend = self.backend.borrow_mut();
         if self.is_64bit {
             backend.reg_write(RegId::TpidrEl0, tls.peer())?;
+            // The AAPCS64 reserves `x18` as the platform register, and Android's
+            // TLS convention puts the thread pointer there as well as in
+            // `TPIDR_EL0`. Only bionic's own startup writes it -- and a module
+            // that is loaded and initialised *before* `__libc_init` has run
+            // (libc++ is, through liblog) would then read whatever the register
+            // happened to hold. libc++'s initialiser calls `pthread_mutex_lock`,
+            // which reads the mutex through `x18`, and faults. unidbg sets it in
+            // the same place it sets `TPIDR_EL0`.
+            backend.reg_write(RegId::X(18), tls.peer())?;
         } else {
             backend.reg_write(RegId::C13C0_3, tls.peer())?;
         }
@@ -397,6 +410,15 @@ impl AndroidElfLoader {
     ///
     /// The emulator installs this in P5; until then loading a library with
     /// initialisers reports them instead of running them.
+    /// Installs the filter that decides which initialisers run.
+    ///
+    /// Port of unidbg: `InitFunctionFilter`, which a `LibraryResolver` may
+    /// implement so the decision sits with whoever knows what the emulator can
+    /// support.
+    pub fn set_init_function_filter(&self, filter: Rc<dyn InitFunctionFilter>) {
+        *self.init_filter.borrow_mut() = Some(filter);
+    }
+
     pub fn set_init_caller(&self, caller: Rc<dyn InitCaller>) {
         *self.init_caller.borrow_mut() = Some(caller);
     }
@@ -407,10 +429,35 @@ impl AndroidElfLoader {
             None => return Ok(()),
         };
         let caller = self.init_caller.borrow().clone();
+        let filter = self.init_filter.borrow().clone();
+        // Each initialiser is entered as if from the kernel: `x18` carries the
+        // thread pointer, which bionic's own `__libc_init` clobbers as it runs
+        // (`x18` is a platform register, free for it to use). A module
+        // initialised afterwards -- libc++, through liblog -- then reads a
+        // mutex through a stale `x18` and faults. unidbg never sees this
+        // because it does not decode the packed relocations that make libc++'s
+        // initialiser run at all. Restoring it per call is what a real kernel
+        // does on every thread entry, and it costs one register write.
+        let thread_pointer = self
+            .backend
+            .borrow()
+            .reg_read(RegId::TpidrEl0)
+            .ok()
+            .filter(|value| *value != 0);
         for function in functions {
             let address = function.address(self.memory.as_ref())?;
             if address == 0 || address == u64::MAX {
                 continue;
+            }
+            if let Some(filter) = filter.as_ref() {
+                if !filter.accept(name, address) {
+                    continue;
+                }
+            }
+            if let (Some(pointer), true) = (thread_pointer, self.is_64bit) {
+                self.backend
+                    .borrow_mut()
+                    .reg_write(RegId::X(18), pointer)?;
             }
             if let Some(caller) = &caller {
                 caller.call_init(address)?;
