@@ -194,3 +194,87 @@ fn an_arm32_malloc_round_trip_through_bionic() {
         .call_function(free.address, &[block])
         .expect("free");
 }
+
+/// The arm32 kuser calls: `__ARM_NR_set_tls` and `__ARM_NR_cacheflush`.
+///
+/// Port of unidbg: `ARM32SyscallHandler.handleInterrupt`'s `case 0xf0005` and
+/// `case 0xf0002`. They are not syscalls -- there is no such call in the ABI --
+/// but bionic issues them, and `set_tls` is the only way a thread changes its
+/// thread pointer.
+#[test]
+fn the_kuser_calls_answer_and_set_tls_moves_the_thread_pointer() {
+    let emulator = AndroidEmulatorBuilder::for_32bit()
+        .process_name("raxdbg-kuser")
+        .sdk(23)
+        .build()
+        .expect("emulator");
+    emulator.loader().set_call_init_function(false);
+    emulator.load_library("libc.so").expect("libc.so");
+    use raxdbg_core::memory::Memory;
+
+    // A page to be the new thread pointer, and an executable page for the code.
+    // The code is ARM rather than Thumb because a call into it sets no Thumb bit,
+    // and the guest has to be in the state its instructions are written in.
+    let page = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, raxdbg_core::backend::Prot::from_bits(0x3), 0x22, -1, 0)
+        .expect("page");
+    let code = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, raxdbg_core::backend::Prot::from_bits(0x5), 0x22, -1, 0)
+        .expect("code page");
+
+    // The thread pointer is loaded from memory rather than built with an
+    // immediate: `ldr r0, [pc, #n]` has no 16-bit immediate to split across
+    // four fields, so the test says what it means without the test itself being
+    // the thing under test.
+    //
+    //   ldr  r0, [pc, #8]   ; the address literal below
+    //   svc  #0xf0005       ; __ARM_NR_set_tls
+    //   mov  r0, #0
+    //   bx   lr
+    //   .word <page>
+    emulator
+        .memory()
+        .pointer(code)
+        .write_u32(0, 0xe59f_0008) // ldr r0, [pc, #8]
+        .expect("ldr");
+    emulator
+        .memory()
+        .pointer(code + 4)
+        .write_u32(0, 0xef00_0000 | 0x00f0_005) // svc #0xf0005
+        .expect("svc");
+    emulator
+        .memory()
+        .pointer(code + 8)
+        .write_u32(0, 0xe3a0_0000) // mov r0, #0
+        .expect("mov");
+    emulator
+        .memory()
+        .pointer(code + 12)
+        .write_u32(0, 0xe12f_ff1e) // bx lr
+        .expect("bx");
+    emulator
+        .memory()
+        .pointer(code + 16)
+        .write_u32(0, page as u32)
+        .expect("the address literal");
+
+    let before = emulator
+        .backend()
+        .borrow()
+        .reg_read(raxdbg_core::reg::RegId::C13C0_3)
+        .expect("thread pointer");
+    assert_ne!(before, page, "the page is not the thread pointer yet");
+
+    emulator
+        .call_function(code, &[])
+        .expect("the kuser call returned");
+
+    let after = emulator
+        .backend()
+        .borrow()
+        .reg_read(raxdbg_core::reg::RegId::C13C0_3)
+        .expect("thread pointer");
+    assert_eq!(after, page, "__ARM_NR_set_tls moved the thread pointer");
+}

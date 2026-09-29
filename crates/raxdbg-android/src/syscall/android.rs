@@ -266,6 +266,35 @@ impl AndroidSyscallHandler {
         }
     }
 
+    /// The arm32 kuser calls.
+    ///
+    /// Port of unidbg: `ARM32SyscallHandler.cacheflush` and `.set_tls`, which its
+    /// `handleInterrupt` dispatches on `0xf0002` and `0xf0005`. `set_tls` is the
+    /// one that matters: bionic's `__set_tls` is the only way a thread changes
+    /// its thread pointer, so without it a second thread keeps the first one's.
+    fn kuser(&self, nr: i32, backend: &mut dyn Backend) -> Option<i32> {
+        use super::arm32::kuser;
+        match nr {
+            kuser::SET_TLS => {
+                let tls = backend.reg_read(RegId::R(0)).ok()?;
+                backend.reg_write(RegId::C13C0_3, tls).ok()?;
+                Some(0)
+            }
+            kuser::CACHEFLUSH => {
+                // The emulator's memory is coherent by construction -- there is
+                // no separate instruction cache to flush -- so the range is read
+                // to be sure the pages are there and the answer is success.
+                let begin = backend.reg_read(RegId::R(0)).ok()?;
+                let end = backend.reg_read(RegId::R(1)).ok()?;
+                if end > begin {
+                    let _ = backend.mem_read(begin, (end - begin) as usize);
+                }
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+
     fn dispatch_swi(&mut self, backend: &mut dyn Backend, swi: i32) -> Result<(), RunError> {
         // Reserved numbers: pop context / thread switch.
         let max = if self.is_64bit {
@@ -280,6 +309,17 @@ impl AndroidSyscallHandler {
         }
         if swi == max - 1 {
             return Err(RunError::ThreadSwitch);
+        }
+        // The kuser calls come first: they are not syscalls, and `set_tls` has
+        // to write the thread pointer rather than answer with a value. An arm32
+        // `svc` immediate may carry the call number directly or with the OABI
+        // base added, so both forms are recognised.
+        if !self.is_64bit {
+            if let Some(value) = self.kuser(super::arm32::kuser::number(swi), backend) {
+                let target = RegId::R(0);
+                backend.reg_write(target, value as u64)?;
+                return Ok(());
+            }
         }
         if swi != 0 {
             // Look up the stub's SVC. We `take` it out for the

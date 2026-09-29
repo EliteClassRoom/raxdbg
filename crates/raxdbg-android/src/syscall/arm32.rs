@@ -149,6 +149,36 @@ pub mod nr {
     pub const GETRANDOM: i32 = 384;
 }
 
+/// The kuser "syscalls", which the arm32 kernel answers on the same `svc`.
+///
+/// Port of unidbg: `ARM32SyscallHandler.handleInterrupt`'s `case 0xf0002` and
+/// `case 0xf0005`. They are not syscalls -- there is no such call in the ABI --
+/// but bionic issues them, so a loader that does not answer them sees a guest
+/// that crashes in `__set_tls` on an old SDK.
+pub mod kuser {
+    /// `__ARM_NR_cacheflush`: flush the instruction cache over a range.
+    pub const CACHEFLUSH: i32 = 0xf0002;
+    /// `__ARM_NR_set_tls`: write the thread pointer.
+    pub const SET_TLS: i32 = 0xf0005;
+
+    /// The OABI base an arm32 `svc` immediate carries: `0x900000 + nr`.
+    ///
+    /// A non-OABI `svc` puts the call number in the immediate directly, which is
+    /// what a syscall wrapper does; an OABI one adds the base, which is what
+    /// bionic's own kuser wrappers do. Both have to be recognised, or the
+    /// number arrives as `0x5f005` rather than `0xf0005`.
+    pub const OABI_BASE: i32 = 0x900000;
+
+    /// The call number an `svc` immediate stands for, whichever form it takes.
+    pub fn number(swi: i32) -> i32 {
+        if swi & OABI_BASE != 0 {
+            swi - OABI_BASE
+        } else {
+            swi
+        }
+    }
+}
+
 /// The arm64 numbers the shared table dispatches on, for the translation.
 ///
 /// These mirror `syscall::arm64::nr`; they are repeated here so the translation
