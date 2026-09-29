@@ -99,6 +99,33 @@ lessons for whoever picks them up:
   carry every symbol the P6-P9 acceptance tests call; `libs/` carries both SDK
   levels. Nothing needs building to run a new test.
 
+## P3: libc++'s initialiser now runs, and needs bionic atexit
+
+Android packed relocations (`DT_ANDROID_REL`/`DT_ANDROID_RELA`, the `APS2`
+format) are decoded and applied as of this session -- see the commit. libcpp.so
+is one of those libraries on both ABIs, so before that its relocations were
+skipped entirely and its `init_array` entry stayed zero, which meant its
+initialiser was never called. It is called now, and it fails:
+
+```
+initialiser 0x1214e110: unmapped memory access at 0x910043fda9017c01
+```
+
+The trace is libc++'s init -> `pthread_mutex_lock` -> `__cxa_atexit`, which
+faults dereferencing a garbage pointer. `__cxa_atexit` takes a `__dso_handle`
+argument, which is a per-module `.bss` variable the module's own
+`__cxa_get_dso_handle` returns. unidbg does not hit this because its bundled
+libcpp is the same file but it never decoded the packed table either, so the
+entry stayed zero and `AbsoluteInitFunction.call` skipped it.
+
+The work is therefore a real gap and not a decoder bug: bionic's atexit support.
+`__cxa_atexit` / `__cxa_finalize` / `__register_atfork` and the
+`__dso_handle` per-module handle need modelling, the way unidbg does it through
+`AndroidSyscallHandler`. The smallest version that unblocks the fixtures is to
+make `__cxa_atexit` accept the call and record it, so the destructor list is
+never walked -- initialisers that register destructors then run to completion.
+Two suites (`hooks`, `jni`) fail on this today; everything else is green.
+
 ## P6: one item is thinner than its name
 
 The plan's "VarArg/VaList" item is only half done. Arguments reach a native
