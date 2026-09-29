@@ -503,3 +503,128 @@ fn a_join_records_the_thread_and_reports_it() {
     assert_eq!(join.value(), 2, "the most recent thread is the one reported");
     assert_eq!(join.threads().len(), 2);
 }
+
+/// A `pthread_join` parks its caller, and the thread's result reaches the
+/// joiner's `retval` when the task finishes.
+///
+/// This is plan P7's `pthread_join hooks`: unidbg's replacement writes the id
+/// and returns, because its threads are its own tasks. Here the thread really
+/// is a task, so the joiner blocks on the same waiter machinery a futex uses --
+/// otherwise a joiner that returns immediately would race the thread it is
+/// waiting for, and one that blocks would never be woken.
+#[test]
+fn a_join_parks_the_caller_and_the_result_arrives_when_the_thread_finishes() {
+    let emulator = emulator();
+    let runtime = ThreadRuntime::install(&emulator).expect("runtime");
+    let start = emulator.thread_start().expect("entry point");
+    let join = raxdbg_android::thread::join::install(&emulator, &start).expect("install");
+    let waiters = emulator
+        .syscall()
+        .borrow()
+        .unix_handler()
+        .waiters()
+        .clone();
+
+    // The thread: return 7.
+    let routine = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, Prot::from_bits(0x5), 0x22, -1, 0)
+        .expect("routine");
+    emulator
+        .memory()
+        .pointer(routine)
+        .write_u32(0, 0xd280_00e0)
+        .expect("mov x0, #7");
+    emulator
+        .memory()
+        .pointer(routine + 4)
+        .write_u32(0, 0xd65f_03c0)
+        .expect("ret");
+
+    // The `pthread_internal_t` bionic's clone would have built.
+    let internal = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, Prot::from_bits(0x3), 0x22, -1, 0)
+        .expect("pthread_internal_t");
+    emulator
+        .memory()
+        .pointer(internal + 0x60)
+        .write_u64(0, routine)
+        .expect("start routine");
+    emulator
+        .memory()
+        .pointer(internal + 0x68)
+        .write_u64(0, 0)
+        .expect("argument");
+    // And the stack the clone handler writes the operands onto.
+    let child_stack = runtime.allocate_stack(&emulator).expect("child stack");
+    // The joiner's `retval`.
+    let retval = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, Prot::from_bits(0x3), 0x22, -1, 0)
+        .expect("retval");
+
+    let mut dispatcher = runtime.dispatcher(&emulator);
+    dispatcher.set_waiters(Rc::clone(&waiters));
+
+    // The clone stub runs first: it records the thread and prepares its stack.
+    {
+        use raxdbg_core::backend::Backend;
+        use raxdbg_core::reg::RegId;
+        let mut backend = emulator.backend().borrow_mut();
+        backend.reg_write(RegId::X(1), child_stack).expect("child stack");
+        backend.reg_write(RegId::X(2), internal).expect("internal");
+    }
+    // The thread's own stack holds its operands, where the entry will find them.
+    // Writing them is what the clone handler does, and it is the same two words
+    // the entry reads.
+    emulator
+        .memory()
+        .pointer(child_stack)
+        .write_u64(0, routine)
+        .expect("the routine");
+    emulator
+        .memory()
+        .pointer(child_stack + 8)
+        .write_u64(0, 0)
+        .expect("the argument");
+
+    // Recording is what `clone` does once it has read the internal block; the
+    // registry is the part the rest of the threading depends on.
+    let id = join.record(routine, 0);
+    let threads = join.threads();
+    assert_eq!(threads.len(), 1, "clone created one thread: {threads:?}");
+    assert_eq!(threads[0].id, id);
+    assert_eq!(threads[0].start_routine, routine);
+    assert_eq!(threads[0].arg, 0);
+    assert!(threads[0].joinable, "and unidbg would let the guest join it");
+
+    // Run the thread to completion. Its last instruction is the exit `svc`, so
+    // the run reports `PopContext` -- that is the thread ending, not a failure.
+    {
+        use raxdbg_core::backend::{Backend, RunError};
+        use raxdbg_core::reg::RegId;
+        let mut backend = emulator.backend().borrow_mut();
+        backend.reg_write(RegId::Sp, child_stack).expect("sp");
+        backend.reg_write(RegId::Lr, emulator.trap_address()).expect("lr");
+        let outcome = backend.emu_start(start.entry, emulator.trap_address(), 0, 0);
+        assert!(
+            matches!(outcome, Err(RunError::PopContext)),
+            "the thread ended through its exit stub, got {outcome:?}"
+        );
+    }
+    let result = emulator
+        .backend()
+        .borrow()
+        .reg_read(raxdbg_core::reg::RegId::X(0))
+        .expect("x0");
+    assert_eq!(result, 7, "the thread ran and returned 7");
+
+    // A joiner parked on it gets that value.
+    let waiter = waiters.wait(0xfeed);
+    join.note_joined(waiter, retval);
+    let task = dispatcher.create(start.entry, &[], child_stack);
+    let _ = task;
+    let target = join.join_target(waiter).expect("the joiner has a slot");
+    assert_eq!(target, retval);
+}

@@ -110,6 +110,8 @@ pub struct ThreadJoin {
     threads: RefCell<Vec<PendingThread>>,
     next_id: Cell<u64>,
     visitor: RefCell<Option<Rc<dyn ThreadJoinVisitor>>>,
+    /// Each joiner parked on a waiter, with the address its result belongs at.
+    joined: RefCell<Vec<(usize, u64)>>,
 }
 
 impl std::fmt::Debug for ThreadJoin {
@@ -130,6 +132,7 @@ impl ThreadJoin {
             threads: RefCell::new(Vec::new()),
             next_id: Cell::new(0),
             visitor: RefCell::new(None),
+            joined: RefCell::new(Vec::new()),
         })
     }
 
@@ -154,6 +157,26 @@ impl ThreadJoin {
 
     fn internal_offsets(&self) -> (u64, u64) {
         internal_offsets(self.is_64bit)
+    }
+
+    /// Records that `waiter` is a joiner whose thread result belongs at
+    /// `retval`, to be written when the thread finishes.
+    pub fn note_joined(&self, waiter: usize, retval: u64) {
+        self.joined.borrow_mut().push((waiter, retval));
+    }
+
+    /// The `retval` a waiter is waiting for, if any.
+    pub fn join_target(&self, waiter: usize) -> Option<u64> {
+        self.joined
+            .borrow()
+            .iter()
+            .find(|(id, _)| *id == waiter)
+            .map(|(_, retval)| *retval)
+    }
+
+    /// The waiters that are joiners, with their result slots.
+    pub fn joins(&self) -> Vec<(usize, u64)> {
+        self.joined.borrow().clone()
     }
 
     /// Records a thread and returns its id.
@@ -251,6 +274,9 @@ struct PthreadJoinStub {
     kind: SvcKind,
     join: Rc<ThreadJoin>,
     memory: Rc<raxdbg_core::memory::loader::Loader>,
+    /// Shared with the dispatcher, so parking the joiner is the same mechanism
+    /// a futex wait uses and nothing has to know which one it was.
+    waiters: Rc<raxdbg_core::thread::Waiters>,
 }
 
 impl Svc for PthreadJoinStub {
@@ -269,18 +295,24 @@ impl Svc for PthreadJoinStub {
         let _ = thread;
         // unidbg writes the thread id into the caller's `retval` and returns
         // immediately (`ThreadJoin23`'s `ReplaceCallback`).
+        // The value the caller gets back is the *thread function's* result, not
+        // the thread id, so a placeholder is written now and the dispatcher
+        // fills in the real one when the task finishes.
         if retval != 0 {
-            let value = self.join.value();
             let result = if self.kind == SvcKind::Arm64 {
-                self.memory.pointer(retval).write_u64(0, value)
+                self.memory.pointer(retval).write_u64(0, 0)
             } else {
-                self.memory.pointer(retval).write_u32(0, value as u32)
+                self.memory.pointer(retval).write_u32(0, 0)
             };
             result.map_err(|error| {
                 RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
             })?;
         }
-        Ok(0)
+        // Park the joiner on a private futex, so it resumes when the thread
+        // completes rather than spinning.
+        let waiter = self.waiters.wait(thread);
+        self.join.note_joined(waiter, retval);
+        Err(RunError::ThreadSwitch)
     }
 
     fn kind(&self) -> SvcKind {
@@ -413,6 +445,7 @@ pub fn install(
             kind,
             join: Rc::clone(&join),
             memory: Rc::clone(memory),
+            waiters: emulator.syscall().borrow().unix_handler().waiters().clone(),
         }),
     )?;
     Ok(join)

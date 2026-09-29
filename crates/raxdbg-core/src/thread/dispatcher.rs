@@ -164,6 +164,41 @@ impl ThreadDispatcher {
         }
     }
 
+    /// Runs `on_finish` for each parked joiner whose thread has just finished,
+    /// waking it and clearing its parking.
+    ///
+    /// A `pthread_join` parks the joiner on a waiter and gives the address its
+    /// result belongs at; when the thread's task retires, the dispatcher hands
+    /// the result over and wakes the joiner. Without this a joiner would stay
+    /// parked forever, which looks exactly like a deadlock.
+    pub fn finish_join(&mut self, on_finish: &mut dyn FnMut(usize, u64)) {
+        let woken: Vec<(usize, u64)> = self
+            .waiters
+            .as_ref()
+            .map(|waiters| {
+                self.tasks
+                    .iter()
+                    .filter(|task| task.state == TaskState::Finished)
+                    .filter_map(|task| task.waiter.map(|waiter| (waiter, task.result.unwrap_or(0))))
+                    .filter(|(waiter, _)| waiters.is_woken(*waiter))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (waiter, result) in woken {
+            if let Some(task) = self
+                .tasks
+                .iter_mut()
+                .find(|task| task.waiter == Some(waiter))
+            {
+                task.waiter = None;
+            }
+            if let Some(waiters) = self.waiters.as_ref() {
+                waiters.remove(waiter);
+            }
+            on_finish(waiter, result);
+        }
+    }
+
     /// Whether any task is still parked.
     pub fn parked(&self) -> usize {
         self.tasks.iter().filter(|task| task.is_parked()).count()
