@@ -15,6 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use crate::elf::packed;
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 use goblin::elf::{Elf, dynamic, header};
 
@@ -875,7 +876,19 @@ impl AndroidElfLoader {
 
         let mut unresolved = Vec::new();
         let mut resolved = Vec::new();
-        for relocation in elf.dynrelas.iter().chain(elf.dynrels.iter()).chain(elf.pltrelocs.iter()) {
+        // Android packs a library's relative relocations into `DT_ANDROID_REL`/
+        // `DT_ANDROID_RELA` (the `APS2` format) and leaves `DT_REL`/`DT_RELASZ`
+        // zero. `libcpp.so` is such a library on both ABIs, so a loader that
+        // only reads the classic tables applies none of its relocations --
+        // which is why its `.init_array` slot still held a raw virtual address.
+        let packed = read_packed_relocations(self, dynamic, load_base, &so_name)?;
+        for relocation in elf
+            .dynrelas
+            .iter()
+            .chain(elf.dynrels.iter())
+            .chain(elf.pltrelocs.iter())
+            .chain(packed.iter().copied())
+        {
             let r_type = relocation.r_type;
             if r_type == 0 {
                 log::warn!("unhandled relocation type 0");
@@ -899,10 +912,25 @@ impl AndroidElfLoader {
             let sym_value = symbol.as_ref().map(|symbol| symbol.value).unwrap_or(0);
             let relocation_addr = load_base + relocation.r_offset;
             let addend = relocation.r_addend.unwrap_or(0);
+            // A `RELA` entry carries its addend in the entry, so the slot's own
+            // content is *not* part of the value; only a `REL` entry (which has
+            // no addend) keeps it in the slot. Adding both doubles the value,
+            // which is what a packed `DT_ANDROID_RELA` table exposed: the slots
+            // it covers still held their link-time contents.
+            let slot_addend = if relocation.r_addend.is_some() {
+                0
+            } else {
+                i64::from(self.memory.pointer(relocation_addr).read_u32(0)?)
+            };
+            let slot_addend_64 = if relocation.r_addend.is_some() {
+                0
+            } else {
+                self.memory.pointer(relocation_addr).read_u64(0)? as i64
+            };
 
             match r_type {
                 reloc_type::R_ARM_ABS32 => {
-                    let offset = i64::from(self.memory.pointer(relocation_addr).read_u32(0)?);
+                    let offset = slot_addend + addend;
                     self.push_relocation(
                         &mut unresolved,
                         &mut resolved,
@@ -914,11 +942,7 @@ impl AndroidElfLoader {
                     );
                 }
                 reloc_type::R_AARCH64_ABS64 => {
-                    let offset = self
-                        .memory
-                        .pointer(relocation_addr)
-                        .read_u64(0)? as i64
-                        + addend;
+                    let offset = slot_addend_64 + addend;
                     self.push_relocation(
                         &mut unresolved,
                         &mut resolved,
@@ -1403,6 +1427,61 @@ fn dynamic_needed(elf: &Elf<'_>, dynamic: &goblin::elf::Dynamic) -> Vec<String> 
 }
 
 /// The value of the first `tag` entry.
+/// Decodes a module's `APS2` packed relocations, if it has any.
+///
+/// Port of unidbg: the `DT_ANDROID_REL`/`DT_ANDROID_RELA` arms of
+/// `ElfDynamicStructure.parseDynamic`, which check the `APS2` magic and hand the
+/// rest of the blob to `AndroidRelocation`.
+fn read_packed_relocations(
+    loader: &AndroidElfLoader,
+    dynamic: &goblin::elf::Dynamic,
+    load_base: u64,
+    so_name: &str,
+) -> Result<Vec<goblin::elf::reloc::Reloc>, ElfError> {
+    /// `DT_ANDROID_REL`: the packed equivalent of `DT_REL`.
+    const DT_ANDROID_REL: u64 = 0x6000_000f;
+    /// `DT_ANDROID_RELSZ`.
+    const DT_ANDROID_RELSZ: u64 = 0x6000_0010;
+    /// `DT_ANDROID_RELA`: the packed equivalent of `DT_RELA`.
+    const DT_ANDROID_RELA: u64 = 0x6000_0011;
+    /// `DT_ANDROID_RELASZ`.
+    const DT_ANDROID_RELASZ: u64 = 0x6000_0012;
+
+    // A RELA table wins when both are present, as the linker only emits one.
+    let (offset_tag, size_tag, rela) = if dynamic_value(dynamic, DT_ANDROID_RELA).is_some() {
+        (DT_ANDROID_RELA, DT_ANDROID_RELASZ, true)
+    } else if dynamic_value(dynamic, DT_ANDROID_REL).is_some() {
+        (DT_ANDROID_REL, DT_ANDROID_RELSZ, false)
+    } else {
+        return Ok(Vec::new());
+    };
+    let Some(offset) = dynamic_value(dynamic, offset_tag) else {
+        return Ok(Vec::new());
+    };
+    let size = dynamic_value(dynamic, size_tag).unwrap_or(0) as usize;
+    // The size covers the four-byte magic, so anything smaller is empty.
+    if size <= 4 {
+        return Ok(Vec::new());
+    }
+    let data = loader
+        .memory
+        .pointer(load_base + offset)
+        .get_bytes(0, size)?;
+    if !packed::has_magic(&data) {
+        log::warn!("{so_name}: the packed relocation table does not begin with APS2");
+        return Ok(Vec::new());
+    }
+    let bits = if loader.is_64bit { 64 } else { 32 };
+    let relocations = packed::decode(&data[4..], rela, bits)
+        .map_err(|error| ElfError::Message(format!("{so_name}: packed relocations: {error}")))?;
+    log::debug!(
+        "{so_name}: decoded {} packed relocations from {:#x}",
+        relocations.len(),
+        load_base + offset
+    );
+    Ok(relocations)
+}
+
 fn dynamic_value(dynamic: &goblin::elf::Dynamic, tag: u64) -> Option<u64> {
     dynamic
         .dyns

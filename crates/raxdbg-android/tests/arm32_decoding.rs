@@ -32,6 +32,10 @@ fn the_two_decoders_agree_on_instruction_boundaries() {
         .and_then(|path| path.parent())
         .expect("workspace root")
         .join("libs/android/sdk23/lib/libc.so");
+    // This test reads the code and never runs it, so the initialisers are not
+    // wanted: running them would make a failure here a symptom of the loader
+    // rather than of the decoders.
+    emulator.loader().set_call_init_function(false);
     let file = ElfLibraryFile::open(&path).expect("open libc");
     emulator.load(Box::new(file), false).expect("load libc");
     let base = emulator

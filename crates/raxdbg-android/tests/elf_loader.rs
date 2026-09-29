@@ -431,3 +431,206 @@ fn loading_libc_twice_is_idempotent() {
     assert_eq!(first.base, second.base, "the same module, not a second copy");
     assert_eq!(second.reference_count, first.reference_count + 1);
 }
+
+/// Every relocation in `libcpp.so`'s packed table must land inside one of that
+/// library's own `PT_LOAD` segments.
+///
+/// `libcpp.so` is the library that forced the packed-relocation decoder into
+/// existence: on both ABIs it carries `DT_ANDROID_REL(A)` and leaves
+/// `DT_REL`/`DT_RELASZ` zero, so nothing was being relocated at all. A decoder
+/// that mis-reads the delta stream produces plausible-looking offsets that are
+/// quietly wrong, and this is the check that catches it: an offset outside every
+/// segment means the stream was decoded wrong, not that the library is odd.
+#[test]
+fn packed_relocations_land_inside_the_librarys_segments() {
+    for (relative, is_64bit) in [
+        ("libs/android/sdk23/lib/libcpp.so", false),
+        ("libs/android/sdk23/lib64/libcpp.so", true),
+    ] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root")
+            .join(relative);
+        let bytes = std::fs::read(&path).expect("read libcpp");
+        let elf = goblin::elf::Elf::parse(&bytes).expect("parse libcpp");
+        let dynamic = elf.dynamic.as_ref().expect("dynamic section");
+        let tag = |name: u64| dynamic.dyns.iter().find(|e| e.d_tag == name).map(|e| e.d_val);
+
+        let (offset, size, rela) = if tag(0x6000_0011).is_some() {
+            (tag(0x6000_0011).unwrap(), tag(0x6000_0012).unwrap(), true)
+        } else {
+            (tag(0x6000_000f).expect("DT_ANDROID_REL"), tag(0x6000_0010).expect("DT_ANDROID_RELSZ"), false)
+        };
+        // `DT_ANDROID_REL` is a virtual address, so it has to be turned into a
+        // file offset through the segment that contains it.
+        let file_offset = elf
+            .program_headers
+            .iter()
+            .filter(|header| header.p_type == goblin::elf::program_header::PT_LOAD)
+            .find(|header| {
+                offset >= header.p_vaddr && offset < header.p_vaddr + header.p_filesz
+            })
+            .map(|header| header.p_offset + (offset - header.p_vaddr))
+            .expect("the packed table lives in a mapped segment");
+        let table = &bytes[file_offset as usize..(file_offset + size) as usize];
+        assert!(
+            raxdbg_android::elf::packed::has_magic(table),
+            "{relative}: the packed table does not start with APS2"
+        );
+        let bits = if is_64bit { 64 } else { 32 };
+        let declared = raxdbg_android::elf::packed::count(&table[4..], bits).expect("count");
+        let relocations =
+            raxdbg_android::elf::packed::decode(&table[4..], rela, bits).expect("decode");
+        assert_eq!(
+            relocations.len() as u64,
+            declared,
+            "{relative}: the stream declares {declared} relocations but decoding produced {}",
+            relocations.len()
+        );
+
+        let segments: Vec<(u64, u64)> = elf
+            .program_headers
+            .iter()
+            .filter(|header| header.p_type == goblin::elf::program_header::PT_LOAD)
+            .map(|header| (header.p_vaddr, header.p_vaddr + header.p_memsz))
+            .collect();
+        let outside: Vec<u64> = relocations
+            .iter()
+            .map(|relocation| relocation.r_offset)
+            .filter(|offset| !segments.iter().any(|(start, end)| offset >= start && offset < end))
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "{relative}: {} relocations fall outside every segment, e.g. {:x?}",
+            outside.len(),
+            &outside[..outside.len().min(6)]
+        );
+
+        // The packed table replaces `DT_REL`/`DT_RELA` wholesale, so it carries
+        // every dynamic relocation the library has, not only the relative ones.
+        // The types must still be ones this loader knows how to apply, because
+        // an unknown one is silently skipped and the module stays wrong.
+        let known: &[u32] = if is_64bit {
+            &[257, 1025, 1026, 1027]
+        } else {
+            &[2, 21, 22, 23]
+        };
+        let unknown: Vec<u32> = relocations
+            .iter()
+            .map(|relocation| relocation.r_type)
+            .filter(|kind| !known.contains(kind))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "{relative}: {} relocations have a type this loader does not apply, e.g. {:?}",
+            unknown.len(),
+            &unknown[..unknown.len().min(6)]
+        );
+        // A relative relocation's addend is a link-time address *inside* the
+        // library, so one that lands outside every segment means the delta
+        // accumulator drifted -- the failure mode a decoder can have while
+        // still producing the right count and the right types.
+        let relative = if is_64bit { 1027 } else { 23 };
+        let span_start = segments.iter().map(|(start, _)| *start).min().unwrap();
+        let span_end = segments.iter().map(|(_, end)| *end).max().unwrap();
+        // Only a `RELA` table carries addends; a `REL` one leaves the value in
+        // the slot, so its decoded addend is always zero and says nothing.
+        let stray: Vec<(u64, i64)> = if rela {
+            relocations
+                .iter()
+                .filter(|relocation| relocation.r_type == relative)
+                .filter_map(|relocation| {
+                    let addend = relocation.r_addend.unwrap_or(0);
+                    (!(span_start..span_end).contains(&(addend as u64)))
+                        .then_some((relocation.r_offset, addend))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        assert!(
+            stray.is_empty(),
+            "{relative}: {} relative relocations point outside {span_start:#x}..{span_end:#x}, e.g. {:x?}",
+            stray.len(),
+            &stray[..stray.len().min(4)]
+        );
+
+        // Both kinds must be present: libc++ has plenty of relative relocations
+        // for its vtables and globals, and plenty of symbol ones for libc.
+        let relative = if is_64bit { 1027 } else { 23 };
+        let relative_count = relocations
+            .iter()
+            .filter(|relocation| relocation.r_type == relative)
+            .count();
+        assert!(
+            relative_count > 0 && relative_count < relocations.len(),
+            "{relative}: {relative_count} relative of {} total looks like a mis-decoded stream",
+            relocations.len()
+        );
+    }
+}
+
+/// The `init_array` entry must come out as a real function address, not as a
+/// bare link-time offset.
+///
+/// This is the end-to-end check on the packed-relocation work: libc++'s
+/// `init_array` has one entry, its relocation is packed, and if the type or the
+/// addend is decoded a step out the slot keeps a small number that looks like a
+/// valid address and the initialiser is called in the wrong place.
+#[test]
+fn a_packed_init_array_entry_becomes_a_function_address() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root")
+        .join("libs/android/sdk23/lib64/libcpp.so");
+    let bytes = std::fs::read(&path).expect("read libcpp");
+    let elf = goblin::elf::Elf::parse(&bytes).expect("parse libcpp");
+    let dynamic = elf.dynamic.as_ref().expect("dynamic");
+    let tag = |name: u64| dynamic.dyns.iter().find(|e| e.d_tag == name).map(|e| e.d_val);
+    let init_array = tag(0x6000_0011).expect("DT_ANDROID_RELA");
+    let size = tag(0x6000_0012).expect("DT_ANDROID_RELASZ");
+    let file_offset = elf
+        .program_headers
+        .iter()
+        .filter(|header| header.p_type == goblin::elf::program_header::PT_LOAD)
+        .find(|header| init_array >= header.p_vaddr && init_array < header.p_vaddr + header.p_filesz)
+        .map(|header| header.p_offset + (init_array - header.p_vaddr))
+        .expect("the table is in a mapped segment");
+    let table = &bytes[file_offset as usize..(file_offset + size) as usize];
+    let relocations =
+        raxdbg_android::elf::packed::decode(&table[4..], true, 64).expect("decode");
+
+    // The real `init_array` lives in the .dynamic section, and its entry is
+    // written by a relative relocation.
+    let init_array_vaddr = dynamic
+        .dyns
+        .iter()
+        .find(|entry| entry.d_tag == goblin::elf::dynamic::DT_INIT_ARRAY)
+        .map(|entry| entry.d_val)
+        .expect("DT_INIT_ARRAY");
+    let entry = relocations
+        .iter()
+        .find(|relocation| relocation.r_offset == init_array_vaddr)
+        .expect("the init_array entry has a packed relocation");
+    assert_eq!(entry.r_type, 1027, "it is R_AARCH64_RELATIVE");
+    assert_eq!(entry.r_sym, 0, "with no symbol");
+    let target = entry.r_addend.expect("a RELA entry carries its addend");
+    assert_ne!(
+        target, 0,
+        "the addend is the link-time address of the initialiser, not zero"
+    );
+    // And that address has to be a *code* address, i.e. inside a PT_LOAD and
+    // above the module's first segment.
+    let loads: Vec<(u64, u64)> = elf
+        .program_headers
+        .iter()
+        .filter(|header| header.p_type == goblin::elf::program_header::PT_LOAD)
+        .map(|header| (header.p_vaddr, header.p_vaddr + header.p_memsz))
+        .collect();
+    assert!(
+        loads.iter().any(|(start, end)| target as u64 >= *start && (target as u64) < *end),
+        "the initialiser {target:#x} is inside a loadable segment"
+    );
+}

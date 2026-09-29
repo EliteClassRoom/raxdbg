@@ -12,6 +12,7 @@
 //! through [`AndroidElfLoader::memory`].
 
 pub mod init;
+pub mod packed;
 pub mod loader;
 pub mod module;
 pub mod symbol;
