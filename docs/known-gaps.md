@@ -164,39 +164,50 @@ prints `hello 42`. SDK 19's arm32 libc still faults in
 `__system_property_area_init` on a null `prop_area` read, so `--sdk 19` with a
 32-bit guest does not work. The tree is bundled and arm64's SDK 19 is fine.
 
-## P7: the last link is a parked joiner receiving its result
+## P7: one thread works; a call with two does not
 
-Everything up to the join works, and each piece is tested:
+`thread_value()` works end to end: bionic's `pthread_create` reaches the
+replacement, the thread runs, and `pthread_join` parks its caller until the
+thread's result comes back. That is the whole chain, and the test asserts it
+against the fixture's own code.
 
-* `pthread_create` is replaced -- through a `HookListener`, because libc really
-  exports it and a stub in the SVC page is not a replacement until something
-  points the symbol at it -- and the handler reads the routine and its argument
-  the way `pthread_create`'s own signature lays them out, writes the thread's id
-  into the caller's `pthread_t`, and records the thread. A test asserts
-  `ThreadJoin::threads()` holds one entry with the fixture's own start routine.
-* `pthread_join` is replaced the same way, registers a waiter and returns
-  `RunError::ThreadSwitch`, so the caller parks rather than spinning. A test
-  asserts the waiter exists and knows its result slot.
-* `ThreadRuntime::free_all_stacks` gives the loader's thread-stack indices back
-  after a run; without it a call that parks and resumes runs out on the
-  sixteenth attempt, because the loader caps threads at `MAX_THREADS`.
+Getting there took four pieces, and each is a thing a real join needs:
 
-What does not work is the end of the chain: the thread runs and returns 7, the
-joiner is parked, and the value never reaches it, so the call ends with
-`ThreadSwitch`. `ThreadJoin::deliver_result` writes the value into the joiner's
-`retval` and wakes its waiter, and `ThreadDispatcher::set_resume_value` puts a
-value in `x0` when a *task* resumes -- but the parked thread here is the
-host-driven call, whose context is the live one, so neither path applies. The
-missing piece is to give the caller its own task: `call_function_driven` should
-run it through the dispatcher like any other, so a switch parks it and a wake
-resumes it with the value.
+* **`pthread_create` is replaced through a `HookListener`,** not just by having
+  a stub in the SVC page. libc really exports it, and a stub nothing points the
+  symbol at is not a replacement. The handler reads the routine and its argument
+  the way `pthread_create`'s own signature lays them out -- third and fourth
+  registers, not the raw `clone` wrapper's first and fourth -- writes the
+  thread's id into the caller's `pthread_t`, and records the thread.
+* **The caller is a task of the dispatcher's own.** That is what makes a park
+  reversible: `pthread_join` returns `RunError::ThreadSwitch`, the dispatcher's
+  `run` saves the caller's context, and the thread runs. unidbg's shape, where a
+  `ThreadContextSwitchException` unwinds to a dispatcher already running the
+  caller as a task.
+* **The dispatcher is refilled between its own passes.** A thread is created by
+  the code that runs, so the dispatcher only learns about one when a pass ends.
+  Without the refill a pass that ends with the caller parked finishes nothing,
+  and the loop concludes there is nothing more to do -- before the thread it was
+  waiting for has run.
+* **A woken task is put back with its value.** `ThreadDispatcher::wake_task`
+  sets the resume value and clears the parking *in that order*: the value is
+  looked up as the task comes back, which is what clearing the waiter enables.
+  The value goes into the task's `x0`, which is what the guest sees when the
+  `svc` returns.
 
-Three tests in `tests/thread_fixture.rs` are `#[ignore]`d with that reason rather
-than deleted, because they are the statement of what the port has to achieve:
-`thread_value()` returning 7 through a real `pthread_create`/`pthread_join`,
-`counter()` with two threads interleaving, and `errno_per_thread`. The two that
-do pass are the fixture loading with every relocation resolved and `hello()`
-printing through bionic's stdio.
+**What does not work is a call that creates more than one thread.**
+`errno_per_thread` and `counter` both do, and both end with `ThreadSwitch`: the
+first thread comes back and the second is left parked. The pieces are the same --
+each created thread gets a task and a stack, each joiner gets a waiter -- so
+what is missing is in the loop rather than in the mechanism: `run_until_refilling`
+stops as soon as a pass leaves nothing runnable, and a call whose second thread
+has not been created yet looks exactly like a deadlock at that point.
+
+Two tests in `tests/thread_fixture.rs` are `#[ignore]`d with that reason rather
+than deleted, because they state what is left. The three that pass are the
+fixture loading with every relocation resolved, `hello()` printing through
+bionic's stdio, and `thread_value()` returning 7 through a real
+`pthread_create`/`pthread_join`.
 
 ## P6: one item is thinner than its name
 

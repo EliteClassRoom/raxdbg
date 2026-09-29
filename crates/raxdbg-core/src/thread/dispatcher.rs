@@ -290,6 +290,152 @@ impl ThreadDispatcher {
         }
     }
 
+    /// Runs until `target` finishes or nothing more can run.
+    ///
+    /// A host-driven call is a task like any other, and a `pthread_join` inside
+    /// it parks; this runs the other tasks and comes back when the caller is
+    /// done, which is what makes a woken join resume with its value.
+    pub fn run_until(
+        &mut self,
+        backend: &mut dyn Backend,
+        target: usize,
+    ) -> Result<Vec<(usize, u64)>, RunError> {
+        self.run_until_refilling(backend, target, &mut |_, _| {})
+    }
+
+    /// [`ThreadDispatcher::run_until`], with a hook that runs between passes.
+    ///
+    /// A thread is created by the running code, so the dispatcher learns about
+    /// it only when a pass ends. The hook is where the caller turns what the
+    /// guest asked for into tasks -- without it, a `pthread_create` inside the
+    /// thread that is joining is not picked up until the whole pass is over, and
+    /// a pass that ends with the caller parked finishes nothing and stops.
+    pub fn run_until_refilling(
+        &mut self,
+        backend: &mut dyn Backend,
+        target: usize,
+        refill: &mut dyn FnMut(&mut ThreadDispatcher, &mut dyn Backend),
+    ) -> Result<Vec<(usize, u64)>, RunError> {
+        let mut finished = Vec::new();
+        // A task that is parked can be woken and re-queued, so one pass over the
+        // ready queue is not always the end. The bound is the caller's: once it
+        // has finished, or once nothing is runnable, there is nothing left.
+        while self
+            .tasks
+            .iter()
+            .any(|task| task.id == target && task.state != TaskState::Finished)
+        {
+            if self.ready.is_empty() {
+                break;
+            }
+            let before = self.finished_count();
+            // A pass that ends with every task parked is a join between halves,
+            // not a failure: the caller is waiting for a thread that has not
+            // finished yet, and the loop below decides whether that ever
+            // happens. So the pass's own error is not propagated here.
+            // A pass that ends with every task parked raises rather than
+            // returning, but the threads that *did* finish in it are the answer
+            // the caller is waiting for, so the results are read back off the
+            // tasks rather than off the return value.
+            match self.run(backend) {
+                Ok(results) => finished.extend(results),
+                Err(_) => {
+                    for task in &self.tasks {
+                        if let Some(result) = task.result() {
+                            if !finished.iter().any(|(id, _)| *id == task.id) {
+                                finished.push((task.id, result));
+                            }
+                        }
+                    }
+                }
+            }
+            // Whatever the pass created or woke is the next pass's work.
+            refill(self, backend);
+            if self.ready.is_empty() {
+                // Nothing runnable: the caller is parked on something no thread
+                // will satisfy, which is a deadlock rather than progress.
+                break;
+            }
+            let _ = before;
+        }
+        Ok(finished)
+    }
+
+    /// How many tasks have finished.
+    pub fn finished_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Finished)
+            .count()
+    }
+
+    /// Puts a woken task on the ready queue and clears its parking.
+    ///
+    /// The resume value has to be set *before* the waiter is cleared, because
+    /// clearing it is what makes the task runnable and the value is looked up
+    /// on the way in.
+    pub fn wake_task(&mut self, id: usize, value: u64) {
+        self.resume_values.insert(id, value);
+        let waiter = self
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == id)
+            .and_then(|task| task.waiter.take());
+        if let Some(waiters) = self.waiters.as_ref() {
+            if let Some(waiter) = waiter {
+                waiters.remove(waiter);
+            }
+        }
+        if !self.ready.contains(&id) {
+            self.ready.push_back(id);
+        }
+    }
+
+    /// Puts every task whose waiter has been woken back on the ready queue.
+    ///
+    /// A `futex` wake that arrives from outside a task -- a host-driven caller
+    /// being resumed, say -- has no `ThreadSwitch` of its own to hang the wake
+    /// off, so the queue is swept here instead.
+    pub fn requeue_woken(&mut self) -> usize {
+        let Some(waiters) = self.waiters.clone() else {
+            return 0;
+        };
+        let woken: Vec<usize> = self
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.waiter
+                    .map(|waiter| waiters.is_woken(waiter))
+                    .unwrap_or(false)
+            })
+            .map(|task| task.id)
+            .collect();
+        let mut count = 0;
+        for id in woken {
+            let waiter = self
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .and_then(|task| task.waiter.take());
+            if let Some(waiter) = waiter {
+                waiters.remove(waiter);
+            }
+            if !self.ready.contains(&id) {
+                self.ready.push_back(id);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// The task parked on `waiter`, if any.
+    pub fn task_waiting_on(&self, waiter: usize) -> Option<usize> {
+        self.tasks
+            .iter()
+            .find(|task| task.waiter == Some(waiter))
+            .map(|task| task.id)
+    }
+
     /// Runs every task to completion.
     ///
     /// Port of unidbg: `UniThreadDispatcher.run` plus `ThreadTask.run`, which
@@ -473,9 +619,11 @@ impl ThreadDispatcher {
                 Err(error) => return Err(error),
             }
         }
-        if self.pending() > 0 && self.parked() > 0 {
-            // Every thread is blocked on something nothing will wake. unidbg
-            // stops the emulator here; reporting it beats hanging.
+        if self.pending() > 0 && self.parked() > 0 && finished.is_empty() {
+            // Every thread is blocked on something nothing will wake, and
+            // nothing finished to show for it. unidbg stops the emulator here;
+            // reporting it beats hanging. A pass that did finish something is
+            // not a deadlock -- a join in progress is exactly that.
             return Err(RunError::Backend(crate::backend::BackendError::Other(
                 format!(
                     "every thread is parked: {} of {} tasks are waiting",

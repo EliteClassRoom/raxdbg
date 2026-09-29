@@ -169,6 +169,11 @@ impl ThreadJoin {
         self.threads.borrow().clone()
     }
 
+    /// How many created threads the dispatcher has not run yet.
+    pub fn pending_count(&self) -> usize {
+        self.pending.borrow().len()
+    }
+
     /// The threads created but not yet run, taken so the dispatcher runs each
     /// of them once.
     pub fn take_pending(&self) -> Vec<PendingThread> {
@@ -178,6 +183,17 @@ impl ThreadJoin {
     /// Records that a created thread has run to completion, with `result`.
     pub fn complete_one(&self, result: u64) {
         self.finished.borrow_mut().push(result);
+    }
+
+    /// The results the finished threads produced, taken so each is delivered
+    /// once.
+    pub fn take_finished(&self) -> Vec<(u64, u64)> {
+        let taken = std::mem::take(&mut *self.finished.borrow_mut());
+        taken
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (index as u64, value))
+            .collect()
     }
 
     /// What the finished threads returned, in the order they finished.

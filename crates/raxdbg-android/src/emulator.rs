@@ -375,77 +375,23 @@ impl AndroidEmulator {
     ///
     /// A `pthread_join` (or a futex wait) parks its caller: the syscall cannot
     /// make progress, so it asks for a `ThreadSwitch` and something else has to
-    /// run. That "something" is the thread the guest just created, so the call
-    /// has to be able to pick up where it left off. This is the same shape as
-    /// unidbg, where a `ThreadContextSwitchException` unwinds to a dispatcher
-    /// that is running the caller as a task of its own.
+    /// run. That "something" is the thread the guest just created.
     ///
-    /// The loop is bounded: a join that is never woken is a deadlock, and
-    /// spinning forever would hide it.
+    /// The caller therefore has to be a task of the dispatcher's own, which is
+    /// how unidbg does it: there a `ThreadContextSwitchException` unwinds to a
+    /// dispatcher that is already running the caller as a task, so a wake puts
+    /// the caller's saved context back and the `svc` returns the value it owes.
+    /// Running the caller on a stack of its own and handing its context to the
+    /// dispatcher makes the same thing true here.
     pub fn call_function_driven(self: &Rc<Self>, address: u64, args: &[u64]) -> Result<u64, EmulatorError> {
         const MAX_SWITCHES: usize = 4096;
-        for _ in 0..MAX_SWITCHES {
-            match self.call_function(address, args) {
-                Ok(value) => return Ok(value),
-                Err(EmulatorError::Run(RunError::ThreadSwitch)) => {
-                    if !self.run_pending_threads()? {
-                        // Nothing is runnable, so the parked caller can never be
-                        // woken. That is a deadlock, and saying so beats hanging.
-                        return Err(EmulatorError::Run(RunError::ThreadSwitch));
-                    }
-                    // A finished thread's result is the value the parked syscall
-                    // owes its caller. The caller's own context is the live one
-                    // -- the dispatcher ran the *other* threads -- so the value
-                    // goes straight into its return register, which is what the
-                    // guest sees when the `svc` returns.
-                    if let Some(value) = self.take_join_result() {
-                        let register = if self.is_64bit {
-                            RegId::X(0)
-                        } else {
-                            RegId::R(0)
-                        };
-                        self.backend.borrow_mut().reg_write(register, value)?;
-                    }
-                    // Nothing to wake means nothing to wait for, so the loop
-                    // would spin until its bound. Say so instead.
-                    if !self.join_has_waiter() {
-                        return Err(EmulatorError::Run(RunError::ThreadSwitch));
-                    }
-                }
-                Err(other) => return Err(other),
-            }
-        }
-        Err(EmulatorError::Run(RunError::ThreadSwitch))
-    }
-
-    /// Takes the result a finished thread produced for a joiner, if one is
-    /// waiting.
-    fn take_join_result(self: &Rc<Self>) -> Option<u64> {
-        let join = self.thread_join.borrow().clone()?;
-        join.results().last().copied()
-    }
-
-    /// Whether a `pthread_join` is still waiting for a thread.
-    fn join_has_waiter(&self) -> bool {
-        self.thread_join
-            .borrow()
-            .as_ref()
-            .map(|join| !join.joins().is_empty())
-            .unwrap_or(false)
-    }
-
-    /// Runs the threads `pthread_create` has made, and reports whether any ran.
-    fn run_pending_threads(self: &Rc<Self>) -> Result<bool, EmulatorError> {
-        let Some(join) = self.thread_join.borrow().clone() else {
-            return Ok(false);
-        };
         let Some(start) = self.thread_start.borrow().clone() else {
-            return Ok(false);
+            // Nothing installed the thread machinery, so nothing can park.
+            return self.call_function(address, args);
         };
-        let pending = join.take_pending();
-        if pending.is_empty() {
-            return Ok(false);
-        }
+        let Some(join) = self.thread_join.borrow().clone() else {
+            return self.call_function(address, args);
+        };
         let runtime = crate::thread::ThreadRuntime::install(self).map_err(EmulatorError::Memory)?;
         let waiters = self
             .syscall
@@ -456,37 +402,142 @@ impl AndroidEmulator {
         let mut dispatcher = runtime.dispatcher(self);
         dispatcher.set_waiters(Rc::clone(&waiters));
 
-        for thread in &pending {
-            let stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
-            // The clone replacement put the routine and its argument at the top
-            // of the child's stack, which is where the entry code reads them.
-            self.loader
-                .memory()
-                .pointer(stack)
-                .write_pointer(0, thread.start_routine)
-                .map_err(EmulatorError::Memory)?;
-            self.loader
-                .memory()
-                .pointer(stack + runtime.word_size())
-                .write_pointer(0, thread.arg)
-                .map_err(EmulatorError::Memory)?;
-            dispatcher.create(start.entry, &[], stack);
+        // The caller, as a task, on a stack of its own.
+        let caller_stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
+        let caller = dispatcher.create(address, args, caller_stack);
+        let mut passes = 0usize;
+        for _ in 0..MAX_SWITCHES {
+            passes += 1;
+            if dispatcher.pending() == 0 && join.pending_count() == 0 {
+                // The caller has finished and nothing new was created.
+                break;
+            }
+            // Every thread the guest created and has not run yet goes on the
+            // ready queue alongside the caller: which of them runs is the
+            // dispatcher's business, and the caller's parked task is woken by a
+            // join exactly like any other. A thread can be created by another
+            // thread, so this happens every pass, not just the first.
+            for thread in join.take_pending() {
+                let stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
+                self.loader
+                    .memory()
+                    .pointer(stack)
+                    .write_pointer(0, thread.start_routine)
+                    .map_err(EmulatorError::Memory)?;
+                self.loader
+                    .memory()
+                    .pointer(stack + runtime.word_size())
+                    .write_pointer(0, thread.arg)
+                    .map_err(EmulatorError::Memory)?;
+                dispatcher.create(start.entry, &[], stack);
+            }
+            // A pass can end with every task parked -- which is what a join
+            // looks like between the two halves of the exchange. That is not a
+            // failure: the results it collected are what the caller is waiting
+            // for, and the loop decides whether there is anything more to do.
+            // A thread is created by the running code, so the queue is topped
+            // up both before and after a pass: a thread the caller makes while
+            // it runs is not there when the pass it is in starts.
+            for thread in join.take_pending() {
+                let stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
+                // The clone replacement put the routine and its argument at the
+                // top of the child's stack, which is where the entry code reads
+                // them.
+                self.loader
+                    .memory()
+                    .pointer(stack)
+                    .write_pointer(0, thread.start_routine)
+                    .map_err(EmulatorError::Memory)?;
+                self.loader
+                    .memory()
+                    .pointer(stack + runtime.word_size())
+                    .write_pointer(0, thread.arg)
+                    .map_err(EmulatorError::Memory)?;
+                dispatcher.create(start.entry, &[], stack);
+            }
+            // The dispatcher asks for more work between its passes, because a
+            // thread is only known once the code that created it has stopped
+            // running.
+            let results = {
+                let mut backend = self.backend.borrow_mut();
+                let mut refill = |dispatcher: &mut raxdbg_core::thread::ThreadDispatcher,
+                                   _backend: &mut dyn Backend| {
+                    // A thread is created by the running code, so the dispatcher
+                    // only learns about one when a pass ends.
+                    for thread in join.take_pending() {
+                        let Ok(stack) = runtime.allocate_stack(self) else {
+                            return;
+                        };
+                        if self
+                            .loader
+                            .memory()
+                            .pointer(stack)
+                            .write_pointer(0, thread.start_routine)
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let _ = self
+                            .loader
+                            .memory()
+                            .pointer(stack + runtime.word_size())
+                            .write_pointer(0, thread.arg);
+                        dispatcher.create(start.entry, &[], stack);
+                    }
+                };
+                dispatcher.run_until_refilling(&mut *backend, caller, &mut refill)
+            };
+            let results = results?;
+            // Whatever the pass created, and whatever it woke, is next.
+            for thread in join.take_pending() {
+                let stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
+                self.loader
+                    .memory()
+                    .pointer(stack)
+                    .write_pointer(0, thread.start_routine)
+                    .map_err(EmulatorError::Memory)?;
+                self.loader
+                    .memory()
+                    .pointer(stack + runtime.word_size())
+                    .write_pointer(0, thread.arg)
+                    .map_err(EmulatorError::Memory)?;
+                dispatcher.create(start.entry, &[], stack);
+            }
+            if results.is_empty() {
+                // Nothing ran, so nothing can change: a join that is never woken
+                // is a deadlock, and saying so beats hanging.
+                break;
+            }
+            for (_, value) in results {
+                join.complete_one(value);
+            }
+            // A thread that finished in this pass hands its result to whoever
+            // joined it: the value goes into that joiner's `retval`, its waiter
+            // is woken, and the woken task resumes with the value in `x0`. This
+            // is the step that turns a parked joiner back into a running one,
+            // so it has to happen before the queue is inspected.
+            for (_, value) in join.take_finished() {
+                for (waiter, _) in join.joins() {
+                    if waiters.is_woken(waiter) {
+                        continue;
+                    }
+                    waiters.wake(waiter as u64, 1);
+                    // `wake_task` sets the value and clears the parking in one
+                    // step, in that order: the value is looked up as the task
+                    // comes back, which is what clearing the waiter enables.
+                    if let Some(task) = dispatcher.task_waiting_on(waiter) {
+                        dispatcher.wake_task(task, value);
+                    }
+                }
+                join.deliver_result(&waiters, value);
+            }
         }
-        let results = {
-            let mut backend = self.backend.borrow_mut();
-            dispatcher.run(&mut *backend).map_err(EmulatorError::Run)?
-        };
-        // Each thread's result is the value its joiner parked waiting for, and
-        // waking that joiner is what lets the call resume.
-        for (_, value) in results {
-            join.complete_one(value);
-            join.deliver_result(&waiters, value);
-        }
-        // The threads have run, so their stacks go back: the loader caps threads
-        // at MAX_THREADS, and a call that parks and resumes would otherwise run
-        // out of them.
+        eprintln!("DBG end: {} tasks, {} finished, caller state {:?}", dispatcher.task_count(), dispatcher.finished_count(), dispatcher.task(caller).map(|t| t.state()));
         runtime.free_all_stacks();
-        Ok(true)
+        match dispatcher.task(caller).and_then(|task| task.result()) {
+            Some(value) => Ok(value),
+            None => Err(EmulatorError::Run(RunError::ThreadSwitch)),
+        }
     }
 
     pub fn call_function(&self, address: u64, args: &[u64]) -> Result<u64, EmulatorError> {

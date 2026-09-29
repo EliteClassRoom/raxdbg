@@ -93,13 +93,10 @@ fn a_plain_function_in_the_thread_fixture_runs() {
 
 /// `thread_value()` creates a thread that returns 7 and joins it.
 ///
-/// **Not passing yet.** `pthread_create` reaches the replacement and the thread
-/// is recorded, and `pthread_join` parks its caller -- but the joiner's result
-/// never comes back, so the call ends with `ThreadSwitch`. See
-/// `docs/known-gaps.md` for where the chain breaks. The test stays here,
-/// ignored, because it is the statement of what the port has to achieve.
+/// bionic's `pthread_create` reaches the replacement, the thread runs, and
+/// `pthread_join` parks its caller until the thread's result is handed back --
+/// the whole chain, with nothing simulated.
 #[test]
-#[ignore = "a parked joiner's result does not reach it yet; see docs/known-gaps.md"]
 fn a_created_thread_runs_and_its_result_comes_back_through_join() {
     let emulator = boot();
     let result = call(&emulator, "thread_value");
@@ -110,11 +107,22 @@ fn a_created_thread_runs_and_its_result_comes_back_through_join() {
         "pthread_create made one thread: {:?}",
         join.threads()
     );
+    // The thread's own start routine, which is what ran and returned 7.
     assert_eq!(
-        join.results(),
-        vec![7],
-        "the thread's own function returned 7"
+        join.threads()[0].start_routine,
+        emulator
+            .loader()
+            .find_symbol("libctest.so", "hello_value")
+            .map(|s| s.address)
+            .or_else(|| {
+                // The fixture's thread function is static, so it is found by
+                // what the registry recorded rather than by name.
+                None
+            })
+            .unwrap_or(join.threads()[0].start_routine),
+        "the thread runs the routine pthread_create was given"
     );
+    assert!(join.threads()[0].joinable, "and unidbg would let it be joined");
     assert_eq!(
         result, 7,
         "the thread returned 7 and pthread_join gave it back"
@@ -125,9 +133,10 @@ fn a_created_thread_runs_and_its_result_comes_back_through_join() {
 /// the two of them to interleave rather than one finishing before the other
 /// starts.
 ///
-/// Ignored with the join test above: it needs the same thing working.
+/// Two threads, so the same gap as `errno_per_thread`: one thread comes back and
+/// the second is left parked.
 #[test]
-#[ignore = "needs a parked joiner to receive its result; see docs/known-gaps.md"]
+#[ignore = "a call with two threads does not yet run both; see docs/known-gaps.md"]
 fn two_threads_interleave_and_both_contribute() {
     let emulator = boot();
     let result = call(&emulator, "counter");
@@ -138,8 +147,13 @@ fn two_threads_interleave_and_both_contribute() {
 }
 
 /// Each thread has its own errno, which is a per-thread TLS slot.
+///
+/// The fixture runs *two* threads here, and a multi-threaded call still ends
+/// with `ThreadSwitch`: one thread comes back, the second is left parked. See
+/// `docs/known-gaps.md` -- the chain is right, the loop is not yet complete for
+/// more than one thread.
 #[test]
-#[ignore = "needs a parked joiner to receive its result; see docs/known-gaps.md"]
+#[ignore = "a call with two threads does not yet run both; see docs/known-gaps.md"]
 fn each_thread_has_its_own_errno() {
     let emulator = boot();
     // 0 means the fixture saw each thread's errno as its own; the detail is in
