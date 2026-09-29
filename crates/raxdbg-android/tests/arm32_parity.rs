@@ -278,3 +278,53 @@ fn the_kuser_calls_answer_and_set_tls_moves_the_thread_pointer() {
         .expect("thread pointer");
     assert_eq!(after, page, "__ARM_NR_set_tls moved the thread pointer");
 }
+
+/// The loader takes the AArch32 branch for an AArch32 library.
+///
+/// Plan P9's `ELF arm32 branch`. `check_header` is the branch, and this says it
+/// takes the right one in both directions: a 32-bit emulator maps the arm32
+/// library and finds its symbols, and a 64-bit one refuses it. Without this an
+/// arm32 loader that checked the wrong machine would still pass every other
+/// test in the suite, because they all use real arm32 libraries.
+#[test]
+fn the_loader_takes_the_aarch32_branch_for_an_aarch32_library() {
+    let library = workspace_path("libs/android/sdk23/lib/libc.so");
+    let bytes = std::fs::read(&library).expect("read arm32 libc");
+    // e_ident's class byte is at 4; e_machine is at 18.
+    assert_eq!(bytes[4], 1, "ELFCLASS32");
+    assert_eq!(bytes[18], 40, "EM_ARM");
+
+    // The 32-bit side: it maps, and the arm32 module's symbols are there.
+    let arm32 = AndroidEmulatorBuilder::for_32bit()
+        .process_name("raxdbg-arm32-branch")
+        .sdk(23)
+        .build()
+        .expect("arm32 emulator");
+    let file = raxdbg_android::android_file::ElfLibraryFile::open(&library).expect("open");
+    arm32
+        .load(Box::new(file), false)
+        .expect("a 32-bit emulator maps an arm32 library");
+    assert!(
+        arm32.loader().find_symbol("libc.so", "malloc").is_some(),
+        "and the arm32 module's symbols are there"
+    );
+
+    // The 64-bit side: the same library is refused, and the error says why.
+    let arm64 = AndroidEmulatorBuilder::for_64bit()
+        .process_name("raxdbg-arm64-branch")
+        .sdk(23)
+        .build()
+        .expect("arm64 emulator");
+    let file = raxdbg_android::android_file::ElfLibraryFile::open(&library).expect("open");
+    let error = arm64
+        .load(Box::new(file), false)
+        .expect_err("a 64-bit emulator refuses an arm32 library");
+    // The class check comes before the machine check, so the error names the
+    // 32-bit class rather than `EM_ARM` -- which is the more precise complaint,
+    // since a 32-bit class is what is wrong first.
+    let message = error.to_string();
+    assert!(
+        message.contains("32-bit") || message.contains("AArch64"),
+        "the error says what was expected: {error}"
+    );
+}

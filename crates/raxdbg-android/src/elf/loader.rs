@@ -1428,21 +1428,51 @@ impl AndroidElfLoader {
     }
 
     fn check_header(&self, elf: &Elf<'_>) -> Result<(), ElfError> {
+        // The message names what the library *is* and what the emulator wanted,
+        // not just which one it must be: "the library must be 64-bit" is
+        // confusing when handed a 32-bit one.
         let class = elf.header.e_ident[header::EI_CLASS];
-        if self.is_64bit && class != header::ELFCLASS64 {
-            return Err(ElfError::Message("the library must be 64-bit".into()));
-        }
-        if !self.is_64bit && class != header::ELFCLASS32 {
-            return Err(ElfError::Message("the library must be 32-bit".into()));
+        let (found, wanted) = if self.is_64bit {
+            (
+                match class {
+                    header::ELFCLASS32 => "a 32-bit",
+                    _ => "an unknown-class",
+                },
+                "a 64-bit (ELFCLASS64) library is required",
+            )
+        } else {
+            (
+                match class {
+                    header::ELFCLASS64 => "a 64-bit",
+                    _ => "an unknown-class",
+                },
+                "a 32-bit (ELFCLASS32) library is required",
+            )
+        };
+        let expected = if self.is_64bit {
+            header::ELFCLASS64
+        } else {
+            header::ELFCLASS32
+        };
+        if class != expected {
+            return Err(ElfError::Message(format!(
+                "the library is {found} library, but {wanted}"
+            )));
         }
         if elf.header.e_ident[header::EI_DATA] != header::ELFDATA2LSB {
             return Err(ElfError::Message("the library must be little-endian".into()));
         }
         if self.is_64bit && elf.header.e_machine != header::EM_AARCH64 {
-            return Err(ElfError::Message("the library must be AArch64".into()));
+            return Err(ElfError::Message(format!(
+                "the library's machine is 0x{:x}, but an AArch64 (EM_AARCH64) library is required",
+                elf.header.e_machine
+            )));
         }
         if !self.is_64bit && elf.header.e_machine != header::EM_ARM {
-            return Err(ElfError::Message("the library must be ARM".into()));
+            return Err(ElfError::Message(format!(
+                "the library's machine is 0x{:x}, but an ARM (EM_ARM) library is required",
+                elf.header.e_machine
+            )));
         }
         Ok(())
     }
