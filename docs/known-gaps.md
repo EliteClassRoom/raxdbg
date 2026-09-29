@@ -244,10 +244,23 @@ than those three words, and `pthread_getattr_np` reads a node pointer and a
 `tid` out of that block rather than out of the node. So the layout to work out
 is the block's, not the node's.
 
-`pthread_getattr_np_answers_for_the_running_thread` in `tests/threads.rs` is the
-test for it, `#[ignore]`d with that reason. Guessing further offsets from the
-disassembly would be guessing; reading the layout out of the binary is the step
-that makes it pass.
+**What the binary says, and what is now built.** Reading
+`pthread_getattr_np` at libc+0x67808 rather than guessing: the block the thread
+pointer names is what carries the attributes. It reads `+0x18` and `+0x50` as the
+thread's stack bounds, and the `pthread_internal_t` node -- `next`, `prev`, `tid`
+at `+0x10` -- hangs off the same allocation. So the block is built with both, and
+with a stack of its own to report, rather than with the two fields left zero:
+an emulator reporting a zero-length stack makes anything that measures it look
+like it ran off the end, which is what a hook engine's size calculation is doing.
+
+**That is not enough, and saying so is the honest part.** With the block
+populated, `dobby_run` still spends millions of instructions in the same place.
+The `cmp w0, #0xd` in the middle of it is an *error code*, not a loop bound, so
+the repetition is a caller retrying rather than a walk overrunning -- bionic is
+returning an error the caller does not expect, and the remaining work is finding
+which one. `pthread_getattr_np_answers_for_the_running_thread` in
+`tests/threads.rs` is the test for it, `#[ignore]`d with that reason, and
+`the_fixture_can_drive_dobby_and_hookzz_itself` in `tests/hooks.rs` likewise.
 
 `the_fixture_can_drive_dobby_and_hookzz_itself` is `#[ignore]`d with that reason
 rather than deleted -- it is the statement of what is left, and it is worth

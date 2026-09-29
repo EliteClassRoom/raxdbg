@@ -165,6 +165,10 @@ impl ThreadRuntime {
     ) -> Result<(u64, u64), MemoryError> {
         let memory = emulator.memory();
         let word = self.word_size();
+        // The block the thread pointer names. bionic's `pthread_getattr_np`
+        // takes its stack bounds from `+0x18` and `+0x50` of *this* block, and
+        // the `pthread_internal_t` node is what hangs off it -- so both live in
+        // the same allocation, and the block is what a thread pointer means.
         let block = memory.allocate_stack(0x400)?.peer();
         let pointer = memory.pointer(block);
         // The head is the running thread's own block, which lives at the thread
@@ -197,6 +201,15 @@ impl ThreadRuntime {
         if following != 0 {
             memory.pointer(following).write_pointer(word, block)?;
         }
+        // The stack bounds `pthread_getattr_np` reports. The thread runs on a
+        // stack of its own, taken from the loader's thread-stack area, so the
+        // block says where that is rather than leaving the fields zero --
+        // an emulator that reports a zero-length stack makes anything that
+        // measures it look like it ran off the end.
+        let stack_low = emulator.memory().allocate_stack(0x1000)?.peer();
+        let stack_high = stack_low + 0x1000;
+        memory.pointer(block + 0x18).write_pointer(0, stack_low)?;
+        memory.pointer(block + 0x50).write_pointer(0, stack_high)?;
         Ok((block, block + word * 2))
     }
 
