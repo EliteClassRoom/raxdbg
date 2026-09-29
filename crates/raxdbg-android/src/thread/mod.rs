@@ -150,6 +150,14 @@ impl ThreadRuntime {
     /// A created thread needs the same thing, or bionic's own bookkeeping --
     /// `__gettid`, the TLS destructor list, `pthread_getattr_np` -- has nothing
     /// to read. The struct is three words: `next`, `prev` and `tid`.
+    ///
+    /// The block is *linked into* the running thread's rather than standing
+    /// alone. bionic's `pthread_getattr_np` walks the list from the calling
+    /// thread's TLS looking for the calling thread's own entry, and a list where
+    /// every node is unreachable from the head makes that walk run forever -- a
+    /// loop a hook engine's own size calculation falls into, because Dobby asks
+    /// for a function's extent. So the new node goes after the head, with the
+    /// head's `next` pointing at it and its `prev` pointing back.
     pub fn pthread_internal(
         &self,
         emulator: &Rc<AndroidEmulator>,
@@ -158,14 +166,32 @@ impl ThreadRuntime {
         let memory = emulator.memory();
         let word = self.word_size();
         let block = memory.allocate_stack(0x400)?.peer();
-        // `next`, `prev`, `tid`: the list is empty, so the first two are null
-        // and only the id is set.
         let pointer = memory.pointer(block);
-        pointer.write_pointer(0, 0)?;
-        pointer.write_pointer(word, 0)?;
+        // The head is the running thread's own block, read out of its TLS.
+        let head = {
+            let register = if emulator.is_64bit() {
+                raxdbg_core::reg::RegId::X(18)
+            } else {
+                raxdbg_core::reg::RegId::C13C0_3
+            };
+            emulator
+                .backend()
+                .borrow()
+                .reg_read(register)
+                .unwrap_or(block)
+        };
+        // A fresh node links after the head: `next` is whatever followed it,
+        // `prev` is the head, and the head's `next` is this node.
+        let following = memory.pointer(head).read_pointer(0).unwrap_or(0);
+        pointer.write_pointer(0, following)?;
+        pointer.write_pointer(word, head)?;
         memory
             .pointer(block + word * 2)
             .write_u32(0, tid as u32)?;
+        memory.pointer(head).write_pointer(0, block)?;
+        if following != 0 {
+            memory.pointer(following).write_pointer(word, block)?;
+        }
         Ok((block, block + word * 2))
     }
 

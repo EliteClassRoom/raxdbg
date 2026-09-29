@@ -231,9 +231,23 @@ last:
   trampoline placed next to the target, because the SVC page is 3.9 GB away and
   a branch reaches 128 MiB.
 
-`the_fixture_can_drive_dobby_and_hookzz_itself` is `#[ignore]`d with that
-reason rather than deleted -- it is the statement of what is left, and it is
-worth chasing because it is what the engines exist for.
+**And the engine's own patching does not finish.** A code hook over the whole
+address space, counting instructions, shows the guest spending millions of them
+cycling through `pthread_getattr_np` (and, at the sampling points, through
+`if_indextoname` and `tzparse` -- those are where sampling landed, not the loop).
+`pthread_getattr_np` is where Dobby asks the runtime for a function's extent, so
+its size calculation is what does not return. The loop itself is a bounded one
+(`cmp w0, #0xd` / `b.ne`), which means bionic is returning something the caller
+did not expect rather than walking a list for ever -- the thread list and the
+`pthread_internal_t` that hangs off it are now linked correctly, so this is
+about what `pthread_getattr_np` reports for a thread this emulator made up, not
+about the list.
+
+`the_fixture_can_drive_dobby_and_hookzz_itself` is `#[ignore]`d with that reason
+rather than deleted -- it is the statement of what is left, and it is worth
+chasing because it is what the engines exist for. The next step is a test that
+calls `pthread_getattr_np` directly on a 32- and a 64-bit thread and asserts the
+attributes it reports, which is where the answer will be.
 
 ## P6: one item is thinner than its name
 

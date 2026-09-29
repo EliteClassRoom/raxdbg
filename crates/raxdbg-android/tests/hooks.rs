@@ -383,14 +383,14 @@ fn load_fixture(emulator: &Rc<AndroidEmulator>, name: &str) {
 
 /// The fixture's own engine drivers, `dobby_run()` and `zz_run()`.
 ///
-/// **Not run yet.** Both `dlopen` their engine and call its entry point
-/// successfully -- `every_engine_is_reachable_through_the_resolver` proves that
-/// half -- but the engines then patch the target themselves, and Dobby's patching
-/// loop does not terminate here. It is worth chasing: the test is the statement
-/// that a guest can do its own inline hooking, which is what the three engines
-/// are for. See `docs/known-gaps.md`.
+/// **Not passing yet**, and now diagnosed rather than merely observed. Both
+/// `dlopen` their engine and call its entry point -- that half is proven by
+/// `every_engine_is_reachable_through_the_resolver` -- and then Dobby's own size
+/// calculation does not return: a code hook shows the guest spending millions
+/// of instructions inside `pthread_getattr_np`, which is where Dobby asks for a
+/// function's extent. See `docs/known-gaps.md`.
 #[test]
-#[ignore = "the engine's own patching loop does not terminate; see docs/known-gaps.md"]
+#[ignore = "Dobby's size calculation spins in pthread_getattr_np; see docs/known-gaps.md"]
 fn the_fixture_can_drive_dobby_and_hookzz_itself() {
     let emulator = AndroidEmulatorBuilder::for_64bit()
         .process_name("raxdbg-engines-guest")
