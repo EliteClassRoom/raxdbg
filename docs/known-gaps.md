@@ -236,12 +236,18 @@ address space, counting instructions, shows the guest spending millions of them
 cycling through `pthread_getattr_np` (and, at the sampling points, through
 `if_indextoname` and `tzparse` -- those are where sampling landed, not the loop).
 `pthread_getattr_np` is where Dobby asks the runtime for a function's extent, so
-its size calculation is what does not return. The loop itself is a bounded one
-(`cmp w0, #0xd` / `b.ne`), which means bionic is returning something the caller
-did not expect rather than walking a list for ever -- the thread list and the
-`pthread_internal_t` that hangs off it are now linked correctly, so this is
-about what `pthread_getattr_np` reports for a thread this emulator made up, not
-about the list.
+its size calculation is what does not return. Calling it directly faults reading
+the id it was handed as an address, which says something specific: the
+`pthread_internal_t` is `next`, `prev`, `tid` -- what unidbg models and what is
+built and linked here -- but the *thread-pointer block* around it carries more
+than those three words, and `pthread_getattr_np` reads a node pointer and a
+`tid` out of that block rather than out of the node. So the layout to work out
+is the block's, not the node's.
+
+`pthread_getattr_np_answers_for_the_running_thread` in `tests/threads.rs` is the
+test for it, `#[ignore]`d with that reason. Guessing further offsets from the
+disassembly would be guessing; reading the layout out of the binary is the step
+that makes it pass.
 
 `the_fixture_can_drive_dobby_and_hookzz_itself` is `#[ignore]`d with that reason
 rather than deleted -- it is the statement of what is left, and it is worth

@@ -167,18 +167,23 @@ impl ThreadRuntime {
         let word = self.word_size();
         let block = memory.allocate_stack(0x400)?.peer();
         let pointer = memory.pointer(block);
-        // The head is the running thread's own block, read out of its TLS.
+        // The head is the running thread's own block, which lives at the thread
+        // pointer. That is read out of `TPIDR_EL0` (or `TPIDRURO`), not out of
+        // `x18`: `x18` is a platform register that bionic's own startup is free
+        // to use, and by the time a thread is created it is holding something
+        // else entirely.
         let head = {
             let register = if emulator.is_64bit() {
-                raxdbg_core::reg::RegId::X(18)
+                raxdbg_core::reg::RegId::TpidrEl0
             } else {
                 raxdbg_core::reg::RegId::C13C0_3
             };
-            emulator
-                .backend()
-                .borrow()
-                .reg_read(register)
-                .unwrap_or(block)
+            let pointer = emulator.backend().borrow().reg_read(register).unwrap_or(0);
+            if pointer == 0 {
+                block
+            } else {
+                pointer
+            }
         };
         // A fresh node links after the head: `next` is whatever followed it,
         // `prev` is the head, and the head's `next` is this node.

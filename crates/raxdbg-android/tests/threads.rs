@@ -641,6 +641,28 @@ fn each_thread_gets_its_own_pthread_internal() {
     let emulator = emulator();
     let runtime = ThreadRuntime::install(&emulator).expect("runtime");
 
+    // The list hangs off the running thread's block, which the test points at
+    // explicitly so the head is known and the links can be checked.
+    let head = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, Prot::from_bits(0x3), 0x22, -1, 0)
+        .expect("the head");
+    use raxdbg_core::backend::Backend;
+    emulator
+        .backend()
+        .borrow_mut()
+        .reg_write(raxdbg_core::reg::RegId::TpidrEl0, head)
+        .expect("thread pointer");
+
+    assert_eq!(
+        emulator
+            .backend()
+            .borrow()
+            .reg_read(raxdbg_core::reg::RegId::TpidrEl0)
+            .expect("thread pointer"),
+        head,
+        "the head is where the thread pointer points"
+    );
     let (first, first_tid) = runtime
         .pthread_internal(&emulator, 11)
         .expect("first thread's internal");
@@ -651,17 +673,34 @@ fn each_thread_gets_its_own_pthread_internal() {
 
     let width = runtime.word_size();
     let memory = emulator.memory();
+    // The nodes are linked into the running thread's, each one going in right
+    // after the head, so the list reads head -> second -> first.
+    assert_eq!(
+        memory.pointer(head).read_pointer(0).expect("head's next"),
+        second,
+        "the head's next is the thread created last"
+    );
+    assert_eq!(
+        memory.pointer(second).read_pointer(0).expect("next"),
+        first,
+        "whose next is the one created before it"
+    );
+    assert_eq!(
+        memory.pointer(first).read_pointer(0).expect("next"),
+        0,
+        "and the first is the tail"
+    );
+    assert_eq!(
+        memory.pointer(second).read_pointer(width).expect("prev"),
+        head,
+        "the back pointers agree with the forward links"
+    );
+    assert_eq!(
+        memory.pointer(first).read_pointer(width).expect("prev"),
+        second,
+        "for both nodes"
+    );
     for (block, tid_at, want) in [(first, first_tid, 11u64), (second, second_tid, 12u64)] {
-        assert_eq!(
-            memory.pointer(block).read_pointer(0).expect("next"),
-            0,
-            "the thread list starts empty"
-        );
-        assert_eq!(
-            memory.pointer(block).read_pointer(width).expect("prev"),
-            0,
-            "and so does its back pointer"
-        );
         assert_eq!(
             memory.pointer(tid_at).read_u32(0).expect("tid"),
             want as u32,
@@ -673,4 +712,37 @@ fn each_thread_gets_its_own_pthread_internal() {
         second_tid - second,
         "both use the same layout, so the tid is the same distance in"
     );
+}
+
+/// `pthread_getattr_np` is what Dobby's size calculation asks, and it is where
+/// that calculation spins.
+///
+/// **Not passing yet**, and the next thing to do rather than a claim. Calling it
+/// directly faults reading the id it was handed as an address, so bionic's own
+/// thread bookkeeping is not laid out the way this port has it: the
+/// `pthread_internal_t` is `next`, `prev`, `tid` -- which is what unidbg models
+/// and what is built here -- but the thread-pointer block around it carries more
+/// than the three words, and `pthread_getattr_np` reads a node pointer and a
+/// `tid` out of *that*. Working out the real layout from the binary, rather than
+/// guessing at offsets, is the step that makes
+/// `the_fixture_can_drive_dobby_and_hookzz_itself` pass.
+#[test]
+#[ignore = "bionic's thread-pointer block layout is not yet modelled; see docs/known-gaps.md"]
+fn pthread_getattr_np_answers_for_the_running_thread() {
+    let emulator = emulator();
+    let libc = emulator
+        .load_library("libc.so")
+        .expect("libc.so loads");
+    let symbol = emulator
+        .loader()
+        .find_symbol(&libc, "pthread_getattr_np")
+        .expect("pthread_getattr_np");
+    let attr = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, raxdbg_core::backend::Prot::from_bits(0x3), 0x22, -1, 0)
+        .expect("attr");
+    let result = emulator
+        .call_function(symbol.address, &[1, attr])
+        .expect("pthread_getattr_np returned");
+    assert_eq!(result as i32, 0, "it reports success");
 }
