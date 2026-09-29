@@ -110,3 +110,195 @@ fn the_replaced_function_still_returns_to_its_own_caller() {
         "second_fn also adds its arguments"
     );
 }
+
+/// One mapped, executable page, named for the failure it is here to explain.
+fn page(emulator: &std::rc::Rc<AndroidEmulator>, what: &str) -> u64 {
+    emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, raxdbg_core::backend::Prot::from_bits(0x5), 0x22, -1, 0)
+        .unwrap_or_else(|error| panic!("{what} page: {error}"))
+}
+
+/// A function at `address` that returns `value` and then returns to its caller.
+fn returns(emulator: &std::rc::Rc<AndroidEmulator>, address: u64, value: u16) {
+    use raxdbg_core::memory::Memory;
+    // `mov x0, #value` is 0xd2800000 | (value << 5).
+    emulator
+        .memory()
+        .pointer(address)
+        .write_u32(0, 0xd280_0000 | (u32::from(value) << 5))
+        .expect("mov");
+    emulator
+        .memory()
+        .pointer(address + 4)
+        .write_u32(0, 0xd65f_03c0)
+        .expect("ret");
+}
+
+/// The three bundled hook engines load and their entry points resolve.
+///
+/// Port of unidbg: `Dobby`, `HookZz` and `xhook`, whose binaries ship under
+/// `android/lib/<abi>/`. They are the same idea -- patch a function's first
+/// instructions so calls land in a replacement -- and the difference between
+/// them is what they have to cope with in a real process, not the idea.
+#[test]
+fn the_bundled_hook_engines_load_and_resolve() {
+    let emulator = AndroidEmulatorBuilder::for_64bit()
+        .process_name("raxdbg-engines")
+        .sdk(23)
+        .seed(5)
+        .build()
+        .expect("emulator");
+
+    let dobby = raxdbg_android::hook::HookEngine::load(
+        &emulator,
+        raxdbg_android::hook::Engine::Dobby,
+    )
+    .expect("libdobby.so loads");
+    assert_eq!(dobby.engine(), raxdbg_android::hook::Engine::Dobby);
+    assert_ne!(dobby.entry(), 0, "DobbyHook resolved");
+    assert!(dobby.module().contains("dobby"), "{}", dobby.module());
+
+    let hookzz = raxdbg_android::hook::HookEngine::load(
+        &emulator,
+        raxdbg_android::hook::Engine::HookZz,
+    )
+    .expect("libhookzz.so loads");
+    assert_ne!(hookzz.entry(), 0, "ZzReplace resolved");
+    assert!(hookzz.module().contains("hookzz"), "{}", hookzz.module());
+
+    let xhook = raxdbg_android::hook::HookEngine::load(
+        &emulator,
+        raxdbg_android::hook::Engine::XHook,
+    )
+    .expect("libxhook.so loads");
+    assert_ne!(xhook.entry(), 0, "the JNI entry point resolved");
+    assert!(
+        xhook.engine().needs_vm(),
+        "xHook is driven through its Java side, so it needs a VM rather than a call"
+    );
+}
+
+/// The shared mechanism underneath the three engines: a branch written at a
+/// function's entry, with the instruction it displaced saved.
+#[test]
+fn an_inline_hook_redirects_a_call_and_can_be_removed() {
+    let emulator = AndroidEmulatorBuilder::for_64bit()
+        .process_name("raxdbg-inline")
+        .seed(5)
+        .build()
+        .expect("emulator");
+    emulator.load_library("libc.so").expect("libc.so");
+
+    // A function that returns 42, and a trampoline in the same page. The page
+    // has to be shared: the SVC page is gigabytes away, and a branch reaches
+    // 128 MiB at most, so the trampoline cannot live where every other stub
+    // does.
+    let target = page(&emulator, "target");
+    returns(&emulator, target, 42);
+    let trampoline = target + 0x100;
+    returns(&emulator, trampoline, 13);
+
+    assert_eq!(
+        emulator.call_function(target, &[]).expect("unhooked"),
+        42,
+        "before the hook the function returns its own value"
+    );
+
+    let hooks = std::rc::Rc::new(raxdbg_android::hook::InlineHooks::new());
+    {
+        use raxdbg_core::backend::Backend;
+        let mut backend = emulator.backend().borrow_mut();
+        raxdbg_android::hook::inline::install(
+            &mut *backend,
+            &hooks,
+            target,
+            trampoline,
+            true,
+        )
+        .expect("the hook installs");
+    }
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks.trampoline_for(target), Some(trampoline));
+    assert_eq!(
+        emulator.call_function(target, &[]).expect("hooked"),
+        13,
+        "the call now reaches the trampoline"
+    );
+
+    {
+        use raxdbg_core::backend::Backend;
+        let mut backend = emulator.backend().borrow_mut();
+        assert!(raxdbg_android::hook::inline::uninstall(
+            &mut *backend,
+            &hooks,
+            target
+        ));
+    }
+    assert!(hooks.is_empty());
+    assert_eq!(
+        emulator.call_function(target, &[]).expect("unhooked again"),
+        42,
+        "and the original is back"
+    );
+}
+
+/// A hook whose trampoline is out of range is refused, not written.
+#[test]
+fn an_out_of_range_trampoline_is_refused() {
+    let emulator = AndroidEmulatorBuilder::for_64bit()
+        .process_name("raxdbg-inline-range")
+        .build()
+        .expect("emulator");
+    emulator.load_library("libc.so").expect("libc.so");
+    let target = page(&emulator, "out-of-range target");
+    returns(&emulator, target, 42);
+    let hooks = std::rc::Rc::new(raxdbg_android::hook::InlineHooks::new());
+    {
+        use raxdbg_core::backend::Backend;
+        let mut backend = emulator.backend().borrow_mut();
+        let error = raxdbg_android::hook::inline::install(
+            &mut *backend,
+            &hooks,
+            target,
+            0xffff_0000,
+            true,
+        )
+        .expect_err("the SVC page is too far away to branch to");
+        assert!(
+            matches!(error, raxdbg_android::hook::inline::HookError::OutOfRange { .. }),
+            "{error}"
+        );
+    }
+    assert!(hooks.is_empty(), "nothing was patched");
+    // And the function still works, because nothing was written.
+    assert_eq!(emulator.call_function(target, &[]).expect("runs"), 42);
+}
+
+/// AArch32 cannot use the same mechanism: a Thumb `b` reaches 4 MiB, and the
+/// SVC page is gigabytes away.
+#[test]
+fn a_thumb_trampoline_is_refused_rather_than_written() {
+    let emulator = AndroidEmulatorBuilder::for_32bit()
+        .process_name("raxdbg-inline-thumb")
+        .build()
+        .expect("emulator");
+    let hooks = std::rc::Rc::new(raxdbg_android::hook::InlineHooks::new());
+    {
+        use raxdbg_core::backend::Backend;
+        let mut backend = emulator.backend().borrow_mut();
+        let error = raxdbg_android::hook::inline::install(
+            &mut *backend,
+            &hooks,
+            0x0010_0000,
+            0x0010_0100,
+            false,
+        )
+        .expect_err("AArch32 needs a near trampoline and a multi-instruction patch");
+        assert!(
+            matches!(error, raxdbg_android::hook::inline::HookError::OutOfRange { .. }),
+            "{error}"
+        );
+    }
+    assert!(hooks.is_empty());
+}

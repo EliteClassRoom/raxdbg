@@ -2,6 +2,10 @@
 //!
 //! Port of unidbg: `unidbg-api/src/main/java/com/github/unidbg/hook/`@7f5da98e.
 
+pub mod engine;
+pub mod inline;
 pub mod replace;
 
+pub use engine::{Engine, EngineError, HookEngine};
+pub use inline::{InlineHook, InlineHooks};
 pub use replace::{HookError, InvocationContext, ReplaceCallback, ReplaceHook};
