@@ -124,7 +124,6 @@ fn the_guest_reads_the_thread_pointer_through_cp15() {
 }
 
 #[test]
-#[ignore = "the fixture's init_array entry is called unrelocated; see docs/known-gaps.md"]
 fn the_arm32_fixture_loads_and_its_symbols_resolve() {
     let emulator = boot();
     load_fixture(&emulator, "libctest.so");
@@ -142,7 +141,7 @@ fn the_arm32_fixture_loads_and_its_symbols_resolve() {
 }
 
 #[test]
-#[ignore = "the fixture's init_array entry is called unrelocated; see docs/known-gaps.md"]
+#[ignore = "stdio's futex lock parks the caller and nothing wakes it on arm32; see docs/known-gaps.md"]
 fn the_arm32_fixture_runs_a_plain_function() {
     let emulator = boot();
     load_fixture(&emulator, "libctest.so");
@@ -150,10 +149,19 @@ fn the_arm32_fixture_runs_a_plain_function() {
         .loader()
         .find_symbol("libctest.so", "hello")
         .expect("hello");
-    assert_eq!(
-        emulator.call_function(hello.address, &[]).expect("hello"),
-        42
-    );
+    // `hello` is `void` and prints "hello 42" through bionic's stdio, which
+    // takes a lock -- so it parks on a futex and the call has to be the driven
+    // one, which runs whatever the guest is waiting for.
+    match emulator.call_function_driven(hello.address, &[]) {
+        Ok(_) => {
+            let printed = emulator.stdout().contents();
+            assert!(
+                printed.contains("hello 42"),
+                "printf reached stdout on armeabi-v7a: {printed}"
+            );
+        }
+        Err(error) => panic!("hello: {error}"),
+    }
 }
 
 #[test]

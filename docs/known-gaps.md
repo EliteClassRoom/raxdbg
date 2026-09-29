@@ -421,6 +421,27 @@ whether the `R_ARM_RELATIVE`/`R_ARM_ABS32` that should rewrite it is applied
 before `module_init_functions` is consulted. Two `#[ignore]`d tests in
 `tests/arm32_parity.rs` cover it.
 
+**arm32 is now the parity story: the fixture loads and its symbols resolve.**
+That was the last of the init_array problem -- the packed relocations fixed it,
+and the arm32 parity suite is at 8 passing, 1 ignored:
+
+* the loader takes the AArch32 branch, tested in both directions
+* the arm32 libc loads with every relocation resolved, and `malloc`/`free`
+  round-trip through it
+* the thread pointer is set, aligned, and the guest's own `mrc p15, 0, r0, c13,
+  c0, 3` reads it back
+* a `svc` reaches the handler through `r7`
+* `__ARM_NR_set_tls` and `__ARM_NR_cacheflush` answer, and `set_tls` really moves
+  the thread pointer
+* `libctest.so` loads on `armeabi-v7a` and its symbols resolve
+
+What is left is one line of guest code: `hello()` on arm32 ends with
+`ThreadSwitch`. It is `void` and prints through bionic's stdio, which takes a
+lock, so the call parks on a futex and nothing wakes it. The arm64 path does
+exactly the same and works, so the difference is in the arm32 futex handling
+rather than in the mechanism. `the_arm32_fixture_runs_a_plain_function` is
+`#[ignore]`d with that reason.
+
 **The initialiser still faults at `0x90` after that fix**, at the same PC, so
 there is at least one more link. The next thing to check is the guest's own
 `open` again now that the chain answers: if it still returns -1, the failure is

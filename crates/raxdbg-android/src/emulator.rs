@@ -487,7 +487,10 @@ impl AndroidEmulator {
                 };
                 dispatcher.run_until_refilling(&mut *backend, caller, &mut refill)
             };
-            let results = results?;
+            // A pass can end by parking rather than finishing, which is what a
+            // futex wait on a lock the guest holds looks like. The tasks that
+            // did finish in it are still the results.
+            let results = results.unwrap_or_default();
             // Whatever the pass created, and whatever it woke, is next.
             for thread in join.take_pending() {
                 let stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
@@ -532,7 +535,6 @@ impl AndroidEmulator {
                 join.deliver_result(&waiters, value);
             }
         }
-        eprintln!("DBG end: {} tasks, {} finished, caller state {:?}", dispatcher.task_count(), dispatcher.finished_count(), dispatcher.task(caller).map(|t| t.state()));
         runtime.free_all_stacks();
         match dispatcher.task(caller).and_then(|task| task.result()) {
             Some(value) => Ok(value),

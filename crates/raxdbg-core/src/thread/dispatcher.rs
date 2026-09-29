@@ -337,6 +337,11 @@ impl ThreadDispatcher {
             // returning, but the threads that *did* finish in it are the answer
             // the caller is waiting for, so the results are read back off the
             // tasks rather than off the return value.
+            // A pass can end by parking -- a join, or a futex wait on a lock the
+            // guest is holding. That is progress, not failure, and the tasks
+            // that finished in it are still the results. So the error is not
+            // propagated here; the caller decides, by whether the task it was
+            // waiting for finished.
             match self.run(backend) {
                 Ok(results) => finished.extend(results),
                 Err(_) => {
@@ -359,6 +364,11 @@ impl ThreadDispatcher {
             let _ = before;
         }
         Ok(finished)
+    }
+
+    /// How many tasks are on the ready queue.
+    pub fn ready_len(&self) -> usize {
+        self.ready.len()
     }
 
     /// How many tasks have finished.
