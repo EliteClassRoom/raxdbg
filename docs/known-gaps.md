@@ -209,6 +209,32 @@ fixture loading with every relocation resolved, `hello()` printing through
 bionic's stdio, and `thread_value()` returning 7 through a real
 `pthread_create`/`pthread_join`.
 
+## P8: the engines are reachable; their own patching loop is not finished
+
+Both halves of "a guest can inline-hook with Dobby" are now in place except the
+last:
+
+* **Reachable.** `resolve_library` falls back to the engine tree, so a guest
+  `dlopen("libdobby.so")` finds it -- which is what the resolver change bought,
+  and what the fixture's own `dobby_run`/`zz_run` depend on.
+  `every_engine_is_reachable_through_the_resolver` drives exactly that path.
+* **Usable from the host.** `HookEngine::load` maps the binary and resolves
+  `DobbyHook`, `ZzReplace` and xHook's JNI entry, and `hook::inline` is the
+  mechanism they all implement, with a test that redirects a call and removes
+  the patch again.
+* **Not finished: the engine's own patching loop.** Calling the fixture's
+  `dobby_run` reaches `DobbyHook` and then does not terminate. Dobby patches by
+  disassembling forward to find where it can put a branch, and in an emulator it
+  walks its own disassembly of code it cannot see is real hardware. That is the
+  one part of these three libraries that wants the platform rather than a guest,
+  and `hook::inline` is the emulator-side answer: a branch at the entry with the
+  trampoline placed next to the target, because the SVC page is 3.9 GB away and
+  a branch reaches 128 MiB.
+
+`the_fixture_can_drive_dobby_and_hookzz_itself` is `#[ignore]`d with that
+reason rather than deleted -- it is the statement of what is left, and it is
+worth chasing because it is what the engines exist for.
+
 ## P6: one item is thinner than its name
 
 The plan's "VarArg/VaList" item is only half done. Arguments reach a native

@@ -368,3 +368,47 @@ fn hello_from_the_ctest_fixture_prints_through_bionic() {
     let printed = emulator.stdout().contents();
     assert!(printed.contains("hello 42"), "{printed}");
 }
+
+/// Loads `libhooktest.so`, the fixture whose whole purpose is hooking.
+fn load_fixture(emulator: &Rc<AndroidEmulator>, name: &str) {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root")
+        .join("fixtures/prebuilt/arm64-v8a")
+        .join(name);
+    let file = ElfLibraryFile::open(&path).expect("open fixture");
+    emulator.load(Box::new(file), false).expect("load fixture");
+}
+
+/// The fixture's own engine drivers, `dobby_run()` and `zz_run()`.
+///
+/// **Not run yet.** Both `dlopen` their engine and call its entry point
+/// successfully -- `every_engine_is_reachable_through_the_resolver` proves that
+/// half -- but the engines then patch the target themselves, and Dobby's patching
+/// loop does not terminate here. It is worth chasing: the test is the statement
+/// that a guest can do its own inline hooking, which is what the three engines
+/// are for. See `docs/known-gaps.md`.
+#[test]
+#[ignore = "the engine's own patching loop does not terminate; see docs/known-gaps.md"]
+fn the_fixture_can_drive_dobby_and_hookzz_itself() {
+    let emulator = AndroidEmulatorBuilder::for_64bit()
+        .process_name("raxdbg-engines-guest")
+        .sdk(23)
+        .seed(5)
+        .build()
+        .expect("emulator");
+    load_fixture(&emulator, "libhooktest.so");
+
+    for (driver, what) in [("dobby_run", "DobbyHook"), ("zz_run", "ZzReplace")] {
+        let address = symbol(&emulator, driver);
+        let result = emulator.call_function(address, &[]).expect("engine call") as i64;
+        // The fixture returns a negative sentinel when the engine or its entry
+        // point is missing; anything else means the guest got as far as calling
+        // it. A positive value is the hooked function's result.
+        assert!(
+            result >= -2,
+            "{driver} reached {what} and ran: {result}"
+        );
+    }
+}
