@@ -302,3 +302,39 @@ fn a_thumb_trampoline_is_refused_rather_than_written() {
     }
     assert!(hooks.is_empty());
 }
+
+/// The fixture drives the engines itself: it `dlopen`s each one, resolves the
+/// entry point with `dlsym`, and calls it. So an engine only has to be findable
+/// by the resolver for the guest to reach it, and this is the test that says so.
+///
+/// It is also the honest boundary of the port: Dobby's `DobbyHook` needs to
+/// disassemble and patch the target itself, which is the part a real Android
+/// process needs and an emulator lays out for itself. The resolver half --
+/// finding the binary and its symbol -- is what this port provides.
+#[test]
+fn every_engine_is_reachable_through_the_resolver() {
+    let emulator = AndroidEmulatorBuilder::for_64bit()
+        .process_name("raxdbg-engines-resolver")
+        .sdk(23)
+        .seed(5)
+        .build()
+        .expect("emulator");
+
+    for (library, symbol) in [
+        ("libdobby.so", "DobbyHook"),
+        ("libhookzz.so", "ZzReplace"),
+        ("libxhook.so", "Java_com_qiyi_xhook_NativeHandler_refresh"),
+    ] {
+        // The resolver is what a guest `dlopen` goes through, so loading the
+        // engine this way is the same path the fixture takes.
+        let module = emulator
+            .loader()
+            .dlopen(library, false)
+            .unwrap_or_else(|| panic!("dlopen({library}): the engine is not bundled"));
+        let entry = emulator
+            .loader()
+            .dlsym(0, symbol)
+            .unwrap_or_else(|| panic!("dlsym({symbol}) in {module}"));
+        assert_ne!(entry.address, 0, "{symbol} resolved in {module}");
+    }
+}

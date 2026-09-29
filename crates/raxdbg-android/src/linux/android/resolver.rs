@@ -182,12 +182,18 @@ impl LibraryResolver for AndroidResolver {
 
         let path = self.library_resource(name);
         if path.is_file() {
-            ElfLibraryFile::open(path)
+            return ElfLibraryFile::open(path)
                 .ok()
-                .map(|file| Box::new(file) as Box<dyn LibraryFile>)
-        } else {
-            None
+                .map(|file| Box::new(file) as Box<dyn LibraryFile>);
         }
+
+        // The hook engines live outside the SDK tree: unidbg keeps them under
+        // `android/lib/<abi>/` rather than `android/sdk<N>/lib*/`, because they
+        // are not part of any platform release. Without this a guest
+        // `dlopen("libdobby.so")` -- which is exactly what an application doing
+        // inline hooking does -- finds nothing.
+        self.hook_library(name)
+            .map(|file| Box::new(file) as Box<dyn LibraryFile>)
     }
 }
 
