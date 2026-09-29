@@ -157,3 +157,52 @@ fn a_jni_signature_reports_the_missing_runtime() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("dvm runtime"), "{stderr}");
 }
+
+#[test]
+fn syscalls_prints_a_summary_and_a_report() {
+    let output = raxdbg(&["syscalls", fixture("libctest.so").to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    // The default is the report alone: a summary is what makes the command
+    // usable on a library that makes thousands of calls.
+    assert!(stdout.contains("-- protection --"), "{stdout}");
+    assert!(stdout.contains("syscalls inspected"), "{stdout}");
+    assert!(
+        !stdout.contains("-- syscalls --"),
+        "the default must not print per-syscall lines, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn syscalls_v_prints_the_calls_that_carry_a_path() {
+    let output = raxdbg(&["syscalls", fixture("libctest.so").to_str().unwrap(), "-v"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("-- syscalls --"), "{stdout}");
+    assert!(stdout.contains("openat"), "a path-carrying call is shown:\n{stdout}");
+}
+
+#[test]
+fn syscalls_vv_prints_every_call() {
+    let output = raxdbg(&["syscalls", fixture("libctest.so").to_str().unwrap(), "-vv"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    // `brk` carries neither a path nor a buffer, so only the full trace
+    // shows it: that is the difference `-vv` makes.
+    assert!(stdout.contains("brk@"), "the full trace shows every call:\n{stdout}");
+}
+
+#[test]
+fn syscalls_runs_jni_on_load_when_asked() {
+    let output = raxdbg(&[
+        "syscalls",
+        fixture("libjnitest.so").to_str().unwrap(),
+        "--jni-on-load",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        stdout.contains("JNI_OnLoad") && stdout.contains("0x10006"),
+        "JNI_OnLoad must run and report the version it returned:\n{stdout}"
+    );
+}

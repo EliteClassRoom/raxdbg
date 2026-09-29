@@ -20,12 +20,16 @@ pub mod android;
 pub mod arm32;
 pub mod arm64;
 pub mod handler;
+pub mod trace;
 
 pub use android::{
     install_standard_descriptors, AndroidSyscallError, AndroidSyscallHandler,
     RefCellAndroidSyscallHandler, SyscallHook,
 };
 pub use arm64::{Arm64SyscallTable, Arm64ThreadState};
+pub use trace::{
+    Abi, Finding, ProtectionReport, Severity, SyscallEvent, SyscallTrace, Verbosity,
+};
 pub use handler::{
     SharedSink, SyscallError, UnixSyscallHandler, AT_FDCWD, CLOCK_BOOTTIME,
     CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,

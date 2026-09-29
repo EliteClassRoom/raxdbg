@@ -21,6 +21,23 @@ $ cargo run -p raxdbg-cli -- run fixtures/prebuilt/arm64-v8a/libctest.so --call 
 hello 42
 ```
 
+To see what a library asks the kernel for, and check its protection
+wrapper, use the `syscalls` command — every syscall with its arguments and
+return value, then a report of the anti-debug checks it made:
+
+```console
+$ cargo run -p raxdbg-cli -- syscalls fixtures/prebuilt/arm64-v8a/libctest.so -v
+-- syscalls --
+#6     pid=1          openat@0x1236a6a4 in libc.so(0xffffff9c, "/proc/stat", 0x80000, ...) = 3
+-- protection --
+18 syscalls inspected, 2 finding(s)
+```
+
+[`docs/syscalls-and-protection.md`](docs/syscalls-and-protection.md) is a
+worked guide, based on a real packed library, covering reading a trace,
+the protection report, driving `JNI_OnLoad`, and what a DEX packer needs
+before it can be emulated.
+
 The bundled Android libraries live in `libs/`, populated from the
 `reference/unidbg` submodule:
 
@@ -91,6 +108,7 @@ The suites are organised by what they prove rather than by module:
 | `raxdbg-android/tests/elf_loader.rs` | Synthetic ELF objects (every relocation type, `DT_INIT_ARRAY`, `DT_NEEDED`) and the real bionic `libc.so`/`libm.so`. |
 | `raxdbg-android/tests/libc_boot.rs` | The bionic boot milestone. |
 | `raxdbg-android/tests/syscalls.rs` | SVC dispatch, the syscall table, the fd table, captured stdout. |
+| `raxdbg-android/tests/syscall_trace.rs` | The syscall tracer: that a trace installed before the load sees the load, that it does not change what the guest sees, and the protection report. |
 | `raxdbg-android/tests/virtual_modules.rs` | The virtual modules, the system property hook, the `libdl` trampolines. |
 
 Fixtures are committed, so no cross toolchain is needed to run the tests. To

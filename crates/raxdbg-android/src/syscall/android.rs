@@ -32,6 +32,7 @@ use raxdbg_core::svc::{
 
 use super::arm64::Arm64ThreadState;
 use super::handler::{SharedSink, SyscallError, UnixSyscallHandler};
+use super::trace::{Abi, SyscallTrace, BUFFER_IN, BUFFER_OUT, PATH_ARGS};
 use crate::elf::AndroidElfLoader;
 
 /// The PRE-callback `swi` marker used by arm64 stubs.
@@ -129,6 +130,12 @@ pub struct AndroidSyscallHandler {
     /// that return `-errno` without writing errno (e.g. anonymous mmap
     /// failing) can still report a consistent number.
     last_errno: Cell<i32>,
+    /// The trace recording every syscall, when one is installed.
+    ///
+    /// A `None` slot is the normal case: the dispatch does one `is_some`
+    /// check per syscall and nothing else. A trace is observation only --
+    /// it never changes what the guest sees.
+    trace: Option<Rc<RefCell<SyscallTrace>>>,
 }
 
 impl std::fmt::Debug for AndroidSyscallHandler {
@@ -179,6 +186,7 @@ impl AndroidSyscallHandler {
             is_64bit,
             stdout_sink: sink,
             last_errno: Cell::new(0),
+            trace: None,
         }));
         Ok(syscall_handler)
     }
@@ -206,6 +214,39 @@ impl AndroidSyscallHandler {
     /// The arm64 thread state.
     pub fn thread_state(&self) -> &Arm64ThreadState {
         &self.state
+    }
+
+    /// Starts recording every syscall, returning a handle to the trace.
+    ///
+    /// Install this **before** the run that is to be traced: the library's
+    /// own initialisers are ordinary guest code and make syscalls of their
+    /// own, so tracing has to be on before the load to see them. The
+    /// returned handle is the same recording the dispatch writes into, so
+    /// read it after the run.
+    ///
+    /// Port of unidbg: nothing — unidbg has no syscall trace. This is the
+    /// observation the analysis in [`super::trace`] is built on.
+    pub fn set_trace(&mut self) -> Rc<RefCell<SyscallTrace>> {
+        let abi = if self.is_64bit {
+            Abi::Arm64
+        } else {
+            Abi::Arm32
+        };
+        // Replacing rather than appending: a second `set_trace` starts a
+        // new record, so two runs never merge into one unreadable trace.
+        let trace = Rc::new(RefCell::new(SyscallTrace::new(abi, PATH_ARGS, BUFFER_IN, BUFFER_OUT)));
+        self.trace = Some(Rc::clone(&trace));
+        trace
+    }
+
+    /// The installed trace, if there is one.
+    pub fn trace(&self) -> Option<Rc<RefCell<SyscallTrace>>> {
+        self.trace.clone()
+    }
+
+    /// Takes the installed trace, leaving the handler untraced.
+    pub fn take_trace(&mut self) -> Option<Rc<RefCell<SyscallTrace>>> {
+        self.trace.take()
     }
 
     /// Registers an SVC stub, allocating both the encoding in the SVC
@@ -427,6 +468,9 @@ impl AndroidSyscallHandler {
                 }
             }
         };
+        // Record the call before the table runs, so the arguments are the
+        // ones the guest passed and not what a handler rewrote them to.
+        let slot = self.trace_enter(backend, nr, args);
         let handler = self.handler.borrow();
         let result = super::arm64::dispatch(&handler, &self.state, nr, args);
         // A syscall that parked the thread (or woke another one) asks for a
@@ -440,10 +484,43 @@ impl AndroidSyscallHandler {
             RegId::R(0)
         };
         backend.reg_write(target, result as u64)?;
+        // Everything the trace needs, read before `handler` is dropped: the
+        // dispatch holds that borrow across the table call, and re-borrowing
+        // inside this scope would alias.
+        let errno = self.last_errno.get();
+        let memory = handler.memory().clone();
+        drop(handler);
+        if let (Some(trace), Some(slot)) = (self.trace.clone(), slot) {
+            trace
+                .borrow_mut()
+                .on_exit(slot, result, errno, &*memory);
+        }
         if switch {
             return Err(RunError::ThreadSwitch);
         }
         Ok(())
+    }
+
+    /// Records a syscall's entry state, returning the slot it went to.
+    ///
+    /// Returns `None` when no trace is installed -- a run without a trace
+    /// pays one branch per syscall and no more. The slot is a real index,
+    /// so `Some(0)` is the first syscall and must stay distinct from
+    /// "not tracing".
+    fn trace_enter(&mut self, backend: &dyn Backend, nr: i32, args: [u64; 8]) -> Option<u64> {
+        let trace = self.trace.clone()?;
+        // A register the ISA does not have is an error, not a reason to
+        // lose the trace: fall back to zero rather than propagate.
+        let read = |reg: RegId| backend.reg_read(reg).unwrap_or(0);
+        let handler = self.handler.borrow();
+        let call = super::trace::CallSite {
+            pc: read(RegId::Pc),
+            lr: read(RegId::Lr),
+            pid: self.state.pid(),
+            handler: &handler,
+            memory: &**handler.memory(),
+        };
+        Some(trace.borrow_mut().on_enter(nr, args, &call))
     }
 }
 

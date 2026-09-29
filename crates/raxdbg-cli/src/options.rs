@@ -29,6 +29,11 @@ pub enum Command {
         /// The library to load.
         library: String,
     },
+    /// `syscalls <lib.so>`
+    Syscalls {
+        /// The library to load.
+        library: String,
+    },
 }
 
 /// Which trace `trace` runs.
@@ -80,6 +85,24 @@ pub struct Options {
     pub trace_reads: bool,
     /// `--write`.
     pub trace_writes: bool,
+    /// `--syscall-detail <n>`: how much of a syscall trace to print.
+    pub syscall_detail: SyscallDetail,
+    /// `--jni-on-load`: run the library's `JNI_OnLoad` before the `--call`.
+    pub jni_on_load: bool,
+}
+
+/// How much of a syscall trace to print.
+///
+/// Ordered so `-v -v` accumulates, which is what the flag reads like.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SyscallDetail {
+    /// Only the summary and the protection report.
+    #[default]
+    Summary,
+    /// The syscalls that carry a path or a captured buffer.
+    Interesting,
+    /// Every syscall.
+    Full,
 }
 
 impl Options {
@@ -112,7 +135,7 @@ impl Options {
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let mut args = args.iter();
         let verb = match args.next().map(String::as_str) {
-            Some(verb @ ("run" | "info" | "trace" | "debug")) => verb.to_string(),
+            Some(verb @ ("run" | "info" | "trace" | "debug" | "syscalls")) => verb.to_string(),
             Some(other) => return Err(format!("unknown command `{other}`")),
             None => return Err("a command is required".into()),
         };
@@ -128,6 +151,9 @@ impl Options {
                     library: library.clone(),
                 },
                 "trace" => Command::Trace {
+                    library: library.clone(),
+                },
+                "syscalls" => Command::Syscalls {
                     library: library.clone(),
                 },
                 _ => Command::Debug {
@@ -147,6 +173,8 @@ impl Options {
             trace_code: false,
             trace_reads: false,
             trace_writes: false,
+            syscall_detail: SyscallDetail::default(),
+            jni_on_load: false,
         };
 
         while let Some(argument) = args.next() {
@@ -179,6 +207,13 @@ impl Options {
                 "--code" => options.trace_code = true,
                 "--read" => options.trace_reads = true,
                 "--write" => options.trace_writes = true,
+                // Each flag turns one more level on, so `-vv` is cumulative
+                // the way it reads at the command line.
+                "-v" | "--syscalls" => {
+                    options.syscall_detail = options.syscall_detail.max(SyscallDetail::Interesting)
+                }
+                "-vv" | "--syscalls=all" => options.syscall_detail = SyscallDetail::Full,
+                "--jni-on-load" => options.jni_on_load = true,
                 "--call" => {
                     let signature = next_value(&mut args, "--call")?;
                     let name = signature
@@ -212,7 +247,7 @@ fn next_value(args: &mut std::slice::Iter<'_, String>, option: &str) -> Result<S
 }
 
 /// A decimal or `0x`-prefixed argument.
-fn parse_number(text: &str) -> Result<u64, String> {
+pub fn parse_number(text: &str) -> Result<u64, String> {
     if let Some(hex) = text.strip_prefix("0x") {
         u64::from_str_radix(hex, 16).map_err(|_| format!("`{text}` is not a number"))
     } else {

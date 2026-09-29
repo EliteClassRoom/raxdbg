@@ -87,13 +87,20 @@ pub enum JniFunc {
     ReleaseIntArrayElements = 195,
     /// `RegisterNatives` — slot 215.
     RegisterNatives = 215,
+    /// `GetJavaVM` — slot 219.
+    ///
+    /// Port of unidbg: `DalvikVM`'s `_GetJavaVM@0x36c`@7f5da98e, which
+    /// writes the `JavaVM` handle through the caller's out-pointer and
+    /// answers `JNI_OK`. A protection reads this to get a second handle on
+    /// the VM and can then attach further threads through it.
+    GetJavaVM = 219,
     /// `ExceptionCheck` — slot 228.
     ExceptionCheck = 228,
 }
 
 impl JniFunc {
     /// Every implemented function, in slot order.
-    pub const ALL: [JniFunc; 18] = [
+    pub const ALL: [JniFunc; 19] = [
         JniFunc::GetVersion,
         JniFunc::FindClass,
         JniFunc::ThrowNew,
@@ -111,6 +118,7 @@ impl JniFunc {
         JniFunc::GetIntArrayElements,
         JniFunc::ReleaseIntArrayElements,
         JniFunc::RegisterNatives,
+        JniFunc::GetJavaVM,
         JniFunc::ExceptionCheck,
     ];
 
@@ -139,6 +147,7 @@ impl JniFunc {
             JniFunc::GetIntArrayElements => "GetIntArrayElements",
             JniFunc::ReleaseIntArrayElements => "ReleaseIntArrayElements",
             JniFunc::RegisterNatives => "RegisterNatives",
+            JniFunc::GetJavaVM => "GetJavaVM",
             JniFunc::ExceptionCheck => "ExceptionCheck",
         }
     }
@@ -265,6 +274,9 @@ pub struct Vm {
     jni_version: i32,
     /// Whether `JNI_OnLoad` has run.
     on_load_ran: Cell<bool>,
+    /// The `JNIEnv` slots the guest called that this port does not
+    /// implement, in the order it first called them.
+    unimplemented: RefCell<Vec<usize>>,
 }
 
 impl std::fmt::Debug for Vm {
@@ -306,6 +318,7 @@ impl Vm {
             java_vm: Cell::new(0),
             jni_version: JNI_VERSION_1_6,
             on_load_ran: Cell::new(false),
+            unimplemented: RefCell::new(Vec::new()),
         }));
         Vm::build_tables(&vm)?;
         Ok(vm)
@@ -339,6 +352,24 @@ impl Vm {
     /// The `JavaVM` pointer `JNI_OnLoad` receives.
     pub fn java_vm(&self) -> u64 {
         self.java_vm.get()
+    }
+
+    /// The `JNIEnv` slots the guest called that this port does not
+    /// implement, in first-call order.
+    ///
+    /// A library that needs one of these keeps running and returns 0 for
+    /// the call, so the list is the honest answer to "what is missing
+    /// before this library runs correctly".
+    pub fn unimplemented(&self) -> Vec<usize> {
+        self.unimplemented.borrow().clone()
+    }
+
+    /// Notes that the guest called the unimplemented JNI function at `slot`.
+    fn record_unimplemented(&self, slot: usize) {
+        let mut recorded = self.unimplemented.borrow_mut();
+        if !recorded.contains(&slot) {
+            recorded.push(slot);
+        }
     }
 
     /// Whether the guest is 64-bit.
@@ -641,6 +672,28 @@ impl Vm {
                 .svc
                 .register_svc_numbered(vm.memory.as_ref(), Box::new(stub))?;
             vm.write_pointer(env_table, function.slot(), address)?;
+        }
+
+        // Every slot the table does not implement gets a stub of its own. The
+        // placeholder `index * 8` the loop above writes is an *unmapped*
+        // address that a guest may well branch to, so a call that reaches an
+        // unimplemented function faults on the jump rather than on the work;
+        // the stub records the slot and answers 0 instead, which turns "this
+        // library needs a JNI function this port lacks" into a report rather
+        // than a crash.
+        for index in 0..=JNI_TABLE_LAST {
+            if JniFunc::ALL.iter().any(|function| function.slot() == index) {
+                continue;
+            }
+            let stub = UnimplementedJniFunction {
+                vm: this_weak.clone(),
+                slot: index,
+                is_64bit: vm.is_64bit,
+            };
+            let (address, _number) = vm
+                .svc
+                .register_svc_numbered(vm.memory.as_ref(), Box::new(stub))?;
+            vm.write_pointer(env_table, index, address)?;
         }
 
         // `JavaVM`'s `GetEnv` is slot 6; `AttachCurrentThread` (slot 4) answers
@@ -1030,6 +1083,15 @@ fn dispatch(
             Ok(0)
         }
         JniFunc::ExceptionCheck => Ok(i64::from(vm.has_exception())),
+        JniFunc::GetJavaVM => {
+            // `(*env)->GetJavaVM(env, &vm)`: x1 is the caller's out-pointer.
+            let out = arg(backend, is_64bit, 1);
+            if out != 0 {
+                write_word(backend, is_64bit, out, vm.java_vm(), pointer_size)
+                    .map_err(RunError::Backend)?;
+            }
+            Ok(i64::from(JNI_OK))
+        }
         JniFunc::ThrowNew => {
             let class_hash = arg(backend, is_64bit, 0) as i32;
             let message_ptr = arg(backend, is_64bit, 1);
@@ -1057,6 +1119,41 @@ fn dispatch(
             vm.delete_local_ref(hash);
             Ok(0)
         }
+    }
+}
+
+/// The `JNIEnv` slot every function this port does not implement points at.
+///
+/// A real `JNIEnv` is a 234-entry table and most libraries touch a handful
+/// of entries. Answering an unimplemented call with a logged 0 is what
+/// unidbg does for a function it has not ported, and it turns a hard fault
+/// at an unmapped slot address into a line in
+/// [`Vm::unimplemented`], which is the list of JNI functions a library
+/// needs before it can be emulated.
+struct UnimplementedJniFunction {
+    vm: std::rc::Weak<RefCell<Vm>>,
+    slot: usize,
+    is_64bit: bool,
+}
+
+impl Svc for UnimplementedJniFunction {
+    fn handle(&mut self, _backend: &mut dyn Backend) -> Result<i64, RunError> {
+        if let Some(vm) = self.vm.upgrade() {
+            vm.borrow_mut().record_unimplemented(self.slot);
+        }
+        Ok(0)
+    }
+
+    fn kind(&self) -> SvcKind {
+        if self.is_64bit {
+            SvcKind::Arm64
+        } else {
+            SvcKind::Arm
+        }
+    }
+
+    fn name(&self) -> &str {
+        "UnimplementedJni"
     }
 }
 
