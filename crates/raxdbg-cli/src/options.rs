@@ -88,10 +88,15 @@ impl Options {
         self.abi != "arm32"
     }
 
-    /// The SDK level, defaulted per ABI as `AndroidEmulatorBuilder` does.
+    /// The SDK level, defaulting to 23 for both ABIs.
+    ///
+    /// `AndroidEmulatorBuilder::for_32bit` also defaults to 23, and so does
+    /// this: the SDK 19 arm64 and arm32 trees are bundled, but 19's arm32 libc
+    /// faults in `__system_property_area_init` because it dereferences a null
+    /// `prop_area` when the properties file is not mapped. `--sdk 19` still
+    /// selects it explicitly; the default is the one that boots.
     pub fn sdk(&self) -> u32 {
-        self.sdk
-            .unwrap_or(if self.is_64bit() { 23 } else { 19 })
+        self.sdk.unwrap_or(23)
     }
 
     /// Which trace to run.
@@ -233,10 +238,17 @@ mod tests {
     }
 
     #[test]
-    fn arm32_defaults_to_the_sdk19_libraries() {
-        let options = parse(&["run", "lib.so", "--abi", "arm32"]).unwrap();
-        assert!(!options.is_64bit());
-        assert_eq!(options.sdk(), 19);
+    fn both_abis_default_to_the_sdk23_libraries() {
+        // SDK 19's arm32 libc faults in `__system_property_area_init`, so a
+        // 32-bit guest that defaulted to it could not load anything. `--sdk 19`
+        // still selects it explicitly.
+        let arm32 = parse(&["run", "lib.so", "--abi", "arm32"]).unwrap();
+        assert!(!arm32.is_64bit());
+        assert_eq!(arm32.sdk(), 23);
+        let arm64 = parse(&["run", "lib.so"]).unwrap();
+        assert_eq!(arm64.sdk(), 23);
+        let explicit = parse(&["run", "lib.so", "--sdk", "19"]).unwrap();
+        assert_eq!(explicit.sdk(), 19);
     }
 
     #[test]

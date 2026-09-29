@@ -60,7 +60,7 @@ commands:
 
 options:
   --abi arm64|arm32     guest ABI (default: arm64)
-  --sdk <level>         bundled bionic SDK level (default: 23 for arm64, 19 for arm32)
+  --sdk <level>         bundled bionic SDK level (default: 23)
   --libs-dir <dir>      the `libs/` tree (default: $RAXDBG_LIBS_DIR or the workspace)
   --root <dir>          the directory guest paths resolve under
   --call <name(args)>   the function to call, then its arguments

@@ -152,13 +152,17 @@ Both suites are green again, and the packed relocations stay in place: libc++'s
 data is relocated correctly, which is what made the gap visible in the first
 place.
 
-## P9: the arm32 CLI still needs SDK 23
+## P9: the arm32 CLI is fixed; SDK 19 arm32 is still broken
 
-`cargo run -p raxdbg-cli -- run <lib.so> --abi arm32` resolves libc.so from the
-SDK 19 tree, whose initialiser faults on a null `prop_area` read. The test suite
-passes `.sdk(23)`, and the builder's default is 23, but the CLI does not set it
-for a 32-bit guest, so it inherits whatever the resolver defaults to. One line:
-`--abi arm32` should imply SDK 23 the way the builder does.
+`--abi arm32` now defaults to SDK 23 like the builder does, so
+
+```
+cargo run -p raxdbg-cli -- run fixtures/prebuilt/armeabi-v7a/libctest.so --abi arm32 --call "hello()V"
+```
+
+prints `hello 42`. SDK 19's arm32 libc still faults in
+`__system_property_area_init` on a null `prop_area` read, so `--sdk 19` with a
+32-bit guest does not work. The tree is bundled and arm64's SDK 19 is fine.
 
 ## P6: one item is thinner than its name
 
