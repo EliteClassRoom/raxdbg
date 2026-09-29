@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use raxdbg_core::backend::{Backend, RunError};
-use raxdbg_core::memory::MemoryError;
+use raxdbg_core::memory::{Memory, MemoryError};
 use raxdbg_core::memory::loader::Loader;
 use raxdbg_core::svc::{Svc, SvcKind, SvcMemory};
 use raxdbg_core::thread::ThreadDispatcher;
@@ -141,6 +141,32 @@ impl ThreadRuntime {
     /// The futex registry the dispatcher and the syscall handler share.
     pub fn waiters(&self) -> &Rc<raxdbg_core::thread::Waiters> {
         &self.waiters
+    }
+
+    /// A thread's `pthread_internal_t`, on the thread's own stack.
+    ///
+    /// Port of unidbg: `AndroidElfLoader.initializeTLS` builds one for the main
+    /// thread (`allocateStack(0x400)`, `next` and `prev` null, `tid` the pid).
+    /// A created thread needs the same thing, or bionic's own bookkeeping --
+    /// `__gettid`, the TLS destructor list, `pthread_getattr_np` -- has nothing
+    /// to read. The struct is three words: `next`, `prev` and `tid`.
+    pub fn pthread_internal(
+        &self,
+        emulator: &Rc<AndroidEmulator>,
+        tid: u64,
+    ) -> Result<(u64, u64), MemoryError> {
+        let memory = emulator.memory();
+        let word = self.word_size();
+        let block = memory.allocate_stack(0x400)?.peer();
+        // `next`, `prev`, `tid`: the list is empty, so the first two are null
+        // and only the id is set.
+        let pointer = memory.pointer(block);
+        pointer.write_pointer(0, 0)?;
+        pointer.write_pointer(word, 0)?;
+        memory
+            .pointer(block + word * 2)
+            .write_u32(0, tid as u32)?;
+        Ok((block, block + word * 2))
     }
 
     /// A stack for a new task, from the loader's thread-stack area.

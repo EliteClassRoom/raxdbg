@@ -628,3 +628,49 @@ fn a_join_parks_the_caller_and_the_result_arrives_when_the_thread_finishes() {
     let target = join.join_target(waiter).expect("the joiner has a slot");
     assert_eq!(target, retval);
 }
+
+/// Every thread gets its own `pthread_internal_t`.
+///
+/// Port of unidbg: `AndroidElfLoader.initializeTLS` builds one for the main
+/// thread -- `allocateStack(0x400)`, `next` and `prev` null, `tid` the pid --
+/// and a created thread needs the same, or bionic's per-thread bookkeeping
+/// (`__gettid`, the TLS destructor list, `pthread_getattr_np`) reads a null
+/// pointer.
+#[test]
+fn each_thread_gets_its_own_pthread_internal() {
+    let emulator = emulator();
+    let runtime = ThreadRuntime::install(&emulator).expect("runtime");
+
+    let (first, first_tid) = runtime
+        .pthread_internal(&emulator, 11)
+        .expect("first thread's internal");
+    let (second, second_tid) = runtime
+        .pthread_internal(&emulator, 12)
+        .expect("second thread's internal");
+    assert_ne!(first, second, "the two threads do not share a block");
+
+    let width = runtime.word_size();
+    let memory = emulator.memory();
+    for (block, tid_at, want) in [(first, first_tid, 11u64), (second, second_tid, 12u64)] {
+        assert_eq!(
+            memory.pointer(block).read_pointer(0).expect("next"),
+            0,
+            "the thread list starts empty"
+        );
+        assert_eq!(
+            memory.pointer(block).read_pointer(width).expect("prev"),
+            0,
+            "and so does its back pointer"
+        );
+        assert_eq!(
+            memory.pointer(tid_at).read_u32(0).expect("tid"),
+            want as u32,
+            "each thread carries its own id"
+        );
+    }
+    assert_eq!(
+        first_tid - first,
+        second_tid - second,
+        "both use the same layout, so the tid is the same distance in"
+    );
+}
