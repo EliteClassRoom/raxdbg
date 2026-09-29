@@ -85,6 +85,8 @@ pub struct AndroidEmulator {
     process_name: String,
     trap_address: u64,
     stdout: std::sync::Arc<crate::syscall::SharedSink>,
+    /// The thread entry point and the `clone`/`pthread_join` replacements.
+    thread_start: std::cell::RefCell<Option<Rc<crate::thread::join::ThreadStart>>>,
 }
 
 impl std::fmt::Debug for AndroidEmulator {
@@ -174,6 +176,7 @@ impl AndroidEmulator {
                 ARM32_TRAP_ADDRESS
             },
             stdout,
+            thread_start: std::cell::RefCell::new(None),
         });
 
         emulator.setup_traps()?;
@@ -256,6 +259,13 @@ impl AndroidEmulator {
         // decision rather than a fault. See docs/known-gaps.md.
         self.loader
             .set_init_function_filter(Rc::new(SkipCxxInit));
+
+        // `clone` and `pthread_join`, the two libc functions unidbg replaces to
+        // make threads (plan P7). The entry code is precomputed (plan D9).
+        let start = crate::thread::join::install_entry(self)
+            .map_err(EmulatorError::Memory)?;
+        crate::thread::join::install(self, &start).map_err(EmulatorError::Memory)?;
+        *self.thread_start.borrow_mut() = Some(Rc::new(start));
         AndroidModule::register(&self.loader)?;
         SystemProperties::register(&self.loader)?;
         JniGraphics::register(&self.loader)?;
@@ -284,6 +294,14 @@ impl AndroidEmulator {
     }
 
     /// The ELF loader.
+    /// The thread entry point and the `clone`/`pthread_join` replacements.
+    ///
+    /// Installed during boot, so it is the one a thread actually runs; a test
+    /// that installs its own would be testing a second copy.
+    pub fn thread_start(&self) -> Option<Rc<crate::thread::join::ThreadStart>> {
+        self.thread_start.borrow().clone()
+    }
+
     pub fn loader(&self) -> &Rc<AndroidElfLoader> {
         &self.loader
     }

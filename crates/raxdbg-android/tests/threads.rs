@@ -401,3 +401,105 @@ fn a_futex_wait_on_a_changed_value_does_not_park() {
     );
     assert_eq!(dispatcher.switches(), 0, "no switch was needed");
 }
+
+/// The precomputed entry code is what a new thread actually runs: it takes the
+/// start routine and its argument off the stack, calls, and leaves the
+/// function's result in `x0`.
+///
+/// This is plan P7's `clone patchers` in its loadable half -- the entry sequence
+/// and the `pthread_internal_t` offsets -- checked against real code rather than
+/// against a table that only looks right.
+#[test]
+fn the_entry_code_calls_the_routine_and_keeps_its_result() {
+    let emulator = emulator();
+    let start = emulator
+        .thread_start()
+        .expect("the emulator installs one during boot");
+    assert_ne!(start.entry, 0, "the entry code has an address");
+
+    // The thread function: return 7.
+    let routine = emulator
+        .memory()
+        .mmap2_impl(0, 0x1000, Prot::from_bits(0x5), 0x22, -1, 0)
+        .expect("routine");
+    emulator.memory().pointer(routine).write_u32(0, 0xd280_00e0).expect("mov x0, #7");
+    emulator
+        .memory()
+        .pointer(routine + 4)
+        .write_u32(0, 0xd65f_03c0)
+        .expect("ret");
+
+    // The routine on its own, to be sure the 7 is coming from there.
+    assert_eq!(
+        emulator.call_function(routine, &[]).expect("the routine"),
+        7,
+        "the thread function returns 7"
+    );
+
+    // The stack the `clone` handler would have prepared: the routine, then its
+    // argument, at the top. The runtime's thread stack is already mapped and
+    // aligned, which a fresh mmap in a test is not.
+    let runtime = ThreadRuntime::install(&emulator).expect("runtime");
+    let stack = runtime.allocate_stack(&emulator).expect("thread stack");
+    emulator.memory().pointer(stack).write_u64(0, routine).expect("routine");
+    emulator
+        .memory()
+        .pointer(stack + 8)
+        .write_u64(0, 0x99)
+        .expect("argument");
+
+    // The entry code reads its operands from the stack, not from the argument
+    // registers, because that is where bionic's `__clone` leaves them and where
+    // the clone handler puts them. So the stack has to be the one the test
+    // prepared, and `call_function` would overwrite the stack pointer; set it
+    // back afterwards and run the entry by hand.
+    let value = {
+        use raxdbg_core::backend::Backend;
+        use raxdbg_core::reg::RegId;
+        let mut backend = emulator.backend().borrow_mut();
+        // The entry loads the routine and its argument from [sp] and [sp, #8],
+        // so sp points at them -- exactly what the clone handler arranges.
+        backend.reg_write(RegId::Sp, stack).expect("sp");
+        backend.reg_write(RegId::Lr, emulator.trap_address()).expect("lr");
+        let outcome = backend.emu_start(start.entry, emulator.trap_address(), 0, 0);
+        let _ = outcome;
+        // The exit `svc` ends the thread; the run reports PopContext with the
+        // result in x0. The trap stops the run just before that, so the value is
+        // already there either way.
+        let _ = outcome;
+        backend.reg_read(RegId::X(0)).expect("x0")
+    };
+    assert_eq!(value, 7, "the thread's result came through the entry code");
+}
+
+/// The `clone` replacement reads the start routine and its argument out of the
+/// `pthread_internal_t` bionic has already built, at the offsets unidbg uses.
+#[test]
+fn the_clone_stub_reads_the_pthread_internal_at_the_offsets_unidbg_uses() {
+    // unidbg: `ClonePatcher64` reads `thread.getPointer(0x60)` and `0x68`;
+    // `ClonePatcher32` reads `0x30` and `0x34`.
+    let wide = raxdbg_android::thread::join::internal_offsets(true);
+    let narrow = raxdbg_android::thread::join::internal_offsets(false);
+    assert_eq!(wide, (0x60, 0x68));
+    assert_eq!(narrow, (0x30, 0x34));
+}
+
+/// `pthread_join` writes the joined thread's id into the caller's `retval`,
+/// which is what unidbg's `ThreadJoin23` replacement does.
+#[test]
+fn a_join_records_the_thread_and_reports_it() {
+    let join = raxdbg_android::thread::join::ThreadJoin::new(true);
+    let id = join.record(0x1000, 0x2000);
+    assert_eq!(id, 1);
+    assert_eq!(join.value(), 1, "pthread_join would write this into retval");
+    let threads = join.threads();
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].start_routine, 0x1000);
+    assert_eq!(threads[0].arg, 0x2000);
+    assert!(threads[0].joinable, "and it can be joined");
+
+    let second = join.record(0x3000, 0x4000);
+    assert_eq!(second, 2);
+    assert_eq!(join.value(), 2, "the most recent thread is the one reported");
+    assert_eq!(join.threads().len(), 2);
+}

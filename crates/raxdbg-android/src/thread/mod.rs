@@ -18,6 +18,10 @@ use raxdbg_core::memory::MemoryError;
 use raxdbg_core::svc::{Svc, SvcKind, SvcMemory};
 use raxdbg_core::thread::ThreadDispatcher;
 
+pub mod join;
+
+pub use join::{PendingThread, ThreadJoin, ThreadJoinVisitor, ThreadStart};
+
 use crate::emulator::AndroidEmulator;
 
 /// The exit stub: what a thread function returns to.
