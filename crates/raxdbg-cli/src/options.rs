@@ -43,6 +43,8 @@ pub enum TraceKind {
     Code,
     /// Memory access trace.
     Memory,
+    /// Function calls.
+    Functions,
 }
 
 /// A `--call` target.
@@ -85,6 +87,10 @@ pub struct Options {
     pub trace_reads: bool,
     /// `--write`.
     pub trace_writes: bool,
+    /// `--functions`.
+    pub trace_functions: bool,
+    /// `--out <file>`: where a trace's lines go instead of this terminal.
+    pub out: Option<PathBuf>,
     /// `--syscall-detail <n>`: how much of a syscall trace to print.
     pub syscall_detail: SyscallDetail,
     /// `--jni-on-load`: run the library's `JNI_OnLoad` before the `--call`.
@@ -126,6 +132,8 @@ impl Options {
     pub fn trace_kind(&self) -> TraceKind {
         if self.trace_reads || self.trace_writes {
             TraceKind::Memory
+        } else if self.trace_functions {
+            TraceKind::Functions
         } else {
             TraceKind::Code
         }
@@ -173,6 +181,8 @@ impl Options {
             trace_code: false,
             trace_reads: false,
             trace_writes: false,
+            trace_functions: false,
+            out: None,
             syscall_detail: SyscallDetail::default(),
             jni_on_load: false,
         };
@@ -207,6 +217,8 @@ impl Options {
                 "--code" => options.trace_code = true,
                 "--read" => options.trace_reads = true,
                 "--write" => options.trace_writes = true,
+                "--functions" => options.trace_functions = true,
+                "--out" => options.out = Some(PathBuf::from(next_value(&mut args, "--out")?)),
                 // Each flag turns one more level on, so `-vv` is cumulative
                 // the way it reads at the command line.
                 "-v" | "--syscalls" => {
@@ -235,6 +247,12 @@ impl Options {
                     options.call_arguments.push(value);
                 }
             }
+        }
+        // One trace per run: the three hooks have nothing to say to each
+        // other, and picking one silently would hide a mistake in the command
+        // line.
+        if options.trace_functions && (options.trace_reads || options.trace_writes) {
+            return Err("--functions cannot be combined with --read/--write".into());
         }
         Ok(options)
     }
@@ -292,6 +310,22 @@ mod tests {
         assert_eq!(options.trace_kind(), TraceKind::Memory);
         let options = parse(&["trace", "lib.so"]).unwrap();
         assert_eq!(options.trace_kind(), TraceKind::Code);
+    }
+
+    #[test]
+    fn functions_and_a_memory_trace_cannot_be_asked_for_at_once() {
+        let options = parse(&["trace", "lib.so", "--functions"]).unwrap();
+        assert_eq!(options.trace_kind(), TraceKind::Functions);
+
+        let error = parse(&["trace", "lib.so", "--functions", "--read"]).unwrap_err();
+        assert!(error.contains("cannot be combined"), "{error}");
+        assert!(parse(&["trace", "lib.so", "--functions", "--write"]).is_err());
+    }
+
+    #[test]
+    fn an_out_file_is_parsed() {
+        let options = parse(&["trace", "lib.so", "--out", "trace.log"]).unwrap();
+        assert_eq!(options.out, Some(PathBuf::from("trace.log")));
     }
 
     #[test]

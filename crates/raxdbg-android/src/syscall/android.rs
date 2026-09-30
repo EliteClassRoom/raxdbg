@@ -489,11 +489,19 @@ impl AndroidSyscallHandler {
         // inside this scope would alias.
         let errno = self.last_errno.get();
         let memory = handler.memory().clone();
+        let exit = handler.take_exit_request();
         drop(handler);
         if let (Some(trace), Some(slot)) = (self.trace.clone(), slot) {
             trace
                 .borrow_mut()
                 .on_exit(slot, result, errno, &*memory);
+        }
+        if let Some(status) = exit {
+            // unidbg's `exit_group` calls `emu_stop()`, which ends the run
+            // cleanly rather than letting the guest `ret` into the trap
+            // page and read a return value nobody wrote.
+            log::info!("guest exited with status {status}");
+            return Err(RunError::StopEmulator);
         }
         if switch {
             return Err(RunError::ThreadSwitch);

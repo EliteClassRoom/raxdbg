@@ -717,6 +717,14 @@ impl AndroidElfLoader {
         module.find_closest_symbol(address)
     }
 
+    /// The symbol a relocation wrote to `address`, in whichever module owns it.
+    pub fn relocation_symbol(&self, address: u64) -> Option<Symbol> {
+        self.modules
+            .borrow()
+            .values()
+            .find_map(|module| module.relocation_symbol(address))
+    }
+
     /// Every symbol exported by every loaded module.
     pub fn exported_symbols(&self) -> Vec<Symbol> {
         let mut out = Vec::new();

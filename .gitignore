@@ -2,3 +2,5 @@
 **/*.rs.bk
 *.pdb
 /reference/rax-src
+
+test_lib/

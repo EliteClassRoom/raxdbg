@@ -4,17 +4,20 @@
 //! `com.github.unidbg.debugger.Debugger`'s console@7f5da98e.
 
 use std::cell::RefCell;
-use std::io::{BufRead, Write};
+use std::fs::File;
+use std::io::{BufRead, BufWriter, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use raxdbg_android::debug::ArmDisassembler;
 use raxdbg_android::dvm::Vm;
-use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder};
+use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder, EmulatorError};
 use raxdbg_android::syscall::trace::Verbosity;
 use raxdbg_core::alloc::MemoryTracker;
-use raxdbg_core::backend::Backend;
-use raxdbg_core::debug::{TraceCode, TraceMemory};
+use raxdbg_core::backend::{Backend, RunError};
+use raxdbg_core::debug::{
+    FunctionCall, FunctionCallListener, TraceCode, TraceFunctionCall, TraceMemory,
+};
 use raxdbg_core::memory::Memory;
 use raxdbg_core::reg::RegId;
 use raxdbg_core::unwind::{NoSymbols, SymbolResolver, Unwinder};
@@ -57,7 +60,7 @@ usage: raxdbg <command> <lib.so> [options]
 commands:
   run       <lib.so>   load the library, run its initialisers, optionally call a function
   info      <lib.so>   print the modules, their exports and their dependencies
-  trace     <lib.so>   trace instructions or memory accesses while calling a function
+  trace     <lib.so>   trace instructions, memory accesses or function calls while calling a function
   syscalls  <lib.so>   log every syscall, then report the protection checks seen
   debug     <lib.so>   open the console debugger
 
@@ -67,7 +70,8 @@ options:
   --libs-dir <dir>      the `libs/` tree (default: $RAXDBG_LIBS_DIR or the workspace)
   --root <dir>          the directory guest paths resolve under
   --call <name(args)>   the function to call, then its arguments
-  --code|--read|--write which trace to run (trace)
+  --code|--read|--write|--functions which trace to run (trace)
+  --out <file>           (trace) write the trace lines there instead of this terminal
   -v                     (syscalls) also print the syscalls that carry a path
   -vv                    (syscalls) print every syscall
   --jni-on-load          (syscalls) run the library's JNI_OnLoad first
@@ -112,11 +116,16 @@ fn syscalls(options: &Options, library: &str) -> Result<(), String> {
     let result = match &options.call {
         Some(call) => {
             let address = resolve_callable(&emulator, call)?;
-            Some(
-                emulator
-                    .call_function(address, &options.call_arguments)
-                    .map_err(|error| format!("calling {}: {error}", call.name))?,
-            )
+            // A guest `exit` is a clean end of the run, so it is reported
+            // rather than turned into a failure. It still ends the run, so
+            // the trace and the report below are still produced.
+            match emulator.call_function(address, &options.call_arguments) {
+                Ok(value) => Some(format!("{}() = 0x{value:x} ({value})", call.name)),
+                Err(EmulatorError::Run(RunError::StopEmulator)) => {
+                    Some(format!("{}() called exit()", call.name))
+                }
+                Err(error) => return Err(format!("calling {}: {error}", call.name)),
+            }
         }
         None => None,
     };
@@ -143,9 +152,8 @@ fn syscalls(options: &Options, library: &str) -> Result<(), String> {
         println!("-- syscalls --");
         print!("{lines}");
     }
-    if let Some(value) = result {
-        let name = options.call.as_ref().map(|call| call.name.as_str()).unwrap_or("?");
-        println!("{name}() = 0x{value:x} ({value})");
+    if let Some(line) = result {
+        println!("{line}");
     }
     if let Some(outcome) = on_load {
         println!("JNI_OnLoad: {outcome}");
@@ -209,11 +217,15 @@ fn run_jni_on_load(emulator: &Rc<AndroidEmulator>, library: &str) -> Option<Stri
     }
 }
 
-/// Boots an emulator for `library` and loads it.
-fn boot(options: &Options, library: &str) -> Result<Rc<AndroidEmulator>, String> {
+/// Boots an emulator for `library`, loads it, and returns the emulator with
+/// the name the library was loaded under.
+fn boot(
+    options: &Options,
+    library: &str,
+) -> Result<(Rc<AndroidEmulator>, String), String> {
     let emulator = boot_traced(options, library)?;
-    load_into(&emulator, library)?;
-    Ok(emulator)
+    let name = load_into(&emulator, library)?;
+    Ok((emulator, name))
 }
 
 /// Boots the emulator without loading `library`.
@@ -261,30 +273,32 @@ fn boot_traced(options: &Options, library: &str) -> Result<Rc<AndroidEmulator>, 
     Ok(emulator)
 }
 
-/// Loads `library` into `emulator`.
+/// Loads `library` into `emulator` and returns the name it was loaded under.
 ///
 /// A path on disk loads directly; a bare name goes through the resolver,
-/// which is what unidbg's `load(File)` and `loadLibrary(name)` do.
-fn load_into(emulator: &Rc<AndroidEmulator>, library: &str) -> Result<(), String> {
+/// which is what unidbg's `load(File)` and `loadLibrary(name)` do. The name
+/// is the one the loader's module table uses, which is what a trace over
+/// "this module" has to look up.
+fn load_into(emulator: &Rc<AndroidEmulator>, library: &str) -> Result<String, String> {
     let path = PathBuf::from(library);
-    if path.is_file() {
+    let name = if path.is_file() {
         let file = raxdbg_android::android_file::ElfLibraryFile::open(&path)
             .map_err(|error| format!("cannot open {library}: {error}"))?;
         emulator
             .load(Box::new(file), false)
-            .map_err(|error| format!("cannot load {library}: {error}"))?;
+            .map_err(|error| format!("cannot load {library}: {error}"))?
     } else {
         emulator
             .load_library(library)
-            .map_err(|error| format!("cannot load {library}: {error}"))?;
-    }
+            .map_err(|error| format!("cannot load {library}: {error}"))?
+    };
     emulator.register_libc_allocator();
-    Ok(())
+    Ok(name)
 }
 
 /// `info`: the modules, their dependencies and their exports.
 fn info(options: &Options, library: &str) -> Result<(), String> {
-    let emulator = boot(options, library)?;
+    let (emulator, _) = boot(options, library)?;
     let loader = emulator.loader();
     for module in loader.module_infos() {
         println!(
@@ -323,21 +337,28 @@ fn info(options: &Options, library: &str) -> Result<(), String> {
 
 /// `run` and `trace`: load, optionally call, and report.
 fn execute(options: &Options, library: &str) -> Result<(), String> {
-    let emulator = boot(options, library)?;
+    let (emulator, module) = boot(options, library)?;
 
     let tracker = emulator.memory().tracker();
 
     let result = match &options.call {
         Some(call) => {
             let address = resolve_callable(&emulator, call)?;
-            let trace = Trace::attach(options, &emulator)?;
-            let value = emulator
-                .call_function(address, &options.call_arguments)
-                .map_err(|error| format!("calling {}: {error}", call.name))?;
+            let trace = Trace::attach(options, &emulator, &module)?;
+            // A guest that called `exit` ended on purpose. That is a normal
+            // end of a run, not a failure, and reporting it as an error
+            // would say the emulation broke when it worked.
+            let outcome = match emulator.call_function(address, &options.call_arguments) {
+                Ok(value) => Some(format!("{name}() = 0x{value:x} ({value})", name = call.name)),
+                Err(EmulatorError::Run(RunError::StopEmulator)) => {
+                    Some(format!("{}() called exit()", call.name))
+                }
+                Err(error) => return Err(format!("calling {}: {error}", call.name)),
+            };
             if let Some(trace) = trace {
                 trace.report();
             }
-            Some(value)
+            outcome
         }
         None => None,
     };
@@ -351,8 +372,8 @@ fn execute(options: &Options, library: &str) -> Result<(), String> {
         None => print!("{stdout}"),
     }
 
-    if let Some(value) = result {
-        println!("{}() = 0x{value:x} ({value})", options.call.as_ref().unwrap().name);
+    if let Some(line) = result {
+        println!("{line}");
     }
 
     if let Some(tracker) = tracker {
@@ -389,85 +410,266 @@ fn resolve_callable(emulator: &Rc<AndroidEmulator>, call: &options::Call) -> Res
     Err(format!("cannot resolve {}", call.name))
 }
 
-/// The instruction or memory trace a `trace` run asked for.
-enum Trace {
-    Code {
-        hook: TraceCode,
-        backend: Rc<RefCell<dyn Backend>>,
-    },
+/// Where a trace's lines go: `--out <file>`, or the terminal.
+fn trace_writer(options: &Options) -> Result<Box<dyn Write + Send>, String> {
+    match &options.out {
+        Some(path) => Ok(Box::new(BufWriter::new(File::create(path).map_err(
+            |error| format!("cannot write {}: {error}", path.display()),
+        )?))),
+        None => Ok(Box::new(std::io::stdout())),
+    }
+}
+
+/// The trace a `trace` run asked for, and the file its lines went to.
+struct Trace {
+    hook: TraceHook,
+    /// The `--out` file the lines were streamed to, if any.
+    redirect: Option<PathBuf>,
+}
+
+enum TraceHook {
+    Code { hook: TraceCode },
     Memory {
         hook: TraceMemory,
-        backend: Rc<RefCell<dyn Backend>>,
         reads: bool,
         writes: bool,
     },
+    Functions { hook: TraceFunctionCall },
 }
 
 impl Trace {
-    fn attach(options: &Options, emulator: &Rc<AndroidEmulator>) -> Result<Option<Self>, String> {
+    fn attach(
+        options: &Options,
+        emulator: &Rc<AndroidEmulator>,
+        module: &str,
+    ) -> Result<Option<Self>, String> {
         if !matches!(options.command, Command::Trace { .. }) {
             return Ok(None);
         }
         let backend = Rc::clone(emulator.backend());
         let (begin, end) = (0u64, u64::MAX);
-        match options.trace_kind() {
+        let redirect = options.out.clone();
+        let hook = match options.trace_kind() {
             options::TraceKind::Memory => {
                 let reads = options.trace_reads;
                 let writes = options.trace_writes;
                 let hook = TraceMemory::new(reads);
+                // `--out` streams: the lines are written as the run goes, so
+                // the vectors never grow to the size of a whole trace.
+                if redirect.is_some() {
+                    hook.set_collect(false);
+                    hook.set_redirect(trace_writer(options)?);
+                }
                 hook.attach(&backend, begin, end);
-                Ok(Some(Trace::Memory {
+                TraceHook::Memory {
                     hook,
-                    backend,
                     reads,
                     writes,
-                }))
+                }
             }
             options::TraceKind::Code => {
                 let hook = TraceCode::new(Rc::new(ArmDisassembler::arm64()));
+                if redirect.is_some() {
+                    hook.set_collect(false);
+                    hook.set_redirect(trace_writer(options)?);
+                }
                 hook.attach(&backend, begin, end);
-                Ok(Some(Trace::Code { hook, backend }))
+                TraceHook::Code { hook }
             }
-        }
+            options::TraceKind::Functions => {
+                let info = emulator
+                    .loader()
+                    .module(module)
+                    .ok_or_else(|| format!("cannot find the loaded module `{module}`"))?;
+                let hook = TraceFunctionCall::new(options.is_64bit());
+                hook.set_listener(Box::new(CallLog {
+                    loader: Rc::clone(emulator.loader()),
+                    is_64bit: options.is_64bit(),
+                    out: trace_writer(options)?,
+                }));
+                // The module's own range is the point of this trace: only
+                // branch instructions executed inside the library are
+                // reported, not the ones libc makes on its own.
+                hook.attach(&backend, info.base, info.base + info.size - 1);
+                TraceHook::Functions { hook }
+            }
+        };
+        Ok(Some(Trace { hook, redirect }))
     }
 
     fn report(&self) {
-        match self {
-            Trace::Code { hook, .. } => {
-                let entries = hook.entries();
-                println!("-- {} instructions --", entries.len());
-                for entry in entries {
-                    match &entry.disassembly {
-                        Some(text) => println!("0x{:x}: {text}", entry.pc),
-                        None => println!("0x{:x}: (undecoded)", entry.pc),
+        let streamed = self.redirect.as_ref().map(|path| path.display().to_string());
+        match &self.hook {
+            TraceHook::Code { hook } => {
+                hook.flush();
+                match &streamed {
+                    Some(path) => println!(
+                        "-- {} instructions (written to {path}) --",
+                        hook.count()
+                    ),
+                    None => {
+                        let entries = hook.entries();
+                        println!("-- {} instructions --", entries.len());
+                        for entry in entries {
+                            match &entry.disassembly {
+                                Some(text) => println!("0x{:x}: {text}", entry.pc),
+                                None => println!("0x{:x}: (undecoded)", entry.pc),
+                            }
+                        }
                     }
                 }
             }
-            Trace::Memory {
+            TraceHook::Memory {
                 hook,
                 reads,
                 writes,
-                ..
             } => {
-                if *reads {
-                    for event in hook.reads() {
+                hook.flush();
+                match &streamed {
+                    Some(path) => {
+                        let (read_count, write_count) = hook.counts();
                         println!(
-                            "read  0x{:x} <- [0x{:x}] size {} from 0x{:x}",
-                            event.value, event.address, event.size, event.pc
+                            "-- {read_count} reads, {write_count} writes (written to {path}) --"
                         );
+                    }
+                    None => {
+                        if *reads {
+                            for event in hook.reads() {
+                                println!(
+                                    "read  0x{:x} <- [0x{:x}] size {} from 0x{:x}",
+                                    event.value, event.address, event.size, event.pc
+                                );
+                            }
+                        }
+                        if *writes {
+                            for event in hook.writes() {
+                                println!(
+                                    "write 0x{:x} -> [0x{:x}] size {} from 0x{:x}",
+                                    event.value, event.address, event.size, event.pc
+                                );
+                            }
+                        }
                     }
                 }
-                if *writes {
-                    for event in hook.writes() {
-                        println!(
-                            "write 0x{:x} -> [0x{:x}] size {} from 0x{:x}",
-                            event.value, event.address, event.size, event.pc
-                        );
-                    }
+            }
+            TraceHook::Functions { hook } => {
+                hook.flush();
+                match &streamed {
+                    Some(path) => println!("-- {} calls (written to {path}) --", hook.count()),
+                    None => println!("-- {} calls --", hook.count()),
                 }
             }
         }
     }
+}
+
+/// Streams the calls the library made, naming each through the loader.
+struct CallLog {
+    loader: Rc<raxdbg_android::elf::AndroidElfLoader>,
+    is_64bit: bool,
+    out: Box<dyn Write>,
+}
+
+impl FunctionCallListener for CallLog {
+    fn on_call(&mut self, backend: &mut dyn Backend, call: &FunctionCall) {
+        let _ = writeln!(
+            self.out,
+            "call 0x{:x} {} -> 0x{:x} {}",
+            call.caller,
+            name_caller(&self.loader, call.caller),
+            call.callee,
+            name_callee(&self.loader, self.is_64bit, backend, call.callee),
+        );
+    }
+
+    fn flush(&mut self) {
+        let _ = self.out.flush();
+    }
+}
+
+/// Names the address of a branch instruction, which sits *inside* a function
+/// and so is named by the nearest symbol below it.
+fn name_caller(loader: &raxdbg_android::elf::AndroidElfLoader, address: u64) -> String {
+    match loader.find_closest_symbol(address) {
+        Some(symbol) => match symbol.module {
+            Some(module) => format!(
+                "{module}!{}+0x{:x}",
+                symbol.name,
+                address.wrapping_sub(symbol.address)
+            ),
+            None => format!("0x{address:x}"),
+        },
+        None => format!("0x{address:x}"),
+    }
+}
+
+/// Names a branch target, which *is* a function entry.
+///
+/// A nearest-symbol name would be a lie here — a call lands in the middle of
+/// nothing — so an exact symbol is required, then a PLT stub's GOT slot, and
+/// only then the containing module.
+fn name_callee(
+    loader: &raxdbg_android::elf::AndroidElfLoader,
+    is_64bit: bool,
+    backend: &mut dyn Backend,
+    address: u64,
+) -> String {
+    if let Some(symbol) = loader.find_closest_symbol(address) {
+        if symbol.address == address {
+            if let Some(module) = &symbol.module {
+                return format!("{module}!{}", symbol.name);
+            }
+        }
+    }
+    if is_64bit {
+        if let Some(slot) = plt_got_slot(backend, address) {
+            if let Some(symbol) = loader.relocation_symbol(slot) {
+                return match &symbol.module {
+                    Some(module) => format!("{module}!{}", symbol.name),
+                    None => symbol.name,
+                };
+            }
+        }
+    }
+    match loader.find_module_by_address(address) {
+        Some(info) => format!("{}+0x{:x}", info.name, address.wrapping_sub(info.base)),
+        None => format!("0x{address:x}"),
+    }
+}
+
+/// The GOT slot an AArch64 PLT stub loads its target from, if `address` is one.
+///
+/// The shape is what `lld` and the Android NDK emit: `adrp x16, page`,
+/// `ldr x17, [x16, #imm]`, `add x16, x16, #imm`, `br x17`. Any other
+/// instruction sequence is not a stub this can name.
+fn plt_got_slot(backend: &mut dyn Backend, address: u64) -> Option<u64> {
+    let bytes = backend.mem_read(address, 16).ok()?;
+    if bytes.len() != 16 {
+        return None;
+    }
+    let word = |index: usize| u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+    let adrp = word(0);
+    let ldr = word(1);
+    let br = word(3);
+    if adrp & 0x9F00_001F != 0x9000_0010 {
+        return None;
+    }
+    if ldr & 0xFFC0_0000 != 0xF940_0000 || (ldr >> 5) & 0x1F != 16 || ldr & 0x1F != 17 {
+        return None;
+    }
+    if br != 0xD61F_0220 {
+        return None;
+    }
+    // ADRP's immediate is 21 bits of halfwords scaled by 2 and 4KB.
+    let imm21 = (((adrp >> 5) & 0x7FFFF) << 2) | ((adrp >> 29) & 3);
+    let page = (address & !0xFFF).wrapping_add(sign_extend(imm21, 21) << 12);
+    Some(page.wrapping_add(u64::from((ldr >> 10) & 0xFFF) * 8))
+}
+
+/// Sign-extends the low `bits` of `value`, for an address displacement.
+fn sign_extend(value: u32, bits: u32) -> u64 {
+    let shift = 32 - bits;
+    (((value << shift) as i32) >> shift) as i64 as u64
 }
 
 /// Prints the live allocations, with a guest backtrace for each.

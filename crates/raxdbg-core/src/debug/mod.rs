@@ -13,12 +13,15 @@
 //! * `unidbg-api/.../arm/CodeHistory.java@7f5da98e`
 //! * `unidbg-api/.../{TraceHook, TraceMemoryHook}.java@7f5da98e`
 //! * `unidbg-api/.../AssemblyCodeDumper.java@7f5da98e`
+//! * `unidbg-api/.../arm/TraceFunctionCall{,32,64}.java@7f5da98e`
 
 pub mod breakpoint;
+pub mod function_call;
 pub mod history;
 pub mod trace;
 
 pub use breakpoint::{BreakCallback, BreakControl, BreakPoint, Breaker, BreakerImpl};
+pub use function_call::{FunctionCall, FunctionCallListener, TraceFunctionCall};
 pub use history::{CodeHistory, HistoryEntry};
 pub use trace::{
     AssemblyCodeDumper, Disassembler, MemTraceEvent, NoopDisassembler, TraceCode, TraceMemory,

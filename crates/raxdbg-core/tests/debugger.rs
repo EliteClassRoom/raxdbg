@@ -16,8 +16,9 @@ use raxdbg_core::backend::{
     UnmappedKind, WriteHook,
 };
 use raxdbg_core::debug::{
-    BreakControl, Breaker, BreakerImpl, CodeHistory, Disassembler, HistoryEntry, MemTraceEvent,
-    NoopDisassembler, TraceCode, TraceMemory,
+    BreakControl, Breaker, BreakerImpl, CodeHistory, Disassembler, FunctionCall,
+    FunctionCallListener, HistoryEntry, MemTraceEvent, NoopDisassembler, TraceCode,
+    TraceFunctionCall, TraceMemory,
 };
 use raxdbg_core::memory::PAGE_SIZE;
 use raxdbg_core::reg::RegId;
@@ -35,6 +36,7 @@ use raxdbg_core::reg::RegId;
 #[derive(Default)]
 struct TestBackend {
     regions: BTreeMap<u64, Vec<u8>>,
+    regs: BTreeMap<RegId, u64>,
     pc: u64,
     sp: u64,
     emu_stop_count: u32,
@@ -84,6 +86,10 @@ impl TestBackend {
             .iter()
             .find(|(base, region)| addr >= **base && addr < **base + region.len() as u64)
             .map(|(base, region)| (*base, region.as_slice()))
+    }
+
+    fn set_reg(&mut self, reg: RegId, value: u64) {
+        self.regs.insert(reg, value);
     }
 
     fn fire_code(&mut self, hook_id: HookId, address: u64, size: u32) {
@@ -169,9 +175,9 @@ impl Backend for TestBackend {
         match reg {
             RegId::Pc => Ok(self.pc),
             RegId::Sp => Ok(self.sp),
-            RegId::Lr | RegId::Fp => Ok(0),
-            RegId::X(n) if n <= 2 => Ok(0),
-            RegId::R(n) if n <= 2 => Ok(0),
+            RegId::Lr | RegId::Fp | RegId::Cpsr => Ok(*self.regs.get(&reg).unwrap_or(&0)),
+            RegId::X(n) if n <= 30 => Ok(*self.regs.get(&reg).unwrap_or(&0)),
+            RegId::R(n) if n <= 15 => Ok(*self.regs.get(&reg).unwrap_or(&0)),
             other => Err(BackendError::UnsupportedRegister(other)),
         }
     }
@@ -186,7 +192,10 @@ impl Backend for TestBackend {
                 self.sp = value;
                 Ok(())
             }
-            _ => Ok(()),
+            _ => {
+                self.regs.insert(reg, value);
+                Ok(())
+            }
         }
     }
 
@@ -657,6 +666,50 @@ fn trace_memory_stop_trace_clears_entries() {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming traces
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_streaming_code_trace_streams_without_collecting() {
+    let (backend_dyn, backend, _breaker) = harness();
+    let trace = Rc::new(TraceCode::new(Rc::new(FixedDisassembler("nop"))));
+    let redirect = Rc::new(CaptureWriter::default());
+    trace.set_redirect(Box::new(SharedWriter(Rc::clone(&redirect))));
+    trace.set_collect(false);
+
+    let hook_id = trace.attach(&backend_dyn, 0, u64::MAX);
+    backend.borrow_mut().mem_map(0x7000, 0x1000, Prot::READ).unwrap();
+    backend.borrow_mut().pc = 0x7000;
+    backend.borrow_mut().fire_code(hook_id, 0x7000, 4);
+    backend.borrow_mut().fire_code(hook_id, 0x7004, 4);
+
+    assert!(trace.entries().is_empty());
+    assert_eq!(trace.count(), 2);
+    let text = String::from_utf8(redirect.bytes.borrow().clone()).unwrap();
+    assert_eq!(text.lines().count(), 2);
+    assert!(text.lines().all(|line| line.contains("nop")));
+}
+
+#[test]
+fn a_streaming_memory_trace_streams_without_collecting() {
+    let (backend_dyn, backend, _breaker) = harness();
+    let trace = Rc::new(TraceMemory::new(true));
+    let redirect = Arc::new(SharedCapture::default());
+    trace.set_redirect(Box::new(SharedCaptureWriter(Arc::clone(&redirect))));
+    trace.set_collect(false);
+
+    let (read_id, _write_id) = trace.attach(&backend_dyn, 0, u64::MAX);
+    backend.borrow_mut().mem_map(0x9000, 0x1000, Prot::READ).unwrap();
+    backend.borrow_mut().fire_read(read_id, 0x1238, 0x9000, 4);
+
+    assert!(trace.reads().is_empty());
+    assert_eq!(trace.counts(), (1, 0));
+    let text = redirect.text();
+    assert_eq!(text.lines().count(), 1);
+    assert!(!text.trim().is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // Capture writer
 // ---------------------------------------------------------------------------
 
@@ -674,3 +727,255 @@ impl io::Write for CaptureWriter {
         Ok(())
     }
 }
+
+/// Lets a test keep a handle on a [`CaptureWriter`] the hook has taken
+/// ownership of.
+struct SharedWriter(Rc<CaptureWriter>);
+
+impl io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.bytes.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A `Send` capture: `TraceMemory`'s hooks live behind a `Mutex`, so their
+/// redirect has to be `Send` too.
+#[derive(Default)]
+struct SharedCapture {
+    bytes: parking_lot::Mutex<Vec<u8>>,
+}
+
+impl SharedCapture {
+    fn text(&self) -> String {
+        String::from_utf8(self.bytes.lock().clone()).unwrap()
+    }
+
+    fn write_bytes(&self, buf: &[u8]) -> usize {
+        self.bytes.lock().extend_from_slice(buf);
+        buf.len()
+    }
+}
+
+impl io::Write for SharedCapture {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Ok(self.write_bytes(buf))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Writes into a `Send` capture the test still holds a handle to.
+struct SharedCaptureWriter(Arc<SharedCapture>);
+
+impl io::Write for SharedCaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Ok(self.0.write_bytes(buf))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TraceFunctionCall
+// ---------------------------------------------------------------------------
+
+/// Records every call the hook reports.
+#[derive(Default)]
+struct CallRecorder {
+    calls: RefCell<Vec<FunctionCall>>,
+}
+
+impl FunctionCallListener for CallRecorder {
+    fn on_call(&mut self, _backend: &mut dyn Backend, call: &FunctionCall) {
+        self.calls.borrow_mut().push(*call);
+    }
+}
+
+/// Everything a function-call test needs: the hook, the listener it was
+/// handed, the backend to fire into and the hook's id on it.
+struct CallHarness {
+    hook: Rc<TraceFunctionCall>,
+    recorder: Rc<RefCell<CallRecorder>>,
+    backend: Rc<RefCell<TestBackend>>,
+    id: HookId,
+}
+
+impl CallHarness {
+    /// Fires the hook at `address`, as the run loop would.
+    fn fire(&self, address: u64, size: u32) {
+        self.backend.borrow_mut().fire_code(self.id, address, size);
+    }
+
+    /// The calls reported so far.
+    fn calls(&self) -> Vec<FunctionCall> {
+        self.recorder.borrow().calls.borrow().clone()
+    }
+
+    /// Sets a register on the backend.
+    fn set_reg(&self, reg: RegId, value: u64) {
+        self.backend.borrow_mut().set_reg(reg, value);
+    }
+}
+
+/// Attaches a function-call hook to a fresh harness.
+fn call_hook(is_64bit: bool) -> CallHarness {
+    let (backend_dyn, backend, _breaker) = harness();
+    let recorder = Rc::new(RefCell::new(CallRecorder::default()));
+    let hook = Rc::new(TraceFunctionCall::new(is_64bit));
+    hook.set_listener(Box::new(CallRecorderProxy(Rc::clone(&recorder))));
+    let id = hook.attach(&backend_dyn, 0, u64::MAX);
+    CallHarness {
+        hook,
+        recorder,
+        backend,
+        id,
+    }
+}
+
+/// Forwards to a shared [`CallRecorder`], so the test keeps a handle on the
+/// listener the hook holds.
+struct CallRecorderProxy(Rc<RefCell<CallRecorder>>);
+
+impl FunctionCallListener for CallRecorderProxy {
+    fn on_call(&mut self, backend: &mut dyn Backend, call: &FunctionCall) {
+        self.0.borrow_mut().on_call(backend, call);
+    }
+}
+
+/// Writes `bytes` at `address` in a mapped page, creating the page if needed.
+fn write_code(harness: &CallHarness, address: u64, bytes: &[u8]) {
+    let base = address & !0xFFF;
+    let mut b = harness.backend.borrow_mut();
+    if b.region_at(base).is_none() {
+        b.mem_map(base, 0x1000, Prot::READ).unwrap();
+    }
+    b.mem_write(address, bytes).unwrap();
+}
+
+#[test]
+fn an_arm64_bl_reports_the_call() {
+    let harness = call_hook(true);
+    write_code(&harness, 0x1000, &0x9400_0040u32.to_le_bytes());
+
+    harness.fire(0x1000, 4);
+
+    assert_eq!(
+        harness.calls(),
+        vec![FunctionCall {
+            caller: 0x1000,
+            callee: 0x1100,
+        }]
+    );
+    assert_eq!(harness.hook.count(), 1);
+}
+
+#[test]
+fn an_arm64_blr_reports_the_register_target() {
+    let harness = call_hook(true);
+    write_code(&harness, 0x2000, &0xD63F_0060u32.to_le_bytes());
+    harness.set_reg(RegId::X(3), 0x3000);
+
+    harness.fire(0x2000, 4);
+
+    assert_eq!(
+        harness.calls(),
+        vec![FunctionCall {
+            caller: 0x2000,
+            callee: 0x3000,
+        }]
+    );
+    assert_eq!(harness.hook.count(), 1);
+}
+
+#[test]
+fn an_arm64_arithmetic_instruction_reports_nothing() {
+    let harness = call_hook(true);
+    write_code(&harness, 0x1000, &0xD280_0000u32.to_le_bytes());
+
+    harness.fire(0x1000, 4);
+
+    assert!(harness.calls().is_empty());
+    assert_eq!(harness.hook.count(), 0);
+}
+
+#[test]
+fn an_arm_state_bl_reports_the_call() {
+    let harness = call_hook(false);
+    write_code(&harness, 0x1000, &0xEB00_0040u32.to_le_bytes());
+    harness.set_reg(RegId::Cpsr, 0);
+
+    harness.fire(0x1000, 4);
+
+    assert_eq!(
+        harness.calls(),
+        vec![FunctionCall {
+            caller: 0x1000,
+            callee: 0x1108,
+        }]
+    );
+    assert_eq!(harness.hook.count(), 1);
+}
+
+#[test]
+fn an_arm_state_blx_register_reports_the_call() {
+    let harness = call_hook(false);
+    write_code(&harness, 0x1000, &0xE12F_FF33u32.to_le_bytes());
+    harness.set_reg(RegId::Cpsr, 0);
+    harness.set_reg(RegId::R(3), 0x2001);
+
+    harness.fire(0x1000, 4);
+
+    assert_eq!(
+        harness.calls(),
+        vec![FunctionCall {
+            caller: 0x1000,
+            callee: 0x2000,
+        }]
+    );
+    assert_eq!(harness.hook.count(), 1);
+}
+
+#[test]
+fn a_thumb_bl_reports_the_call() {
+    let harness = call_hook(false);
+    // `bl #0x1010`: h1 = 0xF000, h2 = 0xF806 (J1=J2=S=0 => I1=I2=1, imm11=3).
+    write_code(&harness, 0x1000, &[0x00, 0xF0, 0x06, 0xF8]);
+    harness.set_reg(RegId::Cpsr, 1 << 5);
+
+    harness.fire(0x1000, 4);
+
+    assert_eq!(
+        harness.calls(),
+        vec![FunctionCall {
+            caller: 0x1000,
+            callee: 0x1010,
+        }]
+    );
+    assert_eq!(harness.hook.count(), 1);
+}
+
+#[test]
+fn a_thumb_blx_register_reports_the_call() {
+    let harness = call_hook(false);
+    write_code(&harness, 0x1000, &[0x98, 0x47]);
+    harness.set_reg(RegId::Cpsr, 1 << 5);
+    harness.set_reg(RegId::R(3), 0x2001);
+
+    harness.fire(0x1000, 2);
+
+    assert_eq!(
+        harness.calls(),
+        vec![FunctionCall {
+            caller: 0x1000,
+            callee: 0x2000,
+        }]
+    );
+    assert_eq!(harness.hook.count(), 1);
+}
+

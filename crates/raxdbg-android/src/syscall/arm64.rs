@@ -905,10 +905,20 @@ impl<'a> Arm64SyscallTable<'a> {
     }
 
     fn exit(&self, group: bool) {
-        let _status = self.arg_u64(0) as i32;
+        let status = self.arg_u64(0) as i32;
+        // Both numbers stop the run here. `exit_group` ends the process and
+        // `exit` ends the calling thread, which without the dispatcher is
+        // the same thing from the run loop's point of view: the guest must
+        // not carry on past its own exit.
+        //
+        // The table is `&self` and has no backend, so the request is
+        // recorded and the SVC dispatch stops the run -- the same shape as
+        // `request_switch` for a blocking syscall.
+        //
+        // Port of unidbg: `ARM64SyscallHandler.exit_group`@7f5da98e, which
+        // calls `Backend.emu_stop()`.
         let _ = group;
-        // The SVC dispatch in `super::mod.rs` turns this into a
-        // backend stop request via the `RunError::StopEmulator` path.
+        self.handler.request_exit(status);
     }
 
     // ---- helpers ------------------------------------------------------------

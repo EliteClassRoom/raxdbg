@@ -169,13 +169,19 @@ impl Module {
             self.symbols[*index].value <= offset
         });
         let mut best = position.checked_sub(1).map(|index| self.by_address[index]);
-        let entry = self.base + self.entry_point;
-        if address >= entry {
-            let current = best.map(|index| self.base + self.symbols[index].value);
-            if current.is_none_or(|current| entry > current) {
-                return Some(Symbol::new("start", entry, 0, Some(self.name.clone())));
+        // A module with no entry point sits at `entry_point == 0`, so the
+        // synthetic "start" symbol would land exactly on its base and hide
+        // every real symbol below it. Only consider an entry point the module
+        // actually has.
+        if self.entry_point != 0 {
+            let entry = self.base + self.entry_point;
+            if address >= entry {
+                let current = best.map(|index| self.base + self.symbols[index].value);
+                if current.is_none_or(|current| entry > current) {
+                    return Some(Symbol::new("start", entry, 0, Some(self.name.clone())));
+                }
+                best = None;
             }
-            best = None;
         }
         let index = best?;
         let symbol = &self.symbols[index];
@@ -197,5 +203,68 @@ impl Module {
     /// The module's `init_array` and `DT_INIT` entry points, in call order.
     pub fn init_functions(&self) -> &[super::init::InitFunction] {
         &self.init_functions
+    }
+
+    /// The symbol a relocation wrote to `address`, when `address` is a GOT
+    /// slot.
+    ///
+    /// unidbg has no such lookup: `Module.findClosestSymbolByAddress` cannot
+    /// name a PLT stub, because a stub is not a symbol. raxdbg needs it to
+    /// name the imported function a `bl <stub>` reaches. The returned symbol's
+    /// `address` is the slot itself; only `name` and `module` are meaningful.
+    pub fn relocation_symbol(&self, address: u64) -> Option<Symbol> {
+        let pending = self
+            .resolved_symbols
+            .values()
+            .chain(self.unresolved.iter())
+            .find(|pending| {
+                pending.relocation_addr == address && !pending.symbol_name().is_empty()
+            })?;
+        Some(Symbol::new(
+            pending.symbol_name(),
+            address,
+            0,
+            pending
+                .to_so_name
+                .clone()
+                .or_else(|| Some(self.name.clone())),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::symbol::{ElfSymbol, ModuleSymbol};
+    use super::*;
+
+    #[test]
+    fn a_relocation_slot_names_the_symbol_it_writes() {
+        let mut module = Module::new(0x1000, 0x1000, 0x1000, "a.so", vec![]);
+        module.resolved_symbols.insert(
+            "printf".into(),
+            ModuleSymbol::new(
+                "a.so",
+                0x1000,
+                Some(ElfSymbol {
+                    name: "printf".into(),
+                    value: 0,
+                    size: 0,
+                    info: 0,
+                    shndx: 0,
+                }),
+                0x2000,
+                Some("libc.so".into()),
+                0,
+            ),
+        );
+
+        let symbol = module.relocation_symbol(0x2000).expect("the slot names printf");
+        assert_eq!(symbol.name, "printf");
+        assert_eq!(symbol.module.as_deref(), Some("libc.so"));
+        // The address is the slot, not the callee: only the name and the
+        // module carry meaning.
+        assert_eq!(symbol.address, 0x2000);
+
+        assert!(module.relocation_symbol(0x2001).is_none());
     }
 }

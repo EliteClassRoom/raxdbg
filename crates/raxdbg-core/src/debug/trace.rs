@@ -150,6 +150,10 @@ struct TraceCodeInner {
     disassembler: Rc<dyn Disassembler>,
     entries: Vec<TraceEntry>,
     output: Option<Box<dyn Write>>,
+    /// Whether entries are retained; `false` streams straight to `output`.
+    collect: bool,
+    /// Instructions seen, whether or not they are collected.
+    count: u64,
 }
 
 impl TraceCode {
@@ -161,6 +165,8 @@ impl TraceCode {
                 disassembler,
                 entries: Vec::new(),
                 output: None,
+                collect: true,
+                count: 0,
             })),
         }
     }
@@ -171,11 +177,35 @@ impl TraceCode {
         self.inner.borrow_mut().output = Some(output);
     }
 
-    /// Stops tracing: clears accumulated entries and drops the redirect.
-    /// Mirrors `TraceHook.stopTrace`.
+    /// Whether instructions are retained in [`TraceCode::entries`].
+    ///
+    /// Turning this off makes the hook stream: a long run writes its lines
+    /// straight to the redirect without the `Vec` growing, and
+    /// [`TraceCode::count`] still reports what the run saw.
+    pub fn set_collect(&self, collect: bool) {
+        self.inner.borrow_mut().collect = collect;
+    }
+
+    /// How many instructions the hook saw, collected or streamed.
+    pub fn count(&self) -> u64 {
+        self.inner.borrow().count
+    }
+
+    /// Flushes the redirect's buffered output, if it has any.
+    pub fn flush(&self) {
+        if let Some(output) = self.inner.borrow_mut().output.as_mut() {
+            // The redirect already ignores write errors, so a failing flush
+            // has nowhere useful to go: a broken pipe is not fatal to the run.
+            let _ = output.flush();
+        }
+    }
+
+    /// Stops tracing: clears accumulated entries, the count and the
+    /// redirect. Mirrors `TraceHook.stopTrace`.
     pub fn stop_trace(&self) {
         let mut inner = self.inner.borrow_mut();
         inner.entries.clear();
+        inner.count = 0;
         inner.output = None;
     }
 
@@ -208,13 +238,15 @@ impl CodeHook for TraceCodeHook {
 
         let line = format_trace_line(address, size, disassembly.as_deref());
 
-        {
-            if let Some(out) = self.inner.borrow_mut().output.as_mut() {
-                let _ = writeln!(out, "{line}");
-            }
+        let mut inner = self.inner.borrow_mut();
+        inner.count += 1;
+        if let Some(out) = inner.output.as_mut() {
+            let _ = writeln!(out, "{line}");
         }
-
-        self.inner.borrow_mut().entries.push(TraceEntry {
+        if !inner.collect {
+            return;
+        }
+        inner.entries.push(TraceEntry {
             pc: address,
             size,
             disassembly,
@@ -244,6 +276,11 @@ struct TraceMemoryInner {
     reads: Vec<MemTraceEvent>,
     writes: Vec<MemTraceEvent>,
     output: Option<Box<dyn Write + Send>>,
+    /// Whether events are retained; `false` streams straight to `output`.
+    collect: bool,
+    /// Accesses seen, whether or not they are collected.
+    read_count: u64,
+    write_count: u64,
 }
 
 impl TraceMemory {
@@ -255,6 +292,9 @@ impl TraceMemory {
                 reads: Vec::new(),
                 writes: Vec::new(),
                 output: None,
+                collect: true,
+                read_count: 0,
+                write_count: 0,
             })),
             collect_reads,
         }
@@ -266,11 +306,36 @@ impl TraceMemory {
         self.inner.lock().output = Some(output);
     }
 
-    /// Stops tracing; clears both lists and drops the redirect.
+    /// Whether accesses are retained in [`TraceMemory::reads`] and
+    /// [`TraceMemory::writes`].
+    ///
+    /// Turning this off makes the hooks stream: a long run writes its lines
+    /// straight to the redirect without the vectors growing, and
+    /// [`TraceMemory::counts`] still reports what the run saw.
+    pub fn set_collect(&self, collect: bool) {
+        self.inner.lock().collect = collect;
+    }
+
+    /// The `(reads, writes)` seen so far, collected or streamed.
+    pub fn counts(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        (inner.read_count, inner.write_count)
+    }
+
+    /// Flushes the redirect's buffered output, if it has any.
+    pub fn flush(&self) {
+        if let Some(output) = self.inner.lock().output.as_mut() {
+            let _ = output.flush();
+        }
+    }
+
+    /// Stops tracing; clears both lists, both counts and the redirect.
     pub fn stop_trace(&self) {
         let mut inner = self.inner.lock();
         inner.reads.clear();
         inner.writes.clear();
+        inner.read_count = 0;
+        inner.write_count = 0;
         inner.output = None;
     }
 
@@ -335,8 +400,12 @@ impl ReadHook for TraceMemoryReadHook {
         };
 
         let mut inner = self.inner.lock();
+        inner.read_count += 1;
         if let Some(out) = inner.output.as_mut() {
             let _ = writeln!(out, "R {:#x}: {:#x}={:#x}", pc, address, value);
+        }
+        if !inner.collect {
+            return;
         }
         inner.reads.push(event);
     }
@@ -357,8 +426,12 @@ impl WriteHook for TraceMemoryWriteHook {
         };
 
         let mut inner = self.inner.lock();
+        inner.write_count += 1;
         if let Some(out) = inner.output.as_mut() {
             let _ = writeln!(out, "W {:#x}: {:#x}={:#x}", pc, address, value);
+        }
+        if !inner.collect {
+            return;
         }
         inner.writes.push(event);
     }
@@ -380,6 +453,8 @@ impl AssemblyCodeDumper {
                 disassembler,
                 entries: Vec::new(),
                 output: None,
+                collect: true,
+                count: 0,
             })),
         }
     }

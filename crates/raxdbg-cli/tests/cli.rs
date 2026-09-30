@@ -82,6 +82,58 @@ fn trace_prints_the_instructions_it_ran() {
 }
 
 #[test]
+fn trace_functions_logs_the_calls_the_library_makes() {
+    let output = raxdbg(&[
+        "trace",
+        fixture("libctest.so").to_str().unwrap(),
+        "--call",
+        "hello()V",
+        "--functions",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    // The branch is inside `hello`, and its target is a PLT stub, which only
+    // the loader's relocation table can name. The count itself is left to the
+    // core tests: a rebuilt fixture may reach `fflush` by a tail call.
+    assert!(stdout.contains("libctest.so!hello+0x"), "{stdout}");
+    assert!(stdout.contains("-> 0x"), "{stdout}");
+    assert!(stdout.contains("libc.so!printf"), "{stdout}");
+    assert!(stdout.contains("calls --"), "{stdout}");
+}
+
+#[test]
+fn trace_out_writes_the_instruction_log_to_a_file() {
+    let log = std::env::temp_dir().join(format!("raxdbg-trace-{}.log", std::process::id()));
+    let output = raxdbg(&[
+        "trace",
+        fixture("libctest.so").to_str().unwrap(),
+        "--call",
+        "hello()V",
+        "--code",
+        "--out",
+        log.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("instructions (written to"), "{stdout}");
+    // With `--out` the instructions are streamed to the file, not the
+    // terminal: only the summary line is left on stdout.
+    assert!(!stdout.contains("[32]:"), "{stdout}");
+
+    let text = std::fs::read_to_string(&log).expect("the trace file");
+    assert!(text.contains("ret"), "the trace must contain a ret");
+    let lines = text.lines().count();
+    let reported: usize = stdout
+        .split("-- ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("no instruction count in {stdout:?}"));
+    assert_eq!(lines, reported, "the file must hold one line per instruction");
+    std::fs::remove_file(&log).ok();
+}
+
+#[test]
 fn leak_check_reports_the_live_mappings() {
     // The tracker is an `MMapListener`, exactly as unidbg's `MemoryTracker` is,
     // so it reports the guest address space's live regions rather than every

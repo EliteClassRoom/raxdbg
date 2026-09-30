@@ -345,7 +345,7 @@ q                quit";
 
 /// Runs a scripted or interactive console session for `debug <lib.so>`.
 pub fn debug_session(options: &Options, library: &str) -> Result<(), String> {
-    let emulator = boot(options, library)?;
+    let (emulator, _) = boot(options, library)?;
     if let Some(call) = options.call.as_ref().filter(|call| !call.signature.is_empty()) {
         preload_call(&emulator, call)?;
     }

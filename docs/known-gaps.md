@@ -492,6 +492,35 @@ returned an error. Check what the syscall immediately before the fault returned
 (the trace above shows a call at `0x120234a8`), and whether the arm32 handler
 answered it with something the guest would treat as a pointer.
 
+## How a run ends, and `exit` now stopping it
+
+`crates/raxdbg-backend-rax/src/run.rs` is the run loop, and it has exactly
+two kinds of exit. A clean stop is a `RunOutcome`; anything else is a
+`RunError` that unwinds.
+
+Clean stops: `Until` (PC reached `until` — how a normal `--call` ends, via
+the `LR` trap page), `Count`, `Timeout`, `Stopped` (a hook called
+`emu_stop`), `Idle` (`WFI`/`WFE` with nothing to do).
+
+Errors: `UnmappedMemory`, `StopEmulator`, `ThreadSwitch` (a blocking
+syscall parked), `PopContext` (a thread retired), `LongJump`, and
+`Backend(..)` for an unhandled `SVC`/`BRK`/undefined instruction or an
+internal rax error. A fault that a memory hook *reports fixed* is retried
+rather than raised, so an unmapped access only becomes an error when nothing
+handled it.
+
+**`exit`/`exit_group` used to do nothing at all.** The table's `exit` was an
+empty `fn` whose comment claimed the dispatch "turns this into a backend
+stop request via the `RunError::StopEmulator` path" — no such path existed,
+and nothing in the crate ever set a pending `StopEmulator`. A guest that
+called `exit(0)` therefore kept running, `ret`'d into the trap page as though
+`exit` were an ordinary function, and its caller read whatever was in `x0`.
+`UnixSyscallHandler` now carries `pending_exit`, the SVC dispatch turns it
+into `RunError::StopEmulator`, and the CLI reports it as
+`name() called exit()` rather than as a failure — which is what it is. This
+covers unidbg's `ARM64SyscallHandler.exit_group`, which calls
+`Backend.emu_stop()`. `crates/raxdbg-android/tests/exit_stops.rs`.
+
 ## P8 handoff: the replace hook works for a direct call
 
 `crates/raxdbg-android/src/hook/replace.rs` is the engine-independent half of
@@ -549,12 +578,18 @@ work should follow:
    with 16-byte alignment, arm32 takes `r1..r3` then the stack with unidbg's
    padding rule. `call_function` in `emulator.rs` already sets `x0` and aligns
    the stack, so this is the same shape.
-4. `dvm/jni_table.rs` — the `JNIEnv` table in the SVC page: 232 pointer-sized
+4. `dvm/jni_table.rs` — the `JNIEnv` table in the SVC page: 234 pointer-sized
    slots, each implemented slot written with the address
-   `SvcMemory::register_svc` returns for that JNI function, and unimplemented
-   slots holding their own index as a bogus pointer (which is how unidbg makes
-   an unimplemented slot obvious). `JavaVM` is an 8-slot table with
-   `AttachCurrentThread` (4) and `GetEnv` (6).
+   `SvcMemory::register_svc` returns for that JNI function. **Unimplemented
+   slots must not hold their own index as a "bogus pointer"** — the plan
+   originally said that, and it is wrong: `index * 8` is an *unmapped*
+   address, so a guest that calls an unimplemented function faults on the
+   `blr` into the table rather than on the work it wanted done. Each
+   unimplemented slot now gets its own stub that records the call in
+   `Vm::unimplemented()` and answers 0, which is what turns "this library
+   needs a JNI function this port lacks" into a report rather than a crash.
+   `JavaVM` is an 8-slot table with `AttachCurrentThread` (4) and `GetEnv`
+   (6).
 5. `dvm/jni.rs` — the `Jni` trait and its defaults, ported from
    `AbstractJni`/`FallbackJni`; the fixture needs `FindClass`,
    `GetStaticMethodID` (returning a method whose `CallStaticIntMethod` answers

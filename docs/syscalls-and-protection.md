@@ -31,7 +31,7 @@ What that tells you before you run anything:
 | 2 unresolved relocations | loader | `AAsset_seek64` / `AAsset_isAllocated` are not implemented; anything reaching them fails |
 
 The `AAsset_*` family is Android's APK asset API. Its absence from the
-bundled `libandroid.so` is a real gap — see §7.
+bundled `libandroid.so` is a real gap — see §8.
 
 ---
 
@@ -154,7 +154,69 @@ handling is in unidbg (`ARM32SyscallHandler.BIONIC_PR_SET_VMA@7f5da98e`).
 
 ---
 
-## 5. Reaching the protection: `JNI_OnLoad`
+## 5. What makes a run stop
+
+Every run ends one of two ways: a **clean stop** (`RunOutcome`) or an
+**error** (`RunError`). The run loop is `crates/raxdbg-backend-rax/src/run.rs`;
+these are all the exits it has.
+
+### Clean stops — the run finished
+
+| Outcome | Cause |
+|---|---|
+| `Until` | PC reached the `until` address. **This is how a normal `--call` ends.** `call_function` sets `LR` to the trap page (`0x7ffff0000` arm64, `0xffff0000` arm32) — a page of `svc #0` mapped read+exec — and passes the same address as `until`. The guest's `ret` lands there, `pc == until`, and the run ends. The instruction at `until` never runs. |
+| `Count` | The instruction budget ran out (`count != 0`). |
+| `Timeout` | The host-time deadline ran out. Checked every 1024 instructions, not per instruction. |
+| `Stopped` | A hook called `emu_stop()` — a breakpoint, or the console debugger's `step`/`continue`. |
+| `Idle` | The guest executed a `WFI`/`WFE` with nothing left to do. How a thread with no work yields. |
+
+### Errors — something went wrong
+
+| `RunError` | Cause |
+|---|---|
+| `UnmappedMemory` | The guest touched memory that is not mapped and no hook fixed it. **The most common one**, and the message names the address, the size, and the PC. A memory hook that *reports* the fault fixed makes the loop retry the instruction, so an unmapped access only becomes an error when nothing handled it. |
+| `StopEmulator` | The guest called `exit`/`exit_group`. A clean end in substance; the CLI prints `name() called exit()` rather than treating it as a failure. |
+| `ThreadSwitch` | A blocking syscall (`futex` wait, `nanosleep`, `pthread_join`) parked the thread. The dispatcher saves the context and runs somebody else. The caller sees it in the return value, not as a failure. |
+| `PopContext` | The running thread finished — its `lr` reached the exit stub, or it joined. Retires the task. |
+| `LongJump` | A guest `setjmp`/`longjmp`. |
+| `Backend(..)` | The backend itself failed: an unhandled `SVC`, an undefined instruction, a `BRK` no hook claimed, re-entering `emu_start`, or an internal rax error. |
+
+### Reading a fault
+
+The three fields in `UnmappedMemory` are the whole diagnosis:
+
+```
+unmapped memory access at 0x30 (size 0) from pc 0x12126e54
+                         │         │         │
+                         │         │         └── the faulting instruction
+                         │         └──────────── access width; 0 when rax
+                         │                      does not report one
+                         └────────────────────── the address the guest wanted
+```
+
+The address tells you *what* the guest was reaching for:
+
+* **A small offset like `0x30` or `0x6d8`** — the guest dereferenced NULL (or a
+  near-null handle) plus a field offset. `0x30` is the 7th word of a null
+  `JNIEnv*`; `0x6d8` was an unimplemented JNI table slot. These are missing
+  *emulation*, not a bug in the guest.
+* **A plausible guest address** — the region was never mapped. Check
+  `raxdbg info` for the base it was loaded at, and `--root` if it is a path
+  the loader should have resolved.
+* **A huge or garbled value** — usually a *value* used as a pointer, which
+  means the guest decoded something wrongly. `0x10006` in §6 is exactly that:
+  `JNI_VERSION_1_6` read as an address.
+
+### Stopping on purpose
+
+A faulting instruction can be retried rather than fatal, which is how a
+memory hook answers an unmapped access by mapping it. That is the mechanism
+behind a breakpoint: the hook stops the context, the run returns
+`Stopped`, and the caller inspects the registers.
+
+---
+
+## 6. Reaching the protection: `JNI_OnLoad`
 
 `JNI_OnLoad` is the only export, so it is the only way in:
 
@@ -186,7 +248,7 @@ JNI_OnLoad: libjnitest.so returned 0x10006 (JNI version)
 
 ---
 
-## 6. What this library actually is
+## 7. What this library actually is
 
 The fault is the useful part. Strings in the binary:
 
@@ -231,7 +293,7 @@ parenthesised signature means a Java method that needs the `dvm` runtime.)
 
 ---
 
-## 7. Gaps this run exposed
+## 8. Gaps this run exposed
 
 Recorded here rather than in `docs/known-gaps.md`, because they are
 specific to this binary:
@@ -244,7 +306,7 @@ specific to this binary:
 
 2. **No DEX/ART runtime.** `Vm` models JNI references and a class table;
    it does not parse `classes.dex` or execute bytecode. This is the hard
-   blocker for §5.
+   blocker for §6.
 
 3. **`/proc/self/status` is absent** from the bundled `libs/android/sdk23/proc/`
    tree (only `proc/stat` is there). A `TracerPid` check that opens it gets
@@ -257,7 +319,7 @@ specific to this binary:
 
 ---
 
-## 8. Command reference
+## 9. Command reference
 
 ```console
 raxdbg <command> <lib.so> [options]
@@ -305,7 +367,7 @@ $ raxdbg syscalls target.so --jni-on-load -v
 
 ---
 
-## 9. Using it from Rust
+## 10. Using it from Rust
 
 The same trace is available as a library, for driving a library
 programmatically:

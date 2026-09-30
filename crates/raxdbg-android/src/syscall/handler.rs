@@ -183,6 +183,16 @@ pub struct UnixSyscallHandler {
     /// SVC dispatch turns it into `RunError::ThreadSwitch` — plan D5's rule that
     /// control flow is a value returned up the stack.
     pending_switch: Cell<bool>,
+    /// The status the guest last passed to `exit`/`exit_group`, or `None`
+    /// when it has not.
+    ///
+    /// The table's `exit` is `&self` and has no backend to stop, so it
+    /// records the request here and the SVC dispatch acts on it, exactly
+    /// as it does for [`Self::request_switch`].
+    ///
+    /// Port of unidbg: `ARM64SyscallHandler.exit_group`@7f5da98e, which
+    /// calls `Backend.emu_stop()`.
+    pending_exit: Cell<Option<i32>>,
 }
 
 impl std::fmt::Debug for UnixSyscallHandler {
@@ -208,6 +218,7 @@ impl UnixSyscallHandler {
             is_64bit,
             waiters: Rc::new(Waiters::new()),
             pending_switch: Cell::new(false),
+            pending_exit: Cell::new(None),
         }
     }
 
@@ -228,6 +239,16 @@ impl UnixSyscallHandler {
     /// Takes the switch request, if a syscall made one.
     pub fn take_switch_request(&self) -> bool {
         self.pending_switch.replace(false)
+    }
+
+    /// Records that the guest asked to exit with `status`.
+    pub fn request_exit(&self, status: i32) {
+        self.pending_exit.set(Some(status));
+    }
+
+    /// Takes the exit request, if a syscall made one.
+    pub fn take_exit_request(&self) -> Option<i32> {
+        self.pending_exit.replace(None)
     }
 
     /// Whether the guest is 64-bit.
