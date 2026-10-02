@@ -42,7 +42,25 @@ pub const JNI_ABORT: i32 = 2;
 /// 32-bit terms, which is `4 * 233`.
 pub const JNI_TABLE_LAST: usize = 233;
 /// The last `JavaVM` slot.
+///
+/// The `JNIInvokeInterface_` has eight entries: 0-2 reserved, 3
+/// `DestroyJavaVM`, 4 `AttachCurrentThread`, 5 `DetachCurrentThread`, 6
+/// `GetEnv` and 7 `AttachCurrentThreadAsDaemon` (JDK 21 invocation spec).
+/// 7 is the last, and nothing beyond it exists.
 pub const JAVA_VM_TABLE_LAST: usize = 7;
+
+/// The `JavaVM` functions this port names a stub for, by slot.
+///
+/// Each is `name`, `slot`. A guest that calls one lands on a stub rather than
+/// on the `index * 8` placeholder the table is filled with, and the call log
+/// prints the name instead of an offset.
+const JAVA_VM_SLOTS: &[(usize, &str)] = &[
+    (3, "DestroyJavaVM"),
+    (4, "AttachCurrentThread"),
+    (5, "DetachCurrentThread"),
+    (6, "GetEnv"),
+    (7, "AttachCurrentThreadAsDaemon"),
+];
 
 /// The JNI functions this port implements, and the slot each occupies.
 ///
@@ -662,12 +680,12 @@ impl Vm {
         }
 
         for function in JniFunc::ALL {
-            let stub = JniFunction {
+            let stub = JniFunction::new(
                 function,
-                vm: this_weak.clone(),
-                memory: Rc::clone(&vm.memory),
-                is_64bit: vm.is_64bit,
-            };
+                this_weak.clone(),
+                Rc::clone(&vm.memory),
+                vm.is_64bit,
+            );
             let (address, _number) = vm
                 .svc
                 .register_svc_numbered(vm.memory.as_ref(), Box::new(stub))?;
@@ -696,17 +714,22 @@ impl Vm {
             vm.write_pointer(env_table, index, address)?;
         }
 
-        // `JavaVM`'s `GetEnv` is slot 6; `AttachCurrentThread` (slot 4) answers
-        // the same environment, which is enough for a single-threaded guest.
-        let stub = JavaVmFunction {
-            vm: this_weak.clone(),
-            is_64bit: vm.is_64bit,
-        };
-        let (address, _number) = vm
-            .svc
-            .register_svc_numbered(vm.memory.as_ref(), Box::new(stub))?;
-        vm.write_pointer(vm_table, 6, address)?;
-        vm.write_pointer(vm_table, 4, address)?;
+        // Every named `JavaVM` function gets a stub of its own. A shared stub
+        // would report as the generic "JavaVM" in a call log, which tells a
+        // reader nothing; naming each one is what makes the log say `GetEnv`.
+        // They all answer `JNI_OK` and, for the two that take an out-pointer,
+        // hand back the `JNIEnv`.
+        for (slot, name) in JAVA_VM_SLOTS {
+            let stub = JavaVmFunction {
+                vm: this_weak.clone(),
+                is_64bit: vm.is_64bit,
+                label: format!("JavaVM!{name}"),
+            };
+            let (address, _number) = vm
+                .svc
+                .register_svc_numbered(vm.memory.as_ref(), Box::new(stub))?;
+            vm.write_pointer(vm_table, *slot, address)?;
+        }
         Ok(())
     }
 
@@ -782,11 +805,30 @@ impl Vm {
 }
 
 /// The `JNIEnv` slot stub: every JNI function is one of these.
+///
+/// The stub is named `JNIEnv!<function>` so a call log distinguishes it from
+/// the `JavaVM` entry points, which have the same signatures and different
+/// behaviour.
 struct JniFunction {
     function: JniFunc,
     vm: Weak<RefCell<Vm>>,
     memory: Rc<raxdbg_core::memory::loader::Loader>,
     is_64bit: bool,
+    /// `<table>!<function>`, owned because it is built once at registration.
+    label: String,
+}
+
+impl JniFunction {
+    fn new(function: JniFunc, vm: Weak<RefCell<Vm>>, memory: Rc<raxdbg_core::memory::loader::Loader>, is_64bit: bool) -> Self {
+        let label = format!("JNIEnv!{}", function.name());
+        Self {
+            function,
+            vm,
+            memory,
+            is_64bit,
+            label,
+        }
+    }
 }
 
 impl Svc for JniFunction {
@@ -809,24 +851,50 @@ impl Svc for JniFunction {
     }
 
     fn name(&self) -> &str {
-        self.function.name()
+        &self.label
     }
 }
 
-/// The `JavaVM` slot stub: `GetEnv` and `AttachCurrentThread`.
+/// The `JavaVM` slot stub: `DestroyJavaVM`, `AttachCurrentThread`,
+/// `DetachCurrentThread`, `GetEnv` and `AttachCurrentThreadAsDaemon`.
+///
+/// One stub per slot rather than one shared, so that a call log names the
+/// function the guest called instead of the table it called through.
 struct JavaVmFunction {
     vm: Weak<RefCell<Vm>>,
     is_64bit: bool,
+    /// `JavaVM!<function>`, owned because it is built once at registration.
+    label: String,
+}
+
+impl JavaVmFunction {
+    /// Whether this entry point takes no out-pointer.
+    ///
+    /// `DetachCurrentThread` and `DestroyJavaVM` return a status and nothing
+    /// else; the other three hand back a `JNIEnv`.
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.label.as_str(),
+            "JavaVM!DetachCurrentThread" | "JavaVM!DestroyJavaVM"
+        )
+    }
 }
 
 impl Svc for JavaVmFunction {
     fn handle(&mut self, backend: &mut dyn Backend) -> Result<i64, RunError> {
+        if self.is_terminal() {
+            // Neither takes an out-pointer: detaching reports success, and
+            // destroying the emulated VM is not something a guest may do --
+            // it would end the run the caller is in the middle of.
+            return Ok(JNI_OK as i64);
+        }
         let Some(vm) = self.vm.upgrade() else {
             return Ok(0);
         };
         let vm = vm.borrow();
-        // `(*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6)`: x1 is the out
-        // pointer, x2 the requested version.
+        // `GetEnv(vm, void **p_env, jint version)` and
+        // `AttachCurrentThread(vm, void **p_env, void *args)` share a shape:
+        // x1 is the out-pointer, x2 the requested version for `GetEnv`.
         let out = arg(backend, self.is_64bit, 0);
         let requested = arg(backend, self.is_64bit, 1) as i32;
         if out != 0 {
@@ -834,7 +902,7 @@ impl Svc for JavaVmFunction {
                 .map_err(RunError::Backend)?;
         }
         // A version the VM does not provide is `JNI_EVERSION` (-3).
-        if requested != 0 && requested != vm.jni_version() {
+        if self.label == "JavaVM!GetEnv" && requested != 0 && requested != vm.jni_version() {
             return Ok(-3);
         }
         Ok(JNI_OK as i64)
@@ -849,7 +917,7 @@ impl Svc for JavaVmFunction {
     }
 
     fn name(&self) -> &str {
-        "JavaVM"
+        &self.label
     }
 }
 
@@ -1084,8 +1152,10 @@ fn dispatch(
         }
         JniFunc::ExceptionCheck => Ok(i64::from(vm.has_exception())),
         JniFunc::GetJavaVM => {
-            // `(*env)->GetJavaVM(env, &vm)`: x1 is the caller's out-pointer.
-            let out = arg(backend, is_64bit, 1);
+            // `(*env)->GetJavaVM(JNIEnv **vm)`. A `JNIEnv` function's arguments
+            // start at `x1` -- `x0` is the environment the table was read from,
+            // which is what `arg(0)` returns -- so the out-pointer is `arg(0)`.
+            let out = arg(backend, is_64bit, 0);
             if out != 0 {
                 write_word(backend, is_64bit, out, vm.java_vm(), pointer_size)
                     .map_err(RunError::Backend)?;
@@ -1153,7 +1223,7 @@ impl Svc for UnimplementedJniFunction {
     }
 
     fn name(&self) -> &str {
-        "UnimplementedJni"
+        "JNIEnv!<unimplemented>"
     }
 }
 

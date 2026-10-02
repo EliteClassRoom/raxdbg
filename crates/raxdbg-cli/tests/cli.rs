@@ -96,7 +96,11 @@ fn trace_functions_logs_the_calls_the_library_makes() {
     // the loader's relocation table can name. The count itself is left to the
     // core tests: a rebuilt fixture may reach `fflush` by a tail call.
     assert!(stdout.contains("libctest.so!hello+0x"), "{stdout}");
-    assert!(stdout.contains("-> 0x"), "{stdout}");
+    // Addresses print module-relative, so the log can be read against the
+    // binary itself rather than against one particular load base. The callee
+    // is a PLT stub, so it belongs to the calling module even though the
+    // function it reaches is libc's.
+    assert!(stdout.contains("libctest.so+0x"), "{stdout}");
     assert!(stdout.contains("libc.so!printf"), "{stdout}");
     assert!(stdout.contains("calls --"), "{stdout}");
 }
@@ -130,6 +134,47 @@ fn trace_out_writes_the_instruction_log_to_a_file() {
         .and_then(|count| count.parse().ok())
         .unwrap_or_else(|| panic!("no instruction count in {stdout:?}"));
     assert_eq!(lines, reported, "the file must hold one line per instruction");
+    std::fs::remove_file(&log).ok();
+}
+
+#[test]
+fn trace_runs_jni_on_load_and_logs_the_calls_it_makes() {
+    // `JNI_OnLoad` takes a `JavaVM*`, so a bare `--call` would pass zeroes and
+    // the guest would fault on the first dereference. With `--jni-on-load` the
+    // VM supplies the pointer, and the function trace covers the whole call.
+    let log = std::env::temp_dir().join(format!("raxdbg-jni-{}.log", std::process::id()));
+    let output = raxdbg(&[
+        "trace",
+        fixture("libjnitest.so").to_str().unwrap(),
+        "--jni-on-load",
+        "--functions",
+        "--out",
+        log.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("calls (written to"), "{stdout}");
+
+    let text = std::fs::read_to_string(&log).expect("the call log");
+    assert!(text.contains("\ncall "), "the log must name the calls:\n{text}");
+    // A host service on the SVC page belongs to no ELF, so the loader cannot
+    // name it -- but the stub page labels every allocation, and that label is
+    // the function's name. Without it these come out as bare offsets.
+    assert!(
+        text.contains("JNIEnv!GetJavaVM") || text.contains("JNIEnv!FindClass"),
+        "host services must be named, not shown as offsets:\n{text}"
+    );
+    // A stub whose name contains a dot must survive label parsing whole: the
+    // dispatch number is a trailing `.<digits>`, and a name like
+    // `JNIEnv!<unimplemented>` is not cut at its own punctuation.
+    for line in text.lines() {
+        if let Some(name) = line.rsplit("-> ").nth(1) {
+            assert!(
+                !name.contains("<unimplemented"),
+                "a stub name was truncated at a dot: {line}"
+            );
+        }
+    }
     std::fs::remove_file(&log).ok();
 }
 

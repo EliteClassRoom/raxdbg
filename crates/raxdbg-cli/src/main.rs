@@ -74,7 +74,7 @@ options:
   --out <file>           (trace) write the trace lines there instead of this terminal
   -v                     (syscalls) also print the syscalls that carry a path
   -vv                    (syscalls) print every syscall
-  --jni-on-load          (syscalls) run the library's JNI_OnLoad first
+  --jni-on-load          (syscalls, trace) run the library's JNI_OnLoad first
   --leak-check          report live allocations when the run finishes
   --seed <n>            seed the random source, for reproducibility
   --stdout <file>       write the guest's stdout there instead of this terminal
@@ -212,8 +212,11 @@ fn run_jni_on_load(emulator: &Rc<AndroidEmulator>, library: &str) -> Option<Stri
                 .map(|name| name.to_string_lossy().into_owned())
         })?;
     match Vm::call_jni_on_load(emulator, &vm, &module) {
-        Ok(version) => Some(report(format!("{module} returned 0x{version:x} (JNI version)"))),
-        Err(error) => Some(report(format!("{module}: {error}"))),
+        Ok(version) => {
+            let shown = display_name(&emulator.loader(), &module);
+            Some(report(format!("{shown} returned 0x{version:x} (JNI version)")))
+        }
+        Err(error) => Some(report(format!("{}: {error}", display_name(&emulator.loader(), &module)))),
     }
 }
 
@@ -301,9 +304,17 @@ fn info(options: &Options, library: &str) -> Result<(), String> {
     let (emulator, _) = boot(options, library)?;
     let loader = emulator.loader();
     for module in loader.module_infos() {
+        // The file the module came from leads, with the name it answers to in
+        // brackets: a packed binary's `DT_SONAME` bears no relation to the
+        // file, and a reader who typed one wants to see the other.
+        let label = if module.file == module.name {
+            module.name.clone()
+        } else {
+            format!("{} [{}]", module.file, module.name)
+        };
         println!(
             "{} base=0x{:x} size=0x{:x} entry=0x{:x} init={} refs={}",
-            module.name,
+            label,
             module.base,
             module.size,
             module.entry_point,
@@ -341,8 +352,14 @@ fn execute(options: &Options, library: &str) -> Result<(), String> {
 
     let tracker = emulator.memory().tracker();
 
-    let result = match &options.call {
-        Some(call) => {
+    // A packed JNI library has one entry point, `JNI_OnLoad`, and it needs a
+    // real `JavaVM*` -- a bare `--call` passes zeroes and the guest faults on
+    // the first dereference. With `--jni-on-load` the VM supplies that pointer
+    // and the run covers the unpack instead of the crash.
+    let jni_target = options.jni_on_load.then_some(module.as_str());
+
+    let result = match (&options.call, jni_target) {
+        (Some(call), _) => {
             let address = resolve_callable(&emulator, call)?;
             let trace = Trace::attach(options, &emulator, &module)?;
             // A guest that called `exit` ended on purpose. That is a normal
@@ -360,7 +377,17 @@ fn execute(options: &Options, library: &str) -> Result<(), String> {
             }
             outcome
         }
-        None => None,
+        (None, Some(module_name)) => {
+            // The trace is installed before the call, so `JNI_OnLoad` and
+            // everything it reaches is inside it.
+            let trace = Trace::attach(options, &emulator, &module_name)?;
+            let outcome = run_jni_on_load(&emulator, library);
+            if let Some(trace) = trace {
+                trace.report();
+            }
+            outcome
+        }
+        (None, None) => None,
     };
 
     let stdout = emulator.stdout().contents();
@@ -572,12 +599,18 @@ struct CallLog {
 
 impl FunctionCallListener for CallLog {
     fn on_call(&mut self, backend: &mut dyn Backend, call: &FunctionCall) {
+        // Addresses print relative to the module that owns them, the way a
+        // disassembler and a map file do. An absolute address carries the load
+        // base, which changes between runs and between ABIs, so it cannot be
+        // pasted into IDA next to the binary; the RVA can. An address with no
+        // module -- a host service on the SVC page -- prints as `-` rather
+        // than as a bare offset that looks like it belongs to nothing.
         let _ = writeln!(
             self.out,
-            "call 0x{:x} {} -> 0x{:x} {}",
-            call.caller,
+            "call {} {} -> {} {}",
+            at(&self.loader, call.caller),
             name_caller(&self.loader, call.caller),
-            call.callee,
+            at(&self.loader, call.callee),
             name_callee(&self.loader, self.is_64bit, backend, call.callee),
         );
     }
@@ -587,19 +620,83 @@ impl FunctionCallListener for CallLog {
     }
 }
 
+/// An address as `file+0xoffset`, or `-` when no module owns it.
+fn at(loader: &raxdbg_android::elf::AndroidElfLoader, address: u64) -> String {
+    // The stub page holds host services, not ELF code, but a virtual module's
+    // span is page-aligned around its exports and can cover it -- so an SVC
+    // address is checked before the module table, or every JNI call would be
+    // attributed to whichever stub module happens to sit next to it.
+    if let Some(svc) = loader.svc_memory() {
+        if address >= svc.base() && address < svc.base() + svc.size() {
+            return "-".to_string();
+        }
+    }
+    match loader.find_module_by_address(address) {
+        Some(info) => format!(
+            "{}+0x{:x}",
+            display_name(loader, &info.name),
+            address.wrapping_sub(info.base)
+        ),
+        None => "-".to_string(),
+    }
+}
+
+/// The name to show a reader for a module loaded under `name`.
+///
+/// A packed binary declares a `DT_SONAME` that has nothing to do with the file
+/// it was built into -- `libapk_android_a64.so` is loaded from
+/// `l1296851e_a64.so` -- and a reader who typed the file name wants to see that
+/// name back. The SONAME stays the module's identity for the guest's `dlsym`;
+/// only the label a human reads changes.
+fn display_name(loader: &raxdbg_android::elf::AndroidElfLoader, name: &str) -> String {
+    loader
+        .module_infos()
+        .into_iter()
+        .find(|info| info.name == name)
+        .map(|info| info.file)
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// A stub's label without its dispatch number.
+///
+/// The label is `<table>!<function>.<number>`, and the number says nothing to
+/// a reader. Only a trailing `.<digits>` is removed, because a name may itself
+/// contain a dot -- `JNIEnv!<unimplemented>` does.
+fn stub_name(label: &str) -> &str {
+    match label.rsplit_once('.') {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => label,
+    }
+}
+
 /// Names the address of a branch instruction, which sits *inside* a function
 /// and so is named by the nearest symbol below it.
 fn name_caller(loader: &raxdbg_android::elf::AndroidElfLoader, address: u64) -> String {
+    // A branch inside a host service has no ELF symbol either, but the stub
+    // page still knows which service it is in.
+    if let Some(svc) = loader.svc_memory() {
+        if let Some(region) = svc.find_region(address) {
+            let name = stub_name(&region.label);
+            if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+                return format!("{name}+0x{:x}", address.wrapping_sub(region.begin));
+            }
+        }
+    }
+    // A branch the symbol table does not name is a branch in a stripped
+    // function, and its RVA is already printed in the address column; adding
+    // the absolute address back would only repeat the same information in a
+    // form that cannot be pasted into a disassembler.
     match loader.find_closest_symbol(address) {
         Some(symbol) => match symbol.module {
             Some(module) => format!(
-                "{module}!{}+0x{:x}",
+                "{}!{}+0x{:x}",
+                display_name(loader, &module),
                 symbol.name,
                 address.wrapping_sub(symbol.address)
             ),
-            None => format!("0x{address:x}"),
+            None => "?".to_string(),
         },
-        None => format!("0x{address:x}"),
+        None => "?".to_string(),
     }
 }
 
@@ -614,10 +711,26 @@ fn name_callee(
     backend: &mut dyn Backend,
     address: u64,
 ) -> String {
+    // A host service on the SVC page -- a JNIEnv or JavaVM function, a libdl
+    // trampoline, a system-property getter -- is not part of any ELF, so the
+    // loader cannot name it. But the stub page labels every allocation, and
+    // the label is the function's real name: `GetJavaVM`, `AAsset_close`.
+    // This comes before the module lookup because a stub can fall inside a
+    // virtual module's page-aligned span and be misattributed to it.
+    if let Some(svc) = loader.svc_memory() {
+        if let Some(region) = svc.find_region(address) {
+            // `JNIEnv!FindClass` / `JavaVM!GetEnv`: the table a stub belongs to
+            // is what tells the two apart, since both have the same shape.
+            let name = stub_name(&region.label);
+            if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+                return name.to_string();
+            }
+        }
+    }
     if let Some(symbol) = loader.find_closest_symbol(address) {
         if symbol.address == address {
             if let Some(module) = &symbol.module {
-                return format!("{module}!{}", symbol.name);
+                return format!("{}!{}", display_name(loader, module), symbol.name);
             }
         }
     }
@@ -625,16 +738,15 @@ fn name_callee(
         if let Some(slot) = plt_got_slot(backend, address) {
             if let Some(symbol) = loader.relocation_symbol(slot) {
                 return match &symbol.module {
-                    Some(module) => format!("{module}!{}", symbol.name),
+                    Some(module) => format!("{}!{}", display_name(loader, module), symbol.name),
                     None => symbol.name,
                 };
             }
         }
     }
-    match loader.find_module_by_address(address) {
-        Some(info) => format!("{}+0x{:x}", info.name, address.wrapping_sub(info.base)),
-        None => format!("0x{address:x}"),
-    }
+    // Nothing named it: the address column already carries the RVA, so say
+    // only that there is no name here rather than repeating the offset.
+    "?".to_string()
 }
 
 /// The GOT slot an AArch64 PLT stub loads its target from, if `address` is one.
@@ -700,7 +812,10 @@ fn report_leaks(emulator: &Rc<AndroidEmulator>, tracker: &Rc<MemoryTracker>) {
         for pc in &record.guest_backtrace {
             match symbols.resolve(*pc) {
                 Some((module, function, offset)) => {
-                    println!("    {module}!{function}+{offset:#x} ({pc:#x})")
+                    println!(
+                        "    {}!{function}+{offset:#x} ({pc:#x})",
+                        display_name(&symbols.loader, &module)
+                    )
                 }
                 None => println!("    {pc:#x}"),
             }

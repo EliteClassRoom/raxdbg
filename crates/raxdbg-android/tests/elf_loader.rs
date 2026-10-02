@@ -130,6 +130,12 @@ fn synthetic_library_maps_relocates_and_registers() {
 
     assert_eq!(module, "libsynthetic.so");
     let info = loader.module("libsynthetic.so").expect("module");
+    // `ModuleInfo::file` is the file the module was loaded from, kept
+    // separately from the name it answers to. This synthetic library declares
+    // no SONAME distinct from its own name, so the two agree here; a packed
+    // binary is the case that matters, where `file` is the file on disk and
+    // `name` is the `DT_SONAME` the guest's `dlsym` uses.
+    assert_eq!(info.file, "libsynthetic.so");
     assert!(info.base >= 0x1200_0000, "the module is mapped above MMAP_BASE");
     assert_eq!(info.base % 0x1000, 0, "the base is page-aligned");
     assert!(info.size >= 0x1000);

@@ -4,3 +4,5 @@
 /reference/rax-src
 
 test_lib/
+
+*.log

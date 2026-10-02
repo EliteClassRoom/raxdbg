@@ -161,6 +161,14 @@ impl Module {
     ///
     /// Port of unidbg: `Module.findClosestSymbolByAddress`.
     pub fn find_closest_symbol(&self, address: u64) -> Option<Symbol> {
+        // A virtual module has no ELF symbol table: its exports live in
+        // `hook_map` as `name -> address`, so the address-ordered search below
+        // has nothing to walk. Without this branch every call into a stub --
+        // `AAsset_getBuffer`, a system-property getter -- is reported as a
+        // bare offset, which is exactly the name the module exists to supply.
+        if self.is_virtual {
+            return self.find_closest_virtual_symbol(address);
+        }
         let offset = address.checked_sub(self.base)?;
         if offset == 0 {
             return None;
@@ -191,6 +199,22 @@ impl Module {
             symbol.size,
             Some(self.name.clone()),
         ))
+    }
+
+    /// The virtual export nearest below `address`.
+    ///
+    /// `hook_map` is keyed by name and its values are absolute addresses, so
+    /// the nearest one is found by scanning rather than by binary search. A
+    /// virtual module has a handful of entries, so the scan costs nothing and
+    /// keeps the ordering explicit.
+    fn find_closest_virtual_symbol(&self, address: u64) -> Option<Symbol> {
+        self.hook_map
+            .iter()
+            .filter(|(_, entry)| **entry <= address)
+            .max_by_key(|(name, entry)| (**entry, (*name).clone()))
+            .map(|(name, entry)| {
+                Symbol::new(name.clone(), *entry, 0, Some(self.name.clone()))
+            })
     }
 
     /// Every defined symbol this module exports.
@@ -266,5 +290,35 @@ mod tests {
         assert_eq!(symbol.address, 0x2000);
 
         assert!(module.relocation_symbol(0x2001).is_none());
+    }
+
+    /// A virtual module's exports live in `hook_map`, not a symbol table, so
+    /// without consulting it every stub call reports as a bare offset.
+    #[test]
+    fn a_virtual_module_names_its_stubs_by_address() {
+        let mut symbols = std::collections::BTreeMap::new();
+        symbols.insert("AAssetManager_fromJava".to_string(), 0xfffe_1118);
+        symbols.insert("AAssetManager_open".to_string(), 0xfffe_1120);
+        symbols.insert("AAsset_close".to_string(), 0xfffe_1128);
+        let module = Module::virtual_module(0xfffe_1000, 0x1000, "libandroid.so", symbols);
+
+        let exact = module
+            .find_closest_symbol(0xfffe_1120)
+            .expect("an exact stub address names its export");
+        assert_eq!(exact.name, "AAssetManager_open");
+        assert_eq!(exact.address, 0xfffe_1120);
+        assert_eq!(exact.module.as_deref(), Some("libandroid.so"));
+
+        // An address past the last export still names the nearest one below,
+        // which is what a call log prints as `name+0x..`.
+        let after = module
+            .find_closest_symbol(0xfffe_1130)
+            .expect("a later address falls back to the nearest export");
+        assert_eq!(after.name, "AAsset_close");
+
+        assert!(
+            module.find_closest_symbol(0xfffe_1110).is_none(),
+            "an address below the first export names nothing"
+        );
     }
 }

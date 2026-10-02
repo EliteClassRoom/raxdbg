@@ -126,7 +126,18 @@ struct Alignment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleInfo {
     /// The module's name.
+    ///
+    /// This is the `DT_SONAME` when the file declares one, which for a packed
+    /// binary bears no relation to the file on disk -- `libapk_android_a64.so`
+    /// loads from `l1296851e_a64.so`. It is what the guest's `dlsym` answers
+    /// to, so it stays the module's identity; [`ModuleInfo::file`] is what a
+    /// reader wants to see.
     pub name: String,
+    /// The file the module was loaded from, by name.
+    ///
+    /// Equal to [`ModuleInfo::name`] for a library that was not renamed by its
+    /// own `DT_SONAME`.
+    pub file: String,
     /// Its base address.
     pub base: u64,
     /// Its span.
@@ -638,6 +649,14 @@ impl AndroidElfLoader {
             .values()
             .map(|module| ModuleInfo {
                 name: module.name.clone(),
+                // The file the module came from, which is not the SONAME a
+                // packed binary declares. A virtual module has no file, and
+                // its name is the only handle on it.
+                file: module
+                    .regions
+                    .first()
+                    .map(|region| region.file.clone())
+                    .unwrap_or_else(|| module.name.clone()),
                 base: module.base,
                 size: module.size,
                 entry_point: module.entry_point,

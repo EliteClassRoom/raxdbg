@@ -10,8 +10,12 @@ use std::rc::Rc;
 
 use raxdbg_android::android_file::ElfLibraryFile;
 use raxdbg_android::dvm::vm::JniError;
-use raxdbg_android::dvm::{DvmClass, DvmMethod, DvmObject, Jni, JNI_VERSION_1_6, Vm};
+use raxdbg_android::dvm::{
+    DvmClass, DvmMethod, DvmObject, Jni, JNI_OK, JNI_VERSION_1_6, Vm,
+};
 use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder};
+use raxdbg_core::backend::Prot;
+use raxdbg_core::memory::{Memory, MAP_ANONYMOUS};
 
 /// The fixture's class, as the guest names it.
 const CLASS: &str = "com/raxdbg/test/JniTest";
@@ -109,6 +113,216 @@ fn the_vm_builds_a_jni_env_and_java_vm() {
         vm.jni_env() >= svc_base && vm.jni_env() < svc_end,
         "JNIEnv {:#x} is not in the SVC page",
         vm.jni_env()
+    );
+}
+
+/// `GetJavaVM` is JNIEnv slot 219 (`(*env)->GetJavaVM(env, &vm)`), and it is
+/// the first call a packed library makes. This reads the slot straight out of
+/// the table the way the guest does, so it fails if the slot is ever left as
+/// the unmapped placeholder again.
+#[test]
+fn get_java_vm_answers_through_the_jni_env_table() {
+    let fixture = Fixture::boot();
+    let vm = fixture.vm.borrow();
+    let java_vm = vm.java_vm();
+
+    let table = fixture
+        .emulator
+        .memory()
+        .pointer(vm.jni_env())
+        .read_pointer(0)
+        .expect("the JNIEnv handle points at its table");
+    // Slot 219 * pointer_size is `GetJavaVM`; a 64-bit table is 8 bytes wide.
+    let entry = fixture
+        .emulator
+        .memory()
+        .pointer(table + 219 * 8)
+        .read_pointer(0)
+        .expect("read GetJavaVM slot");
+    assert_ne!(
+        entry, 219 * 8,
+        "GetJavaVM must not be the unmapped placeholder the table is filled with"
+    );
+    let svc_base = fixture
+        .emulator
+        .loader()
+        .svc_memory()
+        .expect("svc page")
+        .base();
+    assert!(
+        entry >= svc_base,
+        "GetJavaVM {entry:#x} must be a stub in the SVC page"
+    );
+}
+
+/// Calling `GetJavaVM` through the table writes the `JavaVM*` the caller
+/// asked for, which is the whole point of the call.
+#[test]
+fn get_java_vm_writes_the_handle_to_the_out_pointer() {
+    let fixture = Fixture::boot();
+    let java_vm = fixture.vm.borrow().java_vm();
+    let table = fixture
+        .emulator
+        .memory()
+        .pointer(fixture.vm.borrow().jni_env())
+        .read_pointer(0)
+        .expect("the JNIEnv handle points at its table");
+    let entry = fixture
+        .emulator
+        .memory()
+        .pointer(table + 219 * 8)
+        .read_pointer(0)
+        .expect("read GetJavaVM slot");
+
+    // The out-pointer has to live somewhere `call_function`'s own stack
+    // realignment will not disturb, so it comes from a mapping of its own
+    // rather than from the stack.
+    let out = fixture
+        .emulator
+        .memory()
+        .mmap2(
+            0,
+            0x1000,
+            Prot::READ.union(Prot::WRITE),
+            MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+        .expect("scratch page");
+    fixture
+        .emulator
+        .memory()
+        .pointer(out)
+        .write_u64(0, 0)
+        .expect("clear");
+
+    // A `JNIEnv` call is `(*env)->GetJavaVM(env, &out)`: `x0` is the env the
+    // table was read from and the arguments start at `x1`, which is what
+    // `arg(.., 0)` returns.
+    let env = fixture.vm.borrow().jni_env();
+    let result = fixture
+        .emulator
+        .call_function(entry, &[env, out])
+        .expect("GetJavaVM runs");
+
+    assert_eq!(result as i32, JNI_OK as i32, "GetJavaVM reports JNI_OK");
+    let written = fixture
+        .emulator
+        .memory()
+        .pointer(out)
+        .read_u64(0)
+        .expect("read the out-pointer");
+    assert_eq!(
+        written, java_vm,
+        "GetJavaVM must hand back the JavaVM* it was called through"
+    );
+}
+
+/// A `JNIEnv` function's arguments start at `x1`: `x0` is the environment the
+/// table was read from, and `x2` onward belongs to whatever the guest happened
+/// to leave there. A dispatch that reads the wrong register here writes
+/// through garbage and faults, which is how a packed library that calls
+/// `GetJavaVM` first dies before it reaches anything else.
+///
+/// This pins the convention by leaving a poison value in the registers the
+/// call does *not* use.
+#[test]
+fn a_jni_env_call_ignores_the_registers_after_its_arguments() {
+    let fixture = Fixture::boot();
+    let env = fixture.vm.borrow().jni_env();
+    let table = fixture
+        .emulator
+        .memory()
+        .pointer(env)
+        .read_pointer(0)
+        .expect("the JNIEnv handle points at its table");
+    let entry = fixture
+        .emulator
+        .memory()
+        .pointer(table + 219 * 8)
+        .read_pointer(0)
+        .expect("read GetJavaVM slot");
+
+    let out = fixture
+        .emulator
+        .memory()
+        .mmap2(
+            0,
+            0x1000,
+            Prot::READ.union(Prot::WRITE),
+            MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+        .expect("scratch page");
+    fixture
+        .emulator
+        .memory()
+        .pointer(out)
+        .write_u64(0, 0)
+        .expect("clear");
+
+    // `x2` is a poison address: a dispatch that mistook it for the
+    // out-pointer would fault here rather than answer.
+    let poison = 0x10_0006u64;
+    let result = fixture
+        .emulator
+        .call_function(entry, &[env, out, poison])
+        .expect("GetJavaVM runs and does not write through x2");
+    assert_eq!(result as i32, JNI_OK as i32);
+}
+
+/// Each `JavaVM` function gets its own stub, so a call log names the function
+/// the guest called. A single shared stub reports as the generic "JavaVM",
+/// which tells a reader nothing about which entry point was reached.
+#[test]
+fn every_java_vm_slot_holds_its_own_named_stub() {
+    let fixture = Fixture::boot();
+    let java_vm = fixture.vm.borrow().java_vm();
+    let table = fixture
+        .emulator
+        .memory()
+        .pointer(java_vm)
+        .read_pointer(0)
+        .expect("the JavaVM handle points at its table");
+
+    let mut named: Vec<String> = Vec::new();
+    for slot in 0..=7usize {
+        let entry = fixture
+            .emulator
+            .memory()
+            .pointer(table + (slot * 8) as u64)
+            .read_pointer(0)
+            .expect("read a JavaVM slot");
+        let label = fixture
+            .emulator
+            .loader()
+            .svc_memory()
+            .expect("svc page")
+            .find_region(entry)
+            .map(|region| region.label)
+            .unwrap_or_default();
+        named.push(label);
+    }
+    println!("JavaVM slots: {named:?}");
+
+    // `GetEnv` is what a JNI library calls first; it must be nameable, and
+    // the table it belongs to must be in the name so it can be told apart
+    // from the identically-shaped `JNIEnv` entry points.
+    assert!(
+        named[6].starts_with("JavaVM!GetEnv."),
+        "slot 6 is JavaVM!GetEnv, got {}",
+        named[6]
+    );
+    // No two slots may share a stub, or the name would be ambiguous.
+    assert_ne!(
+        named[4], named[6],
+        "AttachCurrentThread and GetEnv must not share one stub"
+    );
+    let unique: std::collections::BTreeSet<&String> = named.iter().collect();
+    assert!(
+        unique.len() >= 5,
+        "each named JavaVM function needs its own stub, got {named:?}"
     );
 }
 

@@ -94,6 +94,10 @@ pub struct Options {
     /// `--syscall-detail <n>`: how much of a syscall trace to print.
     pub syscall_detail: SyscallDetail,
     /// `--jni-on-load`: run the library's `JNI_OnLoad` before the `--call`.
+    ///
+    /// A packed JNI library exports nothing else, and `JNI_OnLoad` needs a
+    /// real `JavaVM*`, so this runs it against a `dvm`-built VM instead of
+    /// passing zeroes. With no `--call` it is the whole run.
     pub jni_on_load: bool,
 }
 
