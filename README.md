@@ -10,8 +10,9 @@ Linux syscalls, and speaks the JNI invocation API so native code can call back
 into a Java side that the caller supplies. raxdbg does the same thing in Rust,
 with a CPU engine written in Rust.
 
-Scope for v1: **Android only, arm64 + arm32.** No MCP server, no GDB stub, no
-IDA `android_server` protocol, no iOS.
+Scope for v1: **Android only, arm64 + arm32.** No MCP server, no IDA
+`android_server` protocol, no iOS. The console debugger and a GDB remote
+protocol server (`debug --gdb <port>`) are here; see below.
 
 ## Quick start
 
@@ -38,6 +39,33 @@ worked guide, based on a real packed library, covering reading a trace,
 the protection report, driving `JNI_OnLoad`, and what a DEX packer needs
 before it can be emulated.
 
+### Debugging
+
+`debug` opens the console debugger on the terminal. `--gdb <port>` serves the
+GDB remote serial protocol instead, so any GDB can attach — the guest is
+stopped at the `--call` target's first instruction, before it runs:
+
+```console
+$ cargo run -p raxdbg-cli -- debug fixtures/prebuilt/arm64-v8a/libctest.so \
+    --gdb 23946 --call "hello()V"
+gdb server listening on 127.0.0.1:23946; connect with: target remote 127.0.0.1:23946
+```
+
+```console
+$ gdb-multiarch
+(gdb) target remote 127.0.0.1:23946
+(gdb) info registers pc x0
+(gdb) break malloc
+(gdb) continue
+```
+
+The protocol is unauthenticated and grants full read/write access to guest
+memory and registers, so the server binds loopback unless `--gdb-bind <ip>`
+names another address. Registers, memory and software breakpoints work for
+both ABIs; `Ctrl-C` is delivered when the run loop next returns, not
+asynchronously inside a guest instruction, because the guest runs on the same
+thread as the protocol.
+
 The bundled Android libraries live in `libs/`, populated from the
 `reference/unidbg` submodule:
 
@@ -61,6 +89,7 @@ another SDK level is a directory of the same shape:
 | Syscalls | The arm64 table from unidbg's `ARM64SyscallHandler`, the SVC stub page, the fd table, host-backed file IO (files, `/dev/*`, pipes, sockets, `/proc`), and the resolver chain. |
 | Android host services | `AndroidResolver` over `libs/`, the `libandroid.so`/`libjnigraphics.so`/`libmediandk.so`/system-property virtual modules, the `libdl` SVC trampolines, and the system property hook (including a real parse of the bundled `__properties__` trie). |
 | APK | `Apk`/`ApkFile`/`ApkDir` with a binary-`AndroidManifest.xml` parser (package, version code, version name) and `assets/` and `lib/<abi>/` access. |
+| Debugging | A console debugger and a GDB remote protocol server (`debug --gdb <port>`) over the shared breakpoint and run-control core: registers, memory, software breakpoints, single-step and continue, for arm64 and arm32. |
 
 Everything else in the plan's phases (JNI `dvm`, threads, hook engines, arm32
 parity, the console debugger, the CLI) is in progress or pending;
@@ -110,6 +139,7 @@ The suites are organised by what they prove rather than by module:
 | `raxdbg-android/tests/syscalls.rs` | SVC dispatch, the syscall table, the fd table, captured stdout. |
 | `raxdbg-android/tests/syscall_trace.rs` | The syscall tracer: that a trace installed before the load sees the load, that it does not change what the guest sees, and the protection report. |
 | `raxdbg-android/tests/virtual_modules.rs` | The virtual modules, the system property hook, the `libdl` trampolines. |
+| `raxdbg-cli/tests/cli.rs` | The binary driven the way a user drives it, including a hand-written GDB remote protocol client that stops, steps, patches memory and continues a real guest call. |
 
 Fixtures are committed, so no cross toolchain is needed to run the tests. To
 rebuild them, install either [zig](https://ziglang.org/download/) or the Android

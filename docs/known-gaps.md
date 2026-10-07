@@ -5,7 +5,7 @@ reproduced with the command given.
 
 ## Green
 
-`cargo test --workspace` passes: 165 tests across the backend, memory facade,
+`cargo test --workspace` passes: 340 tests across the backend, memory facade,
 ELF loader, syscall layer, APK, file IO, debugger core and the Android host
 services. Highlights:
 
@@ -18,17 +18,22 @@ services. Highlights:
 * the syscall layer answers `write`, `read`, `openat`, `getpid`,
   `clock_gettime`, `mmap`, `brk`, `set_tid_address`, `futex`, `getrandom`, and
   dispatches SVC stubs (`crates/raxdbg-android/tests/syscalls.rs`);
-* the four Android virtual modules, the `libdl` trampolines and the system
+* the five Android virtual modules, the `libdl` trampolines and the system
   property hook work, including a real parse of the bundled `__properties__`
-  trie (`crates/raxdbg-android/tests/virtual_modules.rs`).
+  trie (`crates/raxdbg-android/tests/virtual_modules.rs`);
+* a `trace --functions --jni-args` run names each `JNIEnv`/`JavaVM` call and
+  decodes its arguments — class and method names read straight out of guest
+  memory, references printed as the identity hashes they are
+  (`crates/raxdbg-android/src/dvm/args.rs`).
 
 ## bionic boot: green
 
-`cargo test -p raxdbg-android --test libc_boot` — 9/9. `libc.so` maps,
+`cargo test -p raxdbg-android --test libc_boot` — 12/12. `libc.so` maps,
 relocates, runs its `init_array`, and answers `malloc`/`free`, `strlen`,
 `memcpy`, `printf` (captured into the host sink), `getpid`, `clock_gettime`,
-`__system_property_get` (`ro.build.version.sdk` -> `"23"`) and
-`dlopen("libm.so")` + `dlsym("sin")`. Three bugs stood between the first boot
+`__system_property_get` (`ro.build.version.sdk` -> `"23"`), `dlopen("libm.so")`
++ `dlsym("sin")`, and `dlopen("linker64")` + `dlsym` of the linker's private
+`g_dl_mutex`/`do_dlopen` symbols. Five bugs stood between the first boot
 attempt and this, each worth remembering:
 
 1. **`AT_RANDOM`'s auxv value is a pointer, not the guard.** bionic's
@@ -43,6 +48,16 @@ attempt and this, each worth remembering:
    `ldp`/`stp` take an SP-alignment fault, which surfaced as a confusing
    "unmapped write" inside the stack region. `call_function` now aligns to 16
    (8 on arm32) before the call.
+4. **An auxv entry is two words, so the stride is `2 * pointer_size`.** Writing
+   the tag at `pointer_size * index` puts each tag on top of the previous
+   entry's value; the array then holds nothing but tags, `getauxval` reports
+   every tag missing, and `__libc_init_common` dereferences the zero it gets
+   back for `AT_RANDOM`.
+5. **A main program's `e_phoff` is a file offset, not an address.** The image
+   the auxv points at is `ET_DYN`, so `p_vaddr` and `e_phoff` are relative to
+   the load bias. Writing an absolute address into either makes a guest that
+   relocates the image -- which is what a linker does -- compute
+   `bias + bias + offset` and walk into unmapped memory.
 
 One more, for output rather than correctness: `StdoutFileIO` must answer
 `ioctl` successfully (unidbg's `SimpleFileIO` does for `stdout`/`stderr`), or

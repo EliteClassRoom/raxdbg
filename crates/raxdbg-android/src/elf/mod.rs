@@ -11,13 +11,17 @@
 //! [`raxdbg_core::memory::loader::Loader`], which the loader owns and exposes
 //! through [`AndroidElfLoader::memory`].
 
+pub mod auxv;
 pub mod init;
+pub mod names;
 pub mod packed;
 pub mod loader;
 pub mod module;
 pub mod symbol;
 
+pub use auxv::MainProgram;
 pub use init::InitFunction;
 pub use loader::{AndroidElfLoader, ElfError, InitCaller, ModuleInfo};
 pub use module::{MemRegion, Module};
+pub use names::{display_name, name_callee, name_caller, stub_name};
 pub use symbol::{ElfSymbol, ModuleSymbol, Symbol, WEAK_BASE};

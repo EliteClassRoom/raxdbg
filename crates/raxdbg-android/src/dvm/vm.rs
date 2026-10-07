@@ -372,6 +372,11 @@ impl Vm {
         self.java_vm.get()
     }
 
+    /// The guest's pointer width: 8 on a 64-bit guest, 4 on a 32-bit one.
+    pub fn pointer_size(&self) -> u64 {
+        self.pointer_size
+    }
+
     /// The `JNIEnv` slots the guest called that this port does not
     /// implement, in first-call order.
     ///

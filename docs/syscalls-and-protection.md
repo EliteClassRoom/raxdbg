@@ -43,8 +43,9 @@ $ raxdbg run test_lib/l1296851e_a64.so
 
 That succeeds silently. What it did: mapped the object at `0x12000000`,
 resolved relocations against the bundled bionic (`libc.so`, `libm.so`,
-`libdl.so`, `liblog.so`, `libc++.so`), mapped the two virtual modules
-(`libandroid.so`, `libsystemproperties.so`), and ran the four
+`libdl.so`, `liblog.so`, `libc++.so`), mapped the virtual modules
+(`libandroid.so`, `libsystemproperties.so`, `libjnigraphics.so`,
+`libmediandk.so`, `libatexit.so`, `linker64`), and ran the four
 `.init_array` functions at `0x115740`, `0x11588c`, `0x1158f0`, `0x15a644`.
 
 **Those initialisers make no syscalls of their own.** That is worth knowing
@@ -246,6 +247,34 @@ $ raxdbg syscalls fixtures/prebuilt/arm64-v8a/libjnitest.so --jni-on-load
 JNI_OnLoad: libjnitest.so returned 0x10006 (JNI version)
 ```
 
+### Reading what it called, and with what
+
+Naming the callee answers *what did it call?*. Adding `--jni-args` answers
+*what did it ask for?*, which for a packer is usually the question worth
+asking:
+
+```console
+$ raxdbg trace test_lib/l1296851e_a64.so --functions --jni-on-load --jni-args
+call l1296851e_a64.so+0x126e64 -> - JavaVM!GetEnv(vm, env_out=0xe4ffe738, version=0x10006)
+call l1296851e_a64.so+0x126e88 -> - JNIEnv!GetJavaVM
+call l1296851e_a64.so+0x153d80 -> - JNIEnv!FindClass("android/app/ActivityThread")
+call l1296851e_a64.so+0x153e34 -> - JNIEnv!GetStaticMethodID(env, ref=0xdd2d59e8, "currentActivityThread", "()Landroid/app/ActivityThread;")
+call l1296851e_a64.so+0x154900 -> - JNIEnv!FindClass("java/lang/ClassLoader")
+call l1296851e_a64.so+0x1549b0 -> - JNIEnv!GetMethodID(env, ref=0x2f7ad930, "findClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+call l1296851e_a64.so+0x1549c8 -> - JNIEnv!DeleteLocalRef(ref=0x2f7ad930)
+```
+
+The arguments are read at the `bl`, before it retires, which is the only
+moment `x1`–`x7` still hold them. `ref=` is a 32-bit identity hash rather
+than an address, because a `jobject` in this port *is* a hash — see §7 for
+why the VM identifies references that way. The class and method names are
+read straight out of guest memory, so they are the library's own strings:
+`android/app/ActivityThread` and `currentActivityThread` are the ART
+entry points this protection reaches for before it touches an asset.
+
+`JavaVM!GetEnv`'s `version=0x10006` is the JNI version the library asks for,
+and `env_out` is where the VM writes the `JNIEnv*` back.
+
 ---
 
 ## 7. What this library actually is
@@ -304,16 +333,29 @@ specific to this binary:
    reach `vbp.dex`, so this is the first thing to implement for this
    library. They are not in unidbg either.
 
-2. **No DEX/ART runtime.** `Vm` models JNI references and a class table;
+2. **The packer's own symbol lookup wants a `soinfo`, not a `dlsym`.** The
+   sample resolves `/system/bin/linker64` out of its program headers and then
+   searches the result with its *own* hash-table lookup
+   (`libapk_android_a64.so` + `0x157cbc`), which walks `soinfo`-shaped fields
+   at `+0x98`, `+0xa8`, `+0xb0` and `+0xb8`. A handle the emulator builds from
+   the auxv image leaves those zero, so `__dl__ZL10g_dl_mutex` and the
+   `do_dlopen` overloads read back as missing even though
+   `dlopen("linker64")` + `dlsym` resolve them. Reaching the unpack needs
+   either a real `dl_iterate_phdr` (so the packer's own callback at `+0x158c64`
+   builds the `soinfo` from a module's phdrs) or a synthetic `linker64` image
+   carrying those names in its `.dynsym`. The `linker64` virtual module added
+   for the `dlopen` path does not satisfy this lookup.
+
+3. **No DEX/ART runtime.** `Vm` models JNI references and a class table;
    it does not parse `classes.dex` or execute bytecode. This is the hard
    blocker for §6.
 
-3. **`/proc/self/status` is absent** from the bundled `libs/android/sdk23/proc/`
+4. **`/proc/self/status` is absent** from the bundled `libs/android/sdk23/proc/`
    tree (only `proc/stat` is there). A `TracerPid` check that opens it gets
    `-ENOENT` — a passing answer, but for the wrong reason. The analyser
    reports the probe either way, so the gap is visible rather than silent.
 
-4. **No `ptrace` state.** Every request answers 0 and no `TracerPid` is
+5. **No `ptrace` state.** Every request answers 0 and no `TracerPid` is
    ever produced, so a self-attach check cannot be distinguished from a
    successful one.
 
@@ -336,7 +378,9 @@ Options that matter for this work:
 | Option | Effect |
 |---|---|
 | `-v` / `-vv` | syscall trace verbosity (`syscalls`) |
-| `--jni-on-load` | run `JNI_OnLoad` before anything else (`syscalls`) |
+| `--jni-on-load` | run `JNI_OnLoad` before anything else (`syscalls`, `trace`) |
+| `--functions` | report each call the library makes, with the callee named (`trace`) |
+| `--jni-args` | append each `JNIEnv`/`JavaVM` call's decoded arguments (`trace --functions`) |
 | `--call <name>` | C symbol **or** a guest address; arguments follow it |
 | `--abi arm64\|arm32` | guest ABI, default `arm64` |
 | `--sdk <level>` | bundled bionic level, default 23 |

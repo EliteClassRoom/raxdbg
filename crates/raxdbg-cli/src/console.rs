@@ -1,8 +1,9 @@
 //! The console debugger.
 //!
 //! Port of unidbg: `unidbg-api/src/main/java/com/github/unidbg/debugger/Debugger.java`
-//! and `arm/SimpleARM64Debugger.java`'s command set@7f5da98e, minus the GDB and
-//! IDA `android_server` transports (plan D10).
+//! and `arm/SimpleARM64Debugger.java`'s command set@7f5da98e, minus the IDA
+//! `android_server` transport (plan D10). The GDB remote protocol is a separate
+//! transport in [`crate::gdb`], reached with `debug --gdb <port>`.
 
 use std::cell::RefCell;
 use std::io::{BufRead, Write};
@@ -361,7 +362,7 @@ pub fn debug_session(options: &Options, library: &str) -> Result<(), String> {
 
 /// Resolves the `--call` target up front, so a typo is reported before the
 /// console takes over the terminal.
-fn preload_call(emulator: &Rc<AndroidEmulator>, call: &Call) -> Result<(), String> {
+fn preload_call(_emulator: &Rc<AndroidEmulator>, call: &Call) -> Result<(), String> {
     if call.signature.contains('(') && call.signature.contains(')') && !call.signature.ends_with("()V") {
         return Err(format!(
             "the JNI signature {} needs the dvm runtime, which is not ported yet",

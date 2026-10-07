@@ -7,10 +7,12 @@
 //! `jmethodID` is a hash of the class, name and signature, and the `JNIEnv` the
 //! guest calls through is a table of SVC stubs that land in [`vm::dispatch`].
 
+pub mod args;
 pub mod hash;
 pub mod object;
 pub mod vm;
 
+pub use args::format_jni_args;
 pub use hash::{Hashable, Hasher};
 pub use object::{
     mangle_for_jni, normalize_class_name, DvmClass, DvmField, DvmMethod, DvmObject,

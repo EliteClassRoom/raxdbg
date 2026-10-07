@@ -341,6 +341,43 @@ impl Backend for RaxBackend {
         }
     }
 
+    /// AArch64's floating-point control register. AArch32's status register is
+    /// [`RegId::Fpscr`], which [`Backend::reg_read`] already answers, so an
+    /// AArch32 backend reports this one as unsupported.
+    fn fpcr_read(&self) -> Result<u32, BackendError> {
+        match &self.cpu {
+            Cpu::Arm64(cpu) => Ok(cpu.fpcr()),
+            Cpu::Arm32(_) => Err(BackendError::UnsupportedRegister(RegId::Fpcr)),
+        }
+    }
+
+    fn fpcr_write(&mut self, value: u32) -> Result<(), BackendError> {
+        match &mut self.cpu {
+            Cpu::Arm64(cpu) => {
+                cpu.set_fpcr(value);
+                Ok(())
+            }
+            Cpu::Arm32(_) => Err(BackendError::UnsupportedRegister(RegId::Fpcr)),
+        }
+    }
+
+    fn fpsr_read(&self) -> Result<u32, BackendError> {
+        match &self.cpu {
+            Cpu::Arm64(cpu) => Ok(cpu.fpsr()),
+            Cpu::Arm32(_) => Err(BackendError::UnsupportedRegister(RegId::Fpscr)),
+        }
+    }
+
+    fn fpsr_write(&mut self, value: u32) -> Result<(), BackendError> {
+        match &mut self.cpu {
+            Cpu::Arm64(cpu) => {
+                cpu.set_fpsr(value);
+                Ok(())
+            }
+            Cpu::Arm32(_) => Err(BackendError::UnsupportedRegister(RegId::Fpscr)),
+        }
+    }
+
     fn mem_read(&self, addr: u64, size: usize) -> Result<Vec<u8>, BackendError> {
         let mut buf = vec![0u8; size];
         self.mem_read_into(addr, &mut buf)?;

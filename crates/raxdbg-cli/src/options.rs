@@ -6,6 +6,12 @@
 
 use std::path::PathBuf;
 
+/// The address `--gdb` listens on unless `--gdb-bind` says otherwise.
+///
+/// Loopback, because the GDB remote protocol is unauthenticated and grants
+/// full read/write access to guest memory and registers.
+pub const DEFAULT_GDB_BIND: &str = "127.0.0.1";
+
 /// What the user asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -89,10 +95,25 @@ pub struct Options {
     pub trace_writes: bool,
     /// `--functions`.
     pub trace_functions: bool,
+    /// `--jni-args`: also print the arguments of every `JNIEnv`/`JavaVM` call.
+    ///
+    /// Only meaningful with `--functions`, because that is the trace that names
+    /// the callee; on any other trace there is no call to attach arguments to.
+    pub jni_args: bool,
     /// `--out <file>`: where a trace's lines go instead of this terminal.
     pub out: Option<PathBuf>,
     /// `--syscall-detail <n>`: how much of a syscall trace to print.
     pub syscall_detail: SyscallDetail,
+    /// `--gdb <port>`: serve the GDB remote serial protocol on this TCP port.
+    ///
+    /// Only meaningful with `debug`, which without it opens the console.
+    pub gdb_port: Option<u16>,
+    /// `--gdb-bind <ip>`: the address the GDB server listens on.
+    ///
+    /// Loopback by default: the protocol carries no authentication and grants
+    /// full read/write access to guest memory and registers, so anything wider
+    /// has to be asked for.
+    pub gdb_bind: String,
     /// `--jni-on-load`: run the library's `JNI_OnLoad` before the `--call`.
     ///
     /// A packed JNI library exports nothing else, and `JNI_OnLoad` needs a
@@ -186,8 +207,11 @@ impl Options {
             trace_reads: false,
             trace_writes: false,
             trace_functions: false,
+            jni_args: false,
             out: None,
             syscall_detail: SyscallDetail::default(),
+            gdb_port: None,
+            gdb_bind: DEFAULT_GDB_BIND.to_string(),
             jni_on_load: false,
         };
 
@@ -222,6 +246,7 @@ impl Options {
                 "--read" => options.trace_reads = true,
                 "--write" => options.trace_writes = true,
                 "--functions" => options.trace_functions = true,
+                "--jni-args" => options.jni_args = true,
                 "--out" => options.out = Some(PathBuf::from(next_value(&mut args, "--out")?)),
                 // Each flag turns one more level on, so `-vv` is cumulative
                 // the way it reads at the command line.
@@ -230,6 +255,22 @@ impl Options {
                 }
                 "-vv" | "--syscalls=all" => options.syscall_detail = SyscallDetail::Full,
                 "--jni-on-load" => options.jni_on_load = true,
+                "--gdb" => {
+                    options.gdb_port = Some(
+                        next_value(&mut args, "--gdb")?
+                            .parse()
+                            .map_err(|_| "--gdb needs a port number".to_string())?,
+                    )
+                }
+                "--gdb-bind" => {
+                    let bind = next_value(&mut args, "--gdb-bind")?;
+                    // Parsed here rather than at bind time so a typo is a
+                    // command-line error with usage, not a later runtime one.
+                    if bind.parse::<std::net::IpAddr>().is_err() {
+                        return Err("--gdb-bind needs an IP address".into());
+                    }
+                    options.gdb_bind = bind;
+                }
                 "--call" => {
                     let signature = next_value(&mut args, "--call")?;
                     let name = signature
@@ -257,6 +298,18 @@ impl Options {
         // line.
         if options.trace_functions && (options.trace_reads || options.trace_writes) {
             return Err("--functions cannot be combined with --read/--write".into());
+        }
+        if options.gdb_port.is_some() {
+            if !matches!(options.command, Command::Debug { .. }) {
+                return Err("--gdb requires debug".into());
+            }
+            // The server stops at the callee's first instruction, so without a
+            // call there is no execution for the client to take part in.
+            if options.call.is_none() {
+                return Err("--gdb requires --call".into());
+            }
+        } else if options.gdb_bind != DEFAULT_GDB_BIND {
+            return Err("--gdb-bind requires --gdb".into());
         }
         Ok(options)
     }
@@ -327,6 +380,15 @@ mod tests {
     }
 
     #[test]
+    fn jni_args_is_off_by_default_and_parsed() {
+        let options = parse(&["trace", "lib.so", "--functions"]).unwrap();
+        assert!(!options.jni_args, "arguments are opt-in, not noise by default");
+
+        let options = parse(&["trace", "lib.so", "--functions", "--jni-args"]).unwrap();
+        assert!(options.jni_args);
+    }
+
+    #[test]
     fn an_out_file_is_parsed() {
         let options = parse(&["trace", "lib.so", "--out", "trace.log"]).unwrap();
         assert_eq!(options.out, Some(PathBuf::from("trace.log")));
@@ -338,10 +400,75 @@ mod tests {
         assert_eq!(options.call_arguments, vec![0x2a]);
     }
 
-    #[test]
-    fn an_unknown_option_is_rejected() {
+#[test]
+fn an_unknown_option_is_rejected() {
         assert!(parse(&["run", "lib.so", "--nope"]).is_err());
         assert!(parse(&["nope", "lib.so"]).is_err());
         assert!(parse(&["run"]).is_err());
+    }
+
+    #[test]
+    fn a_gdb_debug_session_takes_a_port_and_a_call() {
+        let options = parse(&[
+            "debug",
+            "lib.so",
+            "--gdb",
+            "23946",
+            "--call",
+            "hello()V",
+        ])
+        .unwrap();
+        assert_eq!(options.gdb_port, Some(23946));
+        // Loopback unless asked otherwise: the protocol has no authentication.
+        assert_eq!(options.gdb_bind, DEFAULT_GDB_BIND);
+
+        let bound = parse(&[
+            "debug",
+            "lib.so",
+            "--gdb",
+            "23946",
+            "--gdb-bind",
+            "0.0.0.0",
+            "--call",
+            "hello()V",
+        ])
+        .unwrap();
+        assert_eq!(bound.gdb_bind, "0.0.0.0");
+    }
+
+    #[test]
+    fn a_gdb_session_needs_a_port_a_call_and_the_debug_command() {
+        let error = parse(&["debug", "lib.so", "--gdb", "nope", "--call", "hello()V"])
+            .unwrap_err();
+        assert!(error.contains("--gdb needs a port number"), "{error}");
+
+        let error = parse(&["debug", "lib.so", "--gdb", "99999", "--call", "hello()V"])
+            .unwrap_err();
+        assert!(error.contains("--gdb needs a port number"), "{error}");
+
+        let error = parse(&[
+            "debug",
+            "lib.so",
+            "--gdb",
+            "23946",
+            "--gdb-bind",
+            "localhost",
+            "--call",
+            "hello()V",
+        ])
+        .unwrap_err();
+        assert!(error.contains("--gdb-bind needs an IP address"), "{error}");
+
+        // Without a call the client would attach to a guest that has nothing
+        // to run, so it is refused rather than left idle.
+        let error = parse(&["debug", "lib.so", "--gdb", "23946"]).unwrap_err();
+        assert!(error.contains("--gdb requires --call"), "{error}");
+
+        let error = parse(&["run", "lib.so", "--gdb", "23946", "--call", "hello()V"])
+            .unwrap_err();
+        assert!(error.contains("--gdb requires debug"), "{error}");
+
+        let error = parse(&["debug", "lib.so", "--gdb-bind", "0.0.0.0"]).unwrap_err();
+        assert!(error.contains("--gdb-bind requires --gdb"), "{error}");
     }
 }

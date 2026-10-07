@@ -17,6 +17,9 @@ use raxdbg_core::backend::{
 };
 use raxdbg_core::reg::{ARM32_REGS, ARM64_REGS, RegId};
 
+/// The bits of `FPCR` rax models; the rest are RES0 and read back as zero.
+const FPCR_MASK: u64 = 0x07c8_0007;
+
 fn run(backend: &mut RaxBackend, count: u64) -> RunOutcome {
     backend
         .emu_start(CODE, 0, 0, count)
@@ -41,6 +44,9 @@ fn arm64_register_roundtrip() {
         let expected = match reg {
             RegId::W(_) | RegId::Wsp => value as u32 as u64,
             RegId::Nzcv => value & 0xf,
+            // rax keeps only the architecturally modelled bits of `FPCR`, the
+            // way the hardware drops the reserved ones.
+            RegId::Fpcr => value & FPCR_MASK,
             _ => value,
         };
         backend.reg_write(reg, value).expect("write");

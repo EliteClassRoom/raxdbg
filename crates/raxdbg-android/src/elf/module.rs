@@ -176,7 +176,7 @@ impl Module {
         let position = self.by_address.partition_point(|index| {
             self.symbols[*index].value <= offset
         });
-        let mut best = position.checked_sub(1).map(|index| self.by_address[index]);
+        let best = position.checked_sub(1).map(|index| self.by_address[index]);
         // A module with no entry point sits at `entry_point == 0`, so the
         // synthetic "start" symbol would land exactly on its base and hide
         // every real symbol below it. Only consider an entry point the module
@@ -184,11 +184,15 @@ impl Module {
         if self.entry_point != 0 {
             let entry = self.base + self.entry_point;
             if address >= entry {
+                // "start" names the entry point itself, so it wins only when
+                // no real symbol sits between the entry and the address.
+                // Discarding `best` here would drop the answer for every
+                // address above `_start` -- which is most of a real library's
+                // text, including exact matches like `sigaction`.
                 let current = best.map(|index| self.base + self.symbols[index].value);
                 if current.is_none_or(|current| entry > current) {
                     return Some(Symbol::new("start", entry, 0, Some(self.name.clone())));
                 }
-                best = None;
             }
         }
         let index = best?;
@@ -260,6 +264,55 @@ impl Module {
 mod tests {
     use super::super::symbol::{ElfSymbol, ModuleSymbol};
     use super::*;
+
+    /// The synthetic "start" symbol names the entry point, and must not shadow
+    /// the real symbols above it: most of a library's text sits above `_start`,
+    /// and an exact match there has to name the function, not the module.
+    #[test]
+    fn the_entry_point_does_not_shadow_symbols_above_it() {
+        let symbol = |name: &str, value: u64| ElfSymbol {
+            name: name.into(),
+            value,
+            size: 0,
+            info: 0,
+            // A defined section: `SHN_UNDEF` would filter the symbol out of
+            // the address table entirely.
+            shndx: 1,
+        };
+        // `entry_point` 0x1000, so `start` lands at 0x2000; `sigaction` is
+        // above it, and `early` below.
+        let module = Module::new(
+            0x1000,
+            0x1000,
+            0x4000,
+            "libc.so",
+            vec![symbol("early", 0x400), symbol("sigaction", 0x3000)],
+        );
+        let mut module = module;
+        module.entry_point = 0x1000;
+
+        // An exact match above the entry point still names the symbol.
+        let found = module
+            .find_closest_symbol(0x1000 + 0x3000)
+            .expect("sigaction is above the entry point");
+        assert_eq!(found.name, "sigaction");
+        assert_eq!(found.address, 0x1000 + 0x3000);
+
+        // A symbol below the entry point wins over `start`, which is further
+        // away.
+        let found = module
+            .find_closest_symbol(0x1000 + 0x800)
+            .expect("early is below the entry point");
+        assert_eq!(found.name, "early");
+
+        // With nothing between the entry point and the address, `start` is the
+        // nearest name and is what the caller gets.
+        let found = module
+            .find_closest_symbol(0x1000 + 0x1000)
+            .expect("the entry point itself");
+        assert_eq!(found.name, "start");
+        assert_eq!(found.address, 0x1000 + 0x1000);
+    }
 
     #[test]
     fn a_relocation_slot_names_the_symbol_it_writes() {

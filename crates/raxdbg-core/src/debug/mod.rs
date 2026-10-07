@@ -2,9 +2,10 @@
 //!
 //! Port of unidbg's `com.github.unidbg.debugger` package: the breakpoint
 //! infrastructure, code-history ring buffer and instruction/memory tracing.
-//! The console debugger (P11.4) lives in `raxdbg-android`; GDB stub and
-//! IDA `android_server` protocol are out of scope (plan D10), so this
-//! module carries the host-side pieces every debugger variant shares.
+//! These are the host-side pieces every debugger transport shares. The console
+//! debugger (P11.4) lives in `raxdbg-cli`, and so does the GDB remote
+//! protocol server, which `raxdbg-cli` reaches with `debug --gdb <port>`; the
+//! IDA `android_server` protocol remains out of scope (plan D10).
 //!
 //! See:
 //!

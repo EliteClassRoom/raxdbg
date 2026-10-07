@@ -263,3 +263,181 @@ fn the_loader_reports_no_unresolved_relocations() {
         );
     }
 }
+
+/// The auxv tags the guest reads back through its own `getauxval`.
+mod auxv_tag {
+    /// `AT_PHDR`.
+    pub const PHDR: u64 = 3;
+    /// `AT_PHENT`.
+    pub const PHENT: u64 = 4;
+    /// `AT_PHNUM`.
+    pub const PHNUM: u64 = 5;
+    /// `AT_PAGESZ`.
+    pub const PAGESZ: u64 = 6;
+    /// `AT_BASE`.
+    pub const BASE: u64 = 7;
+    /// `AT_ENTRY`.
+    pub const ENTRY: u64 = 9;
+    /// `AT_RANDOM`.
+    pub const RANDOM: u64 = 25;
+}
+
+/// Calls the guest's own `getauxval` for `tag`.
+///
+/// Going through bionic rather than reading the loader's fields is what makes
+/// this a test of the array the *guest* walks: `getauxval` scans the pairs
+/// with a 16-byte stride and stops at the first zero tag, so an array whose
+/// entries overlap or whose terminator sits on a tag reads back as missing.
+fn guest_getauxval(emulator: &Rc<AndroidEmulator>, tag: u64) -> u64 {
+    let getauxval = emulator
+        .loader()
+        .find_symbol("libc.so", "getauxval")
+        .expect("libc.so exports getauxval");
+    emulator
+        .call_function(getauxval.address, &[tag])
+        .expect("getauxval")
+}
+
+#[test]
+fn the_auxv_describes_a_real_main_program() {
+    let emulator = boot(10);
+
+    // Every tag bionic reads unconditionally is present. A missing AT_RANDOM
+    // is not a soft failure: `__libc_init_common` dereferences the result
+    // without a null check, so the guest faults before it reaches any code.
+    for (tag, name) in [
+        (auxv_tag::RANDOM, "AT_RANDOM"),
+        (auxv_tag::PAGESZ, "AT_PAGESZ"),
+        (auxv_tag::PHDR, "AT_PHDR"),
+        (auxv_tag::BASE, "AT_BASE"),
+        (auxv_tag::ENTRY, "AT_ENTRY"),
+        (auxv_tag::PHENT, "AT_PHENT"),
+        (auxv_tag::PHNUM, "AT_PHNUM"),
+    ] {
+        assert_ne!(
+            guest_getauxval(&emulator, tag),
+            0,
+            "{name} is in the auxv"
+        );
+    }
+
+    assert_eq!(
+        guest_getauxval(&emulator, auxv_tag::PAGESZ),
+        raxdbg_core::memory::PAGE_SIZE,
+        "AT_PAGESZ is the guest page size"
+    );
+    assert_eq!(guest_getauxval(&emulator, auxv_tag::PHENT), 56, "AT_PHENT");
+    assert_eq!(guest_getauxval(&emulator, auxv_tag::PHNUM), 2, "AT_PHNUM");
+
+    // AT_PHDR and AT_BASE must address a real ELF image. Protected code reads
+    // the magic at both and gives up when it does not match, which is how a
+    // packed library decides whether it was loaded by a real linker.
+    let phdr = guest_getauxval(&emulator, auxv_tag::PHDR);
+    let base = guest_getauxval(&emulator, auxv_tag::BASE);
+    for (label, address) in [("AT_PHDR", phdr & !0xfff), ("AT_BASE", base)] {
+        let mut magic = [0u8; 4];
+        emulator
+            .memory()
+            .pointer(address)
+            .read_bytes(0, &mut magic)
+            .unwrap_or_else(|error| panic!("{label} at {address:#x} is readable: {error}"));
+        assert_eq!(
+            magic,
+            [0x7f, b'E', b'L', b'F'],
+            "{label} at {address:#x} carries the ELF magic"
+        );
+    }
+
+    // AT_ENTRY is inside the image, and AT_PHDR sits in the header table the
+    // image's own `e_phnum`/`e_phentsize` describe.
+    let entry = guest_getauxval(&emulator, auxv_tag::ENTRY);
+    assert!(
+        entry >= base && entry < base + raxdbg_core::memory::PAGE_SIZE,
+        "AT_ENTRY {entry:#x} is inside the image at {base:#x}"
+    );
+    assert_eq!(
+        phdr,
+        base + 64,
+        "AT_PHDR follows the 64-byte ELF header"
+    );
+}
+
+#[test]
+fn the_auxv_image_is_a_relocatable_pie() {
+    let emulator = boot(11);
+    let base = guest_getauxval(&emulator, auxv_tag::BASE);
+    let header = emulator.memory().pointer(base);
+
+    // `e_phoff` is a *file offset*, not an address. A guest that relocates the
+    // image -- which is exactly what a linker does -- computes
+    // `bias + e_phoff`; storing the absolute address there instead makes it
+    // compute `bias + bias + offset` and walk into unmapped memory.
+    let phoff = header.read_u64(32).expect("e_phoff");
+    assert_eq!(phoff, 64, "e_phoff is the file offset of the header table");
+    let entry = header.read_u64(24).expect("e_entry");
+    assert!(
+        entry < raxdbg_core::memory::PAGE_SIZE,
+        "e_entry is relative to the load bias, got {entry:#x}"
+    );
+
+    // The first program header is a `PT_LOAD` whose `p_vaddr` is relative and
+    // whose extent covers the image, so `p_vaddr + bias` lands on the header
+    // the walk started from.
+    let load = emulator.memory().pointer(base + phoff);
+    assert_eq!(load.read_u32(0).expect("p_type"), 1, "PT_LOAD");
+    assert_eq!(load.read_u64(16).expect("p_vaddr"), 0, "p_vaddr is relative");
+
+    // The second is `PT_PHDR`, which is what a guest uses to find the table
+    // inside the image without trusting `AT_PHDR`.
+    let phdr_entry = emulator.memory().pointer(base + phoff + 56);
+    assert_eq!(phdr_entry.read_u32(0).expect("p_type"), 6, "PT_PHDR");
+    assert_eq!(phdr_entry.read_u64(16).expect("p_vaddr"), 64, "PT_PHDR vaddr");
+}
+
+#[test]
+fn dlopen_and_dlsym_reach_the_linkers_private_symbols() {
+    let emulator = boot(12);
+    // A packer resolves the interpreter out of its own program headers and
+    // then opens it to reach the linker's internals. `g_dl_mutex` and the
+    // `do_dlopen` overloads are private to `linker64`: no shared library
+    // exports them, so without a virtual module the lookup returns NULL and
+    // the unpack stops before it starts.
+    let dlopen = emulator.loader().dlsym(0, "dlopen").expect("dlopen");
+    let dlsym = emulator.loader().dlsym(0, "dlsym").expect("dlsym");
+
+    let name = emulator
+        .memory()
+        .write_stack_string("linker64")
+        .expect("name");
+    let handle = emulator
+        .call_function(dlopen.address, &[name.peer(), 2])
+        .expect("dlopen(linker64)");
+    assert_ne!(handle, 0, "linker64 opened");
+
+    for symbol in [
+        "__dl__ZL10g_dl_mutex",
+        "__dl__Z9do_dlopenPKciPK17android_dlextinfo",
+        "__dl__Z9do_dlopenPKciPK17android_dlextinfoPKv",
+        "__dl__Z8__dlopenPKciPKv",
+    ] {
+        let name = emulator.memory().write_stack_string(symbol).expect("symbol");
+        let address = emulator
+            .call_function(dlsym.address, &[handle, name.peer()])
+            .expect("dlsym");
+        assert_ne!(address, 0, "{symbol} resolved through linker64");
+    }
+
+    // The full interpreter path resolves too, because `dlopen` keys on the
+    // basename and a guest may pass either form.
+    let path = emulator
+        .memory()
+        .write_stack_string("/system/bin/linker64")
+        .expect("path");
+    assert_ne!(
+        emulator
+            .call_function(dlopen.address, &[path.peer(), 2])
+            .expect("dlopen(path)"),
+        0,
+        "/system/bin/linker64 opened"
+    );
+}

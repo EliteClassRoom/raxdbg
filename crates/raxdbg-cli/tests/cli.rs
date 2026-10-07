@@ -4,6 +4,7 @@
 //! committed, so these tests prove the whole stack — loader, bionic boot,
 //! syscalls, unwinder, debugger core — from the outside.
 
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -297,9 +298,194 @@ fn syscalls_runs_jni_on_load_when_asked() {
         "--jni-on-load",
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success());
     assert!(
         stdout.contains("JNI_OnLoad") && stdout.contains("0x10006"),
         "JNI_OnLoad must run and report the version it returned:\n{stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The GDB remote serial protocol
+// ---------------------------------------------------------------------------
+
+/// A GDB remote-serial-protocol client, driven by hand.
+///
+/// The repository has no GDB binary to test against, so this speaks the wire
+/// protocol itself: the server is driven exactly the way GDB drives it, which
+/// is what makes this an acceptance test rather than a unit test.
+struct RspClient {
+    stream: std::net::TcpStream,
+    buffered: Vec<u8>,
+}
+
+impl RspClient {
+    fn connect(port: u16) -> Option<Self> {
+        // The server is a child process, so the listener may not be up yet.
+        for _ in 0..200 {
+            if let Ok(stream) =
+                std::net::TcpStream::connect(("127.0.0.1", port))
+            {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+                return Some(RspClient { stream, buffered: Vec::new() });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        None
+    }
+
+    /// One byte, refilled from the socket as needed.
+    fn byte(&mut self) -> Option<u8> {
+        if self.buffered.is_empty() {
+            let mut chunk = [0u8; 4096];
+            match self.stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => self.buffered.extend_from_slice(&chunk[..n]),
+            }
+        }
+        Some(self.buffered.remove(0))
+    }
+
+    /// Sends one packet and returns the reply, which may be run-length
+    /// encoded: a `c*<count>` run stands for that many copies of `c`.
+    fn packet(&mut self, payload: &str) -> Option<String> {
+        let raw = payload.as_bytes();
+        let checksum = raw.iter().map(|b| *b as u32).sum::<u32>() & 0xff;
+        let framed = format!("${payload}#{checksum:02x}");
+        self.stream.write_all(framed.as_bytes()).ok()?;
+
+        // The stub acknowledges the packet before it replies, so the first
+        // byte back is the ack and the packet follows it.
+        match self.byte()? {
+            b'+' | b'-' => {}
+            other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+        self.byte()?; // the leading '$'
+        let mut body = Vec::new();
+        loop {
+            match self.byte()? {
+                b'#' => break,
+                byte => body.push(byte),
+            }
+        }
+        // The two checksum digits every packet is framed with.
+        self.byte()?;
+        self.byte()?;
+        Some(expand_rle(&body))
+    }
+}
+
+/// Reverses the run-length encoding a stub may apply to its replies.
+///
+/// `c*<n>` stands for `c` repeated `n` times *in total*, with `n` biased by 28
+/// so it never lands on a binary character: `0*<`,` is sixteen zeros.
+fn expand_rle(body: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let mut index = 0;
+    while index < body.len() {
+        let byte = body[index];
+        index += 1;
+        if byte != b'*' || out.is_empty() || index >= body.len() {
+            out.push(byte);
+            continue;
+        }
+        let total = body[index].wrapping_sub(28) as usize;
+        index += 1;
+        // The character before the marker is the first of the run, so it is
+        // already in place; the count covers the repeats that follow it.
+        let repeated = *out.last().expect("a run repeats what precedes it");
+        for _ in 1..total {
+            out.push(repeated);
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A free loopback port, released before the server is asked to take it.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let port = listener.local_addr().expect("a local address").port();
+    drop(listener);
+    port
+}
+
+#[test]
+fn a_gdb_client_drives_the_guest_through_the_remote_protocol() {
+    let port = free_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_raxdbg"))
+        .args([
+            "debug",
+            fixture("libctest.so").to_str().unwrap(),
+            "--gdb",
+            &port.to_string(),
+            "--call",
+            "ctest_malloc_ok()V",
+        ])
+        .current_dir(workspace_root())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the GDB server");
+
+    let mut client = RspClient::connect(port).expect("the server listens on the loopback");
+    assert!(
+        client.packet("qSupported:multiprocess+").is_some_and(|r| r.contains("PacketSize=")),
+        "the server negotiates features"
+    );
+    let stop = client.packet("?").expect("the halt reason");
+    assert!(stop.starts_with('T') || stop.starts_with('S'), "stopped: {stop}");
+
+    // The guest is parked at the callee's first instruction, before it ran.
+    let regs = client.packet("g").expect("the register file");
+    assert_eq!(regs.len() % 2, 0, "the register file is hex");
+    // Register values travel as target-endian bytes, which is little-endian
+    // here: 31 x-registers and `sp` (8 bytes each), then `pc`.
+    let file = (0..regs.len() / 2)
+        .map(|index| u8::from_str_radix(&regs[index * 2..index * 2 + 2], 16).expect("hex"))
+        .collect::<Vec<u8>>();
+    let pc = u64::from_le_bytes(file[32 * 8..33 * 8].try_into().expect("eight bytes"));
+    assert_ne!(pc, 0, "the program counter is at the callee");
+
+    // A step runs exactly one real instruction, so it comes before any write
+    // over the code at the entry.
+    let stepped = client.packet("s").expect("the step completes");
+    assert!(
+        stepped.starts_with('S') || stepped.starts_with('T'),
+        "a step stops: {stepped}"
+    );
+    let moved = {
+        let after = client.packet("g").expect("the register file");
+        let bytes: Vec<u8> = (0..after.len() / 2)
+            .map(|i| u8::from_str_radix(&after[i * 2..i * 2 + 2], 16).expect("hex"))
+            .collect();
+        u64::from_le_bytes(bytes[32 * 8..33 * 8].try_into().expect("eight bytes"))
+    };
+    assert_ne!(moved, pc, "one instruction moved the program counter");
+
+    // A memory write is visible to the next read, in both directions.
+    let write = client.packet(&format!("M{pc:x},4:aabbccdd"));
+    assert_eq!(write.as_deref(), Some("OK"), "writing at {pc:x}");
+    assert_eq!(
+        client.packet(&format!("m{pc:x},4")).as_deref(),
+        Some("aabbccdd")
+    );
+    // Unmapped memory is EFAULT rather than zeroes.
+    assert_eq!(client.packet("m1,4").as_deref(), Some("E0e"));
+
+    // Breakpoints are accepted, and removing one that is gone is refused.
+    assert_eq!(client.packet(&format!("Z0,{pc:x},4")).as_deref(), Some("OK"));
+    assert_eq!(client.packet(&format!("z0,{pc:x},4")).as_deref(), Some("OK"));
+    assert_eq!(client.packet(&format!("z0,{pc:x},4")).as_deref(), Some("E16"));
+
+    // Continuing runs the call to its return, and the session ends with the
+    // exit reply a client reads as "the program finished".
+    assert_eq!(client.packet("c").as_deref(), Some("W00"));
+    drop(client);
+
+    let output = child.wait_with_output().expect("the server exits");
+    assert!(
+        output.status.success(),
+        "the server exits cleanly: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

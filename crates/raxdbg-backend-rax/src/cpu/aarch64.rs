@@ -237,6 +237,7 @@ impl RaxArm64Cpu {
             RegId::Ip1 => self.x(17)?,
             RegId::Nzcv => u64::from(self.core().nzcv_bits()),
             RegId::CpacrEl1 => self.core().cpacr_el1(),
+            RegId::Fpcr => u64::from(self.core().fpcr_value()),
             RegId::TpidrEl0 => self.core().tpidr_el0(),
             RegId::TpidrroEl0 => self.core().tpidrro_el0(),
             other => return Err(BackendError::UnsupportedRegister(other)),
@@ -263,11 +264,32 @@ impl RaxArm64Cpu {
             RegId::Ip1 => self.set_x(17, value)?,
             RegId::Nzcv => self.core_mut().set_nzcv_bits(value as u8),
             RegId::CpacrEl1 => self.core_mut().set_cpacr_el1(value),
+            RegId::Fpcr => self.core_mut().set_fpcr_value(value as u32),
             RegId::TpidrEl0 => self.core_mut().set_tpidr_el0(value),
             RegId::TpidrroEl0 => self.core_mut().set_tpidrro_el0(value),
             other => return Err(BackendError::UnsupportedRegister(other)),
         }
         Ok(())
+    }
+
+    /// Reads the floating-point control register.
+    pub fn fpcr(&self) -> u32 {
+        self.core().fpcr_value()
+    }
+
+    /// Writes the floating-point control register.
+    pub fn set_fpcr(&mut self, value: u32) {
+        self.core_mut().set_fpcr_value(value);
+    }
+
+    /// Reads the floating-point status register.
+    pub fn fpsr(&self) -> u32 {
+        self.core().fpsr_value()
+    }
+
+    /// Writes the floating-point status register.
+    pub fn set_fpsr(&mut self, value: u32) {
+        self.core_mut().set_fpsr_value(value);
     }
 
     /// Reads a 128-bit vector register.

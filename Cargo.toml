@@ -27,6 +27,10 @@ sha2 = "0.10"
 raxdbg-core = { path = "crates/raxdbg-core" }
 raxdbg-backend-rax = { path = "crates/raxdbg-backend-rax" }
 raxdbg-android = { path = "crates/raxdbg-android" }
+# The GDB remote serial protocol, driven by `debug --gdb`; `gdbstub_arch`
+# supplies the GDB-defined ARM64/ARM32 register layouts and target XML.
+gdbstub = "=0.7.10"
+gdbstub_arch = "=0.3.3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

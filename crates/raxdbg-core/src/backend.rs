@@ -463,6 +463,33 @@ pub trait Backend {
     /// Writes a 128-bit vector register.
     fn reg_write_vector(&mut self, reg: RegId, v: [u8; 16]) -> Result<(), BackendError>;
 
+    /// Reads the floating-point control register (`FPCR` on AArch64).
+    ///
+    /// AArch32 has no `FPCR`: its status register is [`RegId::Fpscr`], which
+    /// [`Backend::reg_read`] already answers. A backend without the register
+    /// returns [`BackendError::UnsupportedRegister`].
+    fn fpcr_read(&self) -> Result<u32, BackendError> {
+        Err(BackendError::UnsupportedRegister(RegId::Fpscr))
+    }
+
+    /// Writes the floating-point control register. See [`Backend::fpcr_read`].
+    fn fpcr_write(&mut self, _value: u32) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedRegister(RegId::Fpscr))
+    }
+
+    /// Reads the floating-point status register (`FPSR` on AArch64).
+    ///
+    /// A backend without the register returns
+    /// [`BackendError::UnsupportedRegister`].
+    fn fpsr_read(&self) -> Result<u32, BackendError> {
+        Err(BackendError::UnsupportedRegister(RegId::Fpscr))
+    }
+
+    /// Writes the floating-point status register. See [`Backend::fpsr_read`].
+    fn fpsr_write(&mut self, _value: u32) -> Result<(), BackendError> {
+        Err(BackendError::UnsupportedRegister(RegId::Fpscr))
+    }
+
     /// Reads `size` bytes of guest memory.
     fn mem_read(&self, addr: u64, size: usize) -> Result<Vec<u8>, BackendError>;
 

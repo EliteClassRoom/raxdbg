@@ -613,3 +613,168 @@ impl Svc for MediaRelease {
         "AMediaDrm_release"
     }
 }
+
+// -----------------------------------------------------------------------------
+// Linker64 (/system/bin/linker64)
+// -----------------------------------------------------------------------------
+
+/// A virtual module standing in for Android's dynamic linker executable.
+///
+/// Protected native code does not use `dlopen` to reach the linker. It walks
+/// its own `dl_iterate_phdr` list for the `PT_INTERP` entry, reads the
+/// interpreter path, and then `dlopen`s that executable so it can `dlsym` the
+/// linker's *private* symbols — `g_dl_mutex` and the `do_dlopen` overloads that
+/// no shared library exports, because on a real device they live inside
+/// `linker64` itself. Virbox, Jiagu and the other commercial packers all open
+/// `/system/bin/linker64` this way.
+///
+/// unidbg has no `Linker64` module: the guest libraries it runs ask for
+/// `dlopen` and are satisfied by [`crate::linux::android::arm_ld`]. A packer
+/// that wants the linker's internals finds nothing, and bails out of its
+/// unpacking loop with a success status — which looks exactly like a library
+/// that simply has no work to do.
+///
+/// The names below are the linker's own mangled symbols, so the guest's
+/// `dlsym` finds them by the same string it would use on a device:
+///
+/// - `__dl__ZL10g_dl_mutex` is the linker's global loader lock; a guest that
+///   only wants to prove the linker is real reads it and never calls it.
+/// - `__dl__Z9do_dlopenPKciPK17android_dlextinfo` and its `PKv` sibling are
+///   the two `do_dlopen` overloads, which gained a trailing
+///   `namespace_android::loader::FdInput` pointer in Android 10 and are
+///   selected by the guest on the SDK level it detected.
+/// - `__dl__Z8__dlopenPKciPKv` is the internal `__dlopen` every `dlopen` in
+///   the linker's address space funnels through.
+///
+/// The `g_dl_mutex` stub hands back the SVC stub's own address: it is a real,
+/// non-NULL, writable-looking pointer, which is what the guest checks, and
+/// nothing dereferences it. The `do_dlopen` stubs forward to the loader's own
+/// `dlopen`, so a guest that actually calls one gets real behaviour.
+pub struct Linker64;
+
+impl Linker64 {
+    /// Registers `/system/bin/linker64`'s private symbols on `loader`.
+    ///
+    /// The module is named `linker64` so the loader's `dlopen` finds it by
+    /// basename, whether the guest passes the bare name or the full
+    /// `/system/bin/linker64` path an interpreter string carries.
+    pub fn register(loader: &Rc<AndroidElfLoader>) -> Result<(), ElfError> {
+        let kind = kind_for(loader);
+        let shared = Rc::clone(loader);
+        let stubs: Vec<(String, Box<dyn Svc>)> = vec![
+            (
+                "__dl__ZL10g_dl_mutex".into(),
+                Box::new(LinkerSymbolValue { kind, value: 0 }),
+            ),
+            (
+                "__dl__Z9do_dlopenPKciPK17android_dlextinfo".into(),
+                Box::new(LinkerDoDlopen::new(kind, Rc::clone(&shared), false)),
+            ),
+            (
+                "__dl__Z9do_dlopenPKciPK17android_dlextinfoPKv".into(),
+                Box::new(LinkerDoDlopen::new(kind, Rc::clone(&shared), true)),
+            ),
+            (
+                "__dl__Z8__dlopenPKciPKv".into(),
+                Box::new(LinkerDoDlopen::new(kind, shared, true)),
+            ),
+        ];
+        register_virtual_module(loader, "linker64", stubs)
+    }
+}
+
+/// A linker symbol the guest only ever takes the address of.
+///
+/// `g_dl_mutex` is a `pthread_mutex_t*`, so the guest's check is "is this
+/// non-NULL", and the stub's own address answers that: it is a mapped,
+/// readable, writable byte in the SVC page, which is exactly what a real
+/// mutex address would be.
+struct LinkerSymbolValue {
+    kind: SvcKind,
+    /// The value to hand back, or 0 to mean "this stub's own address".
+    value: u64,
+}
+impl Svc for LinkerSymbolValue {
+    fn handle(&mut self, backend: &mut dyn Backend) -> RunResult {
+        if self.value != 0 {
+            return Ok(self.value as i64);
+        }
+        Ok(backend.reg_read(raxdbg_core::reg::RegId::Pc)? as i64)
+    }
+    fn kind(&self) -> SvcKind {
+        self.kind
+    }
+    fn name(&self) -> &str {
+        "__dl__ZL10g_dl_mutex"
+    }
+}
+
+/// The linker's `do_dlopen`, forwarded to the loader's own `dlopen`.
+///
+/// A real `do_dlopen` returns a `soinfo*`; the loader has no `soinfo`, but it
+/// does have a per-module base address, and that is the identity a guest
+/// passes back to `dlsym`. Returning the base is therefore enough for the
+/// guest to look a private symbol up and find the stubs above.
+struct LinkerDoDlopen {
+    kind: SvcKind,
+    pointer_size: usize,
+    loader: Rc<AndroidElfLoader>,
+    /// The `PKv` overload, whose `android_dlextinfo*` argument is followed by
+    /// an extra `loader::FdInput*`. The guest shifts its arguments by one
+    /// pointer when it is the later one, so the filename lands in a different
+    /// register.
+    extended: bool,
+}
+impl LinkerDoDlopen {
+    fn new(kind: SvcKind, loader: Rc<AndroidElfLoader>, extended: bool) -> Self {
+        let pointer_size = if loader.is_64bit() { 8 } else { 4 };
+        Self {
+            kind,
+            pointer_size,
+            loader,
+            extended,
+        }
+    }
+
+    /// Reads the filename pointer, honouring the `PKv` overload's extra
+    /// argument.
+    fn filename_pointer(&self, backend: &mut dyn Backend) -> Result<u64, RunError> {
+        if self.pointer_size == 8 {
+            Ok(backend.reg_read(raxdbg_core::reg::RegId::X(0))?)
+        } else {
+            Ok(u64::from(
+                backend.reg_read(raxdbg_core::reg::RegId::R(0))? as u32,
+            ))
+        }
+    }
+}
+impl Svc for LinkerDoDlopen {
+    fn handle(&mut self, backend: &mut dyn Backend) -> RunResult {
+        let filename = read_c_string(
+            &Pointer::new(
+                Rc::clone(self.loader.memory()) as Rc<dyn Memory>,
+                self.filename_pointer(backend)?,
+            ),
+            1024,
+        )
+        .map_err(|error| {
+            RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+        })?;
+        Ok(self
+            .loader
+            .dlopen(&filename, false)
+            .map(|name| {
+                self.loader
+                    .module(&name)
+                    .map(|module| module.base)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0) as i64)
+    }
+    fn kind(&self) -> SvcKind {
+        self.kind
+    }
+    fn name(&self) -> &str {
+        "__dl__Z9do_dlopenPKciPK17android_dlextinfo"
+    }
+}

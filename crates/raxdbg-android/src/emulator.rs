@@ -25,7 +25,7 @@ use crate::linux::android::arm_ld::ArmLd64;
 use crate::linux::android::resolver::AndroidResolver;
 use crate::linux::android::system_property::{SystemPropertyHook, SystemPropertyProvider};
 use crate::linux::android::virtual_module::{
-    AndroidModule, JniGraphics, MediaNdkModule, SystemProperties,
+    AndroidModule, JniGraphics, Linker64, MediaNdkModule, SystemProperties,
 };
 use crate::syscall::android::{AndroidSyscallHandler, SyscallHook};
 
@@ -275,6 +275,11 @@ impl AndroidEmulator {
         SystemProperties::register(&self.loader)?;
         JniGraphics::register(&self.loader)?;
         MediaNdkModule::register(&self.loader)?;
+        // `/system/bin/linker64` as a virtual module. A packer resolves the
+        // interpreter out of its own program headers and then `dlopen`s it to
+        // reach the linker's private `g_dl_mutex` and `do_dlopen`; without this
+        // the `dlopen` returns NULL and the unpack silently does nothing.
+        Linker64::register(&self.loader)?;
         Ok(())
     }
 
@@ -553,6 +558,32 @@ impl AndroidEmulator {
         )
     }
 
+    /// Sets a guest function call up without running it.
+    ///
+    /// Port of unidbg's `eFunc`/`eEntry` setup: the arguments go into the ABI's
+    /// argument registers, the link register points at the `LR` trap page so
+    /// the callee's `ret` ends the call, and the program counter is at the
+    /// callee. The stack is the same 16-byte-aligned (8 on arm32) frame
+    /// [`AndroidEmulator::call_function`] uses.
+    ///
+    /// A caller that stops before running the call — the GDB server, which waits
+    /// for its client — owns the returned [`PreparedFunctionCall`] and must call
+    /// [`PreparedFunctionCall::finish`] once the call is over.
+    pub fn prepare_function_call(
+        &self,
+        address: u64,
+        args: &[u64],
+    ) -> Result<PreparedFunctionCall, EmulatorError> {
+        AndroidEmulator::prepare_function_call_on(
+            &self.backend,
+            self.loader.memory(),
+            self.trap_address,
+            self.is_64bit,
+            address,
+            args,
+        )
+    }
+
     pub(crate) fn call_function_on(
         backend: &Rc<RefCell<dyn Backend>>,
         memory: &Rc<Loader>,
@@ -561,6 +592,35 @@ impl AndroidEmulator {
         address: u64,
         args: &[u64],
     ) -> Result<u64, EmulatorError> {
+        let call = AndroidEmulator::prepare_function_call_on(
+            backend, memory, trap, is_64bit, address, args,
+        )?;
+        let result = {
+            let mut backend = backend.borrow_mut();
+            backend.emu_start(address, trap, 0, 0)?;
+            let value = if is_64bit {
+                backend.reg_read(RegId::X(0))?
+            } else {
+                backend.reg_read(RegId::R(0))?
+            };
+            Ok::<u64, EmulatorError>(value)
+        };
+        call.finish();
+        result
+    }
+
+    /// Writes a call's argument registers, link register and program counter.
+    ///
+    /// The half of [`AndroidEmulator::call_function_on`] that does not run the
+    /// guest, so a debugger can hand the prepared state to its own control flow.
+    pub(crate) fn prepare_function_call_on(
+        backend: &Rc<RefCell<dyn Backend>>,
+        memory: &Rc<Loader>,
+        trap: u64,
+        is_64bit: bool,
+        address: u64,
+        args: &[u64],
+    ) -> Result<PreparedFunctionCall, EmulatorError> {
         // The ABI requires a 16-byte-aligned stack at a call boundary, and
         // `write_stack_string` (which a caller uses to build arguments) aligns
         // its own allocation to four bytes. bionic's `ldp`/`stp` take an
@@ -568,7 +628,7 @@ impl AndroidEmulator {
         let align = if is_64bit { 16 } else { 8 };
         let sp = (memory.get_stack_point() - align) & !(align - 1);
         memory.set_stack_point(sp);
-        let result = {
+        {
             let mut backend = backend.borrow_mut();
             for (index, arg) in args.iter().enumerate() {
                 let reg = if is_64bit {
@@ -579,16 +639,12 @@ impl AndroidEmulator {
                 backend.reg_write(reg, *arg)?;
             }
             backend.reg_write(RegId::Lr, trap)?;
-            backend.emu_start(address, trap, 0, 0)?;
-            let value = if is_64bit {
-                backend.reg_read(RegId::X(0))?
-            } else {
-                backend.reg_read(RegId::R(0))?
-            };
-            Ok::<u64, EmulatorError>(value)
-        };
-        memory.set_stack_point(sp + align);
-        result
+            backend.reg_write(RegId::Pc, address)?;
+        }
+        Ok(PreparedFunctionCall {
+            memory: Rc::clone(memory),
+            restore: sp + align,
+        })
     }
 
     /// Registers the guest's `malloc`/`free` with the memory facade once
@@ -616,6 +672,31 @@ impl AndroidEmulator {
     /// Runs `address` with no arguments, as a module initialiser.
     pub fn call_init(&self, address: u64) -> Result<u64, EmulatorError> {
         self.call_function(address, &[])
+    }
+}
+
+/// A guest call that has been set up but not run.
+///
+/// [`AndroidEmulator::prepare_function_call`] returns one: the stack has been
+/// moved down for the call frame, and the guest's argument, link and program
+/// counters are set. [`PreparedFunctionCall::finish`] gives the stack back,
+/// which every path out of the call owes the emulator — a debugger that stops
+/// before the call runs holds this across its whole session.
+pub struct PreparedFunctionCall {
+    memory: Rc<Loader>,
+    /// The stack pointer to restore, which is the call frame's top.
+    restore: u64,
+}
+
+impl PreparedFunctionCall {
+    /// The stack pointer the call reserved, for a caller that has to report it.
+    pub fn frame_base(&self) -> u64 {
+        self.restore
+    }
+
+    /// Gives the stack back to the emulator. Called exactly once.
+    pub fn finish(self) {
+        self.memory.set_stack_point(self.restore);
     }
 }
 

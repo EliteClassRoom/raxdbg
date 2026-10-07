@@ -44,6 +44,10 @@ pub enum RegId {
     Nzcv,
     /// `CPACR_EL1`.
     CpacrEl1,
+    /// `FPCR` (AArch64 floating-point control register).
+    ///
+    /// AArch32 has no `FPCR`; its status register is [`RegId::Fpscr`].
+    Fpcr,
     /// `TPIDR_EL0` (thread pointer, the guest's TLS base).
     TpidrEl0,
     /// `TPIDRRO_EL0` (read-only thread pointer).
@@ -142,6 +146,7 @@ impl fmt::Display for RegId {
             RegId::Ip1 => f.write_str("ip1"),
             RegId::Nzcv => f.write_str("nzcv"),
             RegId::CpacrEl1 => f.write_str("cpacr_el1"),
+            RegId::Fpcr => f.write_str("fpcr"),
             RegId::TpidrEl0 => f.write_str("tpidr_el0"),
             RegId::TpidrroEl0 => f.write_str("tpidrro_el0"),
             RegId::R(n) => write!(f, "r{n}"),
@@ -236,6 +241,7 @@ pub const ARM64_REGS: &[RegId] = &[
     RegId::Ip1,
     RegId::Nzcv,
     RegId::CpacrEl1,
+    RegId::Fpcr,
     RegId::TpidrEl0,
     RegId::TpidrroEl0,
 ];

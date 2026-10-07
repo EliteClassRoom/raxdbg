@@ -30,6 +30,7 @@ use raxdbg_core::reg::RegId;
 use raxdbg_core::svc::SvcMemory;
 
 use crate::android_file::{LibraryFile, LibraryResolver};
+use crate::elf::auxv::{self, MainProgram};
 use crate::elf::init::InitFunction;
 use crate::elf::module::{MemRegion, Module};
 use crate::elf::symbol::{ElfSymbol, ModuleSymbol, Symbol, WEAK_BASE};
@@ -170,6 +171,10 @@ pub struct AndroidElfLoader {
     /// Gates which initialisers run, as unidbg's `InitFunctionFilter` does.
     init_filter: RefCell<Option<Rc<dyn InitFunctionFilter>>>,
     rng: RefCell<Rng>,
+    /// The `app_process` image the auxv's `AT_BASE`/`AT_PHDR`/`AT_ENTRY`
+    /// describe. Every process has one, and protected code reads it to find
+    /// the real linker, so it is mapped before the stack is built.
+    main_program: RefCell<Option<MainProgram>>,
 }
 
 impl std::fmt::Debug for AndroidElfLoader {
@@ -210,7 +215,14 @@ impl AndroidElfLoader {
             init_caller: RefCell::new(None),
             init_filter: RefCell::new(None),
             rng: RefCell::new(Rng::new(seed)),
+            main_program: RefCell::new(None),
         });
+        // The main program has to exist before the auxv is written, because
+        // `AT_BASE`, `AT_PHDR` and `AT_ENTRY` are its addresses. Every Linux
+        // process has one; here it is a minimal ELF standing in for
+        // `app_process`.
+        let main_program = MainProgram::map(loader.memory.as_ref(), is_64bit)?;
+        loader.main_program.replace(Some(main_program));
         loader.setup_stack(process_name)?;
         Ok(loader)
     }
@@ -254,16 +266,54 @@ impl AndroidElfLoader {
         let program_name_pointer = memory.allocate_stack(pointer_size)?;
         program_name_pointer.write_pointer(0, program_name.peer())?;
 
-        let auxv = memory.allocate_stack(0x100)?;
-        // AT_RANDOM's *value* is a pointer to 16 bytes of randomness on the
-        // stack, which is why the guard slot's address is what goes in the
-        // array; bionic dereferences it in `__libc_init_common`.
-        const AT_RANDOM: u64 = 25;
-        const AT_PAGESZ: u64 = 6;
-        auxv.write_pointer(0, AT_RANDOM)?;
-        auxv.write_pointer(pointer_size as u64, stack_chk_guard.peer())?;
-        auxv.write_pointer(pointer_size as u64 * 2, AT_PAGESZ)?;
-        auxv.write_pointer(pointer_size as u64 * 3, PAGE_SIZE)?;
+        // AT_RANDOM's *value* is a pointer to 16 bytes of randomness, which
+        // is the stack canary slot; bionic dereferences it in
+        // `__libc_init_common`, and so does every packer that wants a
+        // per-process seed. AT_PLATFORM's value is a string the guest may
+        // read, so it needs a home of its own.
+        let platform = memory.write_stack_string(
+            self.main_program
+                .borrow()
+                .as_ref()
+                .map(|program| program.platform())
+                .unwrap_or(if self.is_64bit { "aarch64" } else { "armv7l" }),
+        )?;
+        // A loader built without a main program still has to publish the tags
+        // bionic reads unconditionally, or the guest faults in
+        // `__libc_init_common` before it reaches any of the library's code.
+        let entries = match self.main_program.borrow().as_ref() {
+            Some(program) => program.entries(stack_chk_guard.peer(), platform.peer()),
+            None => auxv::baseline_entries(stack_chk_guard.peer()),
+        };
+        // The array is sized from what it holds. A fixed size is what this
+        // used to do, and it is what broke when the entry list grew: the
+        // overflow ran into the `argv` block allocated next to it and
+        // corrupted the argc the guest reads at startup. One page covers
+        // every tag Linux defines on either ABI with room to spare.
+        let auxv_size = ((entries.len() as u64 + 1) * pointer_size as u64 * 2)
+            .next_multiple_of(PAGE_SIZE as u64);
+        let auxv = memory.allocate_stack(auxv_size as usize)?;
+        // An auxv entry is a `(tag, value)` pair of words, so the stride
+        // between entries is twice the pointer size. Advancing by one word
+        // per entry writes each tag on top of the previous entry's value and
+        // leaves the array holding nothing but tags.
+        let stride = pointer_size as u64 * 2;
+        for (index, (tag, value)) in entries.iter().enumerate() {
+            auxv.write_pointer(stride * index as u64, *tag)?;
+            auxv.write_pointer(stride * index as u64 + pointer_size as u64, *value)?;
+        }
+        // AT_NULL terminates the array, and the kernel always follows it with
+        // a zero word; bionic's `getauxval` stops on the tag, but a guest that
+        // walks the pairs needs the padding to stay in bounds.
+        //
+        // The offset steps over *both* words of every entry. Advancing by one
+        // word per entry instead writes the terminator on top of the last
+        // entry's tag, which makes `getauxval` report that tag missing -- and
+        // `__libc_init_common` dereferences `getauxval(AT_RANDOM)` without a
+        // null check, so a missing AT_RANDOM is an immediate fault.
+        let at = pointer_size as u64 * 2 * entries.len() as u64;
+        auxv.write_pointer(at, auxv::tag::NULL)?;
+        auxv.write_pointer(at + pointer_size as u64, 0)?;
 
         let env_list: Vec<&str> = envs
             .iter()

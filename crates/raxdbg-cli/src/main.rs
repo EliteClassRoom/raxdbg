@@ -23,6 +23,7 @@ use raxdbg_core::reg::RegId;
 use raxdbg_core::unwind::{NoSymbols, SymbolResolver, Unwinder};
 
 mod console;
+mod gdb;
 mod options;
 
 use options::{Command, Options, SyscallDetail};
@@ -62,7 +63,7 @@ commands:
   info      <lib.so>   print the modules, their exports and their dependencies
   trace     <lib.so>   trace instructions, memory accesses or function calls while calling a function
   syscalls  <lib.so>   log every syscall, then report the protection checks seen
-  debug     <lib.so>   open the console debugger
+  debug     <lib.so>   open the console debugger, or serve GDB with --gdb
 
 options:
   --abi arm64|arm32     guest ABI (default: arm64)
@@ -71,10 +72,13 @@ options:
   --root <dir>          the directory guest paths resolve under
   --call <name(args)>   the function to call, then its arguments
   --code|--read|--write|--functions which trace to run (trace)
+  --jni-args            (trace) also print the arguments of each JNIEnv/JavaVM call
   --out <file>           (trace) write the trace lines there instead of this terminal
   -v                     (syscalls) also print the syscalls that carry a path
   -vv                    (syscalls) print every syscall
   --jni-on-load          (syscalls, trace) run the library's JNI_OnLoad first
+  --gdb <port>           (debug) serve the GDB remote protocol on this TCP port
+  --gdb-bind <ip>        (debug) the address to listen on (default: 127.0.0.1)
   --leak-check          report live allocations when the run finishes
   --seed <n>            seed the random source, for reproducibility
   --stdout <file>       write the guest's stdout there instead of this terminal
@@ -85,7 +89,10 @@ fn run(options: &Options) -> Result<(), String> {
         Command::Info { library } => info(options, library),
         Command::Run { library } => execute(options, library),
         Command::Trace { library } => execute(options, library),
-        Command::Debug { library } => console::debug_session(options, library),
+        Command::Debug { library } => match options.gdb_port {
+            Some(port) => gdb::debug_session(options, library, port),
+            None => console::debug_session(options, library),
+        },
         Command::Syscalls { library } => syscalls(options, library),
     }
 }
