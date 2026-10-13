@@ -65,6 +65,14 @@ pub struct Module {
     pub resolved_symbols: BTreeMap<String, super::symbol::ModuleSymbol>,
     /// The initialisers to run, in order.
     pub init_functions: Vec<super::init::InitFunction>,
+    /// Whether the module's initialisers have run, or have been settled
+    /// without running -- which is what unidbg's `dlopen` does when
+    /// initialisers are off.
+    ///
+    /// The list is kept either way: it is the record of what the module
+    /// carries, and [`ModuleInfo::init_functions`](super::loader::ModuleInfo::init_functions)
+    /// reports it. This flag is what decides whether they run again.
+    pub init_functions_ran: bool,
     /// Dependency basenames, resolved through the loader's module table.
     pub needed_libraries: Vec<String>,
     /// The regions this module occupies.
@@ -108,6 +116,7 @@ impl Module {
             unresolved: Vec::new(),
             resolved_symbols: BTreeMap::new(),
             init_functions: Vec::new(),
+            init_functions_ran: false,
             needed_libraries: Vec::new(),
             regions: Vec::new(),
             hook_map: BTreeMap::new(),

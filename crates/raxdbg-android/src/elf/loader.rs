@@ -12,10 +12,10 @@
 //! core [`Loader`], which this type delegates to through [`AndroidElfLoader::memory`].
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use crate::elf::init::InitFunctionFilter;
+use crate::elf::init::{InitCall, InitFunctionFilter, InitFunctionListener, InitKind};
 use crate::elf::packed;
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 use goblin::elf::{Elf, dynamic, header};
@@ -168,6 +168,15 @@ pub struct AndroidElfLoader {
     max_so_name: RefCell<Option<String>>,
     max_size_of_so: Cell<u64>,
     init_caller: RefCell<Option<Rc<dyn InitCaller>>>,
+    /// The order modules were loaded in, which is dependency-first: a module
+    /// is inserted here only after its `DT_NEEDED` set has resolved. The
+    /// `BTreeMap` above stays the lookup table, because a lookup by name wants
+    /// `O(log n)`; walking it gives *name* order, and libc++ sorts before
+    /// libc. bionic constructs a `dlopen` closure in dependency order, so this
+    /// vector is what the walk follows.
+    module_order: RefCell<Vec<String>>,
+    /// Watches each initialiser as it is about to run.
+    init_listener: RefCell<Option<Rc<dyn InitFunctionListener>>>,
     /// Gates which initialisers run, as unidbg's `InitFunctionFilter` does.
     init_filter: RefCell<Option<Rc<dyn InitFunctionFilter>>>,
     rng: RefCell<Rng>,
@@ -213,6 +222,8 @@ impl AndroidElfLoader {
             max_so_name: RefCell::new(None),
             max_size_of_so: Cell::new(0),
             init_caller: RefCell::new(None),
+            module_order: RefCell::new(Vec::new()),
+            init_listener: RefCell::new(None),
             init_filter: RefCell::new(None),
             rng: RefCell::new(Rng::new(seed)),
             main_program: RefCell::new(None),
@@ -443,21 +454,16 @@ impl AndroidElfLoader {
         self.resolve_symbols(!force_call_init);
 
         if self.call_init_function.get() || force_call_init {
-            let names: Vec<String> = self.modules.borrow().keys().cloned().collect();
-            let ran = self.init_caller.borrow().is_some();
+            // Load order, not name order: a module's dependencies are mapped
+            // before it, so their initialisers run first -- which is what
+            // bionic's linker does when it constructs a `dlopen` closure. The
+            // `BTreeMap` walk this replaced put libc++ before libc, and
+            // libc++'s initialiser reads state libc builds.
+            let names = self.module_order.borrow().clone();
             for module_name in names {
                 let force = force_call_init && module_name == name;
                 if self.call_init_function.get() || force {
                     self.call_init_functions(&module_name)?;
-                }
-                // unidbg always clears the list here because it always runs
-                // the initialisers. raxdbg keeps them when nothing ran them
-                // (no emulator is attached yet), so the loader still reports
-                // what a module wanted to run.
-                if ran {
-                    if let Some(module) = self.modules.borrow_mut().get_mut(&module_name) {
-                        module.init_functions.clear();
-                    }
                 }
             }
         }
@@ -484,13 +490,26 @@ impl AndroidElfLoader {
         *self.init_caller.borrow_mut() = Some(caller);
     }
 
-    fn call_init_functions(&self, name: &str) -> Result<(), ElfError> {
+    /// Installs the listener told about each initialiser as it starts.
+    pub fn set_init_function_listener(&self, listener: Rc<dyn InitFunctionListener>) {
+        *self.init_listener.borrow_mut() = Some(listener);
+    }
+
+    /// Runs the initialisers `name` still owes, returning how many ran.
+    ///
+    /// A module whose initialisers already ran, or were settled without
+    /// running, is a no-op: the flag decides, not the list. A module with no
+    /// emulator attached cannot run them either, and its list stays pending so
+    /// a later `call_constructors` can.
+    fn call_init_functions(&self, name: &str) -> Result<usize, ElfError> {
         let functions = match self.modules.borrow().get(name) {
-            Some(module) => module.init_functions.clone(),
-            None => return Ok(()),
+            Some(module) if !module.init_functions_ran => module.init_functions.clone(),
+            _ => return Ok(0),
         };
         let caller = self.init_caller.borrow().clone();
         let filter = self.init_filter.borrow().clone();
+        let listener = self.init_listener.borrow().clone();
+        let count = functions.len();
         // Each initialiser is entered as if from the kernel: `x18` carries the
         // thread pointer, which bionic's own `__libc_init` clobbers as it runs
         // (`x18` is a platform register, free for it to use). A module
@@ -505,7 +524,8 @@ impl AndroidElfLoader {
             .reg_read(RegId::TpidrEl0)
             .ok()
             .filter(|value| *value != 0);
-        for function in functions {
+        let mut called = 0usize;
+        for (index, function) in functions.iter().enumerate() {
             let address = function.address(self.memory.as_ref())?;
             if address == 0 || address == u64::MAX {
                 continue;
@@ -515,6 +535,19 @@ impl AndroidElfLoader {
                     continue;
                 }
             }
+            // The ordinal is the entry's slot in the module's whole list, so
+            // a filtered entry leaves a gap rather than renumbering the rest.
+            let init_call = InitCall {
+                module: name,
+                kind: function.kind(),
+                index,
+                count,
+                address,
+            };
+            log::info!("{}", init_call.label());
+            if let Some(listener) = listener.as_ref() {
+                listener.on_pre_call_init_function(&init_call);
+            }
             if let (Some(pointer), true) = (thread_pointer, self.is_64bit) {
                 self.backend
                     .borrow_mut()
@@ -522,9 +555,65 @@ impl AndroidElfLoader {
             }
             if let Some(caller) = &caller {
                 caller.call_init(address)?;
+                called += 1;
             }
         }
-        Ok(())
+        // A fault inside an initialiser leaves the flag unset, which is the
+        // honest state: the run is over anyway, because every caller
+        // propagates the `Err`.
+        if caller.is_some() {
+            if let Some(module) = self.modules.borrow_mut().get_mut(name) {
+                module.init_functions_ran = true;
+            }
+        }
+        Ok(called)
+    }
+
+    /// Runs the initialisers a module still owes, dependencies first.
+    ///
+    /// bionic's linker constructs a `dlopen`ed library's closure before
+    /// anything can call into it: every module it needs is constructed first,
+    /// and within a module `.preinit_array` runs before `.init`, which runs
+    /// before `.init_array`. `JNI_OnLoad` is reached only after that, so this
+    /// is what brings a module up when the load itself was asked not to.
+    /// Modules whose initialisers already ran are skipped, which makes this a
+    /// no-op after a normal load. Returns how many initialisers ran.
+    pub fn call_constructors(&self, name: &str) -> Result<usize, ElfError> {
+        // Nothing can run them without an emulator to run them in, so the
+        // pending lists stay pending and are still the module's record.
+        if self.init_caller.borrow().is_none() {
+            return Ok(0);
+        }
+        let mut order = Vec::new();
+        let mut visited = BTreeSet::new();
+        self.collect_constructor_order(name, &mut visited, &mut order);
+        let mut ran = 0;
+        for module in order {
+            ran += self.call_init_functions(&module)?;
+        }
+        Ok(ran)
+    }
+
+    /// Post-order walk of a module's dependency closure: every dependency
+    /// lands in `order` before the module that needs it.
+    ///
+    /// A cycle terminates on `visited`; a `DT_NEEDED` name with no module
+    /// behind it (the loader has one) is a leaf.
+    fn collect_constructor_order(
+        &self,
+        name: &str,
+        visited: &mut BTreeSet<String>,
+        order: &mut Vec<String>,
+    ) {
+        if !visited.insert(name.to_string()) {
+            return;
+        }
+        if let Some(needed) = self.modules.borrow().get(name) {
+            for dependency in &needed.needed_libraries {
+                self.collect_constructor_order(dependency, visited, order);
+            }
+        }
+        order.push(name.to_string());
     }
 
     /// Resolves every pending relocation across every loaded module.
@@ -583,8 +672,11 @@ impl AndroidElfLoader {
             Ok(name) => {
                 self.resolve_symbols(false);
                 if !self.call_init_function.get() {
+                    // Settled without running: a `dlopen` with initialisers
+                    // off leaves the module up but never calls them, and the
+                    // list stays as the record of what it carries.
                     for module in self.modules.borrow_mut().values_mut() {
-                        module.init_functions.clear();
+                        module.init_functions_ran = true;
                     }
                 }
                 if let Some(module) = self.modules.borrow_mut().get_mut(&name) {
@@ -656,6 +748,10 @@ impl AndroidElfLoader {
         module.reference_count = module.reference_count.saturating_sub(1);
         if module.reference_count == 0 {
             let module = modules.remove(&name).expect("just looked up");
+            drop(modules);
+            // The load order holds the same name; leaving it would make a
+            // later walk look for a module that is no longer mapped.
+            self.module_order.borrow_mut().retain(|other| other != &name);
             self.unload(&module);
         }
         true
@@ -688,6 +784,7 @@ impl AndroidElfLoader {
         let (base, size) = align(first, last - first, PAGE_SIZE);
         let module = Module::virtual_module(base, size, name, symbols);
         self.modules.borrow_mut().insert(name.to_string(), module);
+        self.note_module_order(name);
         self.note_module_name(name);
         Ok(())
     }
@@ -835,6 +932,19 @@ impl AndroidElfLoader {
         let mut max = self.max_so_name.borrow_mut();
         if max.as_ref().is_none_or(|current| name.len() > current.len()) {
             *max = Some(name.to_string());
+        }
+    }
+
+    /// Records a module's place in the load order.
+    ///
+    /// Called after the module is in the table, which for a file-backed module
+    /// is after its `DT_NEEDED` set has been resolved -- so the order this
+    /// builds is dependency-first. A reloaded name keeps its first position,
+    /// because a module's dependencies did not change.
+    fn note_module_order(&self, name: &str) {
+        let mut order = self.module_order.borrow_mut();
+        if !order.iter().any(|other| other == name) {
+            order.push(name.to_string());
         }
     }
 
@@ -1153,6 +1263,7 @@ impl AndroidElfLoader {
                     init_functions.push(InitFunction::Absolute {
                         load_base,
                         lib_name: so_name.clone(),
+                        kind: InitKind::PreinitArray,
                         ptr,
                         address,
                     });
@@ -1181,6 +1292,7 @@ impl AndroidElfLoader {
                     init_functions.push(InitFunction::Absolute {
                         load_base,
                         lib_name: so_name.clone(),
+                        kind: InitKind::InitArray,
                         ptr,
                         address,
                     });
@@ -1243,6 +1355,7 @@ impl AndroidElfLoader {
         }
 
         self.modules.borrow_mut().insert(so_name.clone(), module);
+        self.note_module_order(&so_name);
         self.note_module_name(&so_name);
         if bound_high > self.max_size_of_so.get() {
             self.max_size_of_so.set(bound_high);

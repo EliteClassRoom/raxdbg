@@ -176,6 +176,21 @@ fn trace_runs_jni_on_load_and_logs_the_calls_it_makes() {
             );
         }
     }
+    // The log opens with the phases the run went through and reaches the
+    // marker naming the entry point before the calls it makes. libc.so, which
+    // the fixture needs, contributes the eleven `init_array` markers; the
+    // fixture itself carries none.
+    let marker = text
+        .find("[libjnitest.so] JNI_OnLoad 0x")
+        .expect("the log names the entry point");
+    let first_call = text.find("\ncall ").expect("the log has calls");
+    assert!(marker < first_call, "the marker comes before the calls:\n{text}");
+    assert!(
+        text.lines()
+            .next()
+            .is_some_and(|line| line.starts_with("[libc.so] .init_array[1/11] 0x")),
+        "and the phases come before that:\n{text}"
+    );
     std::fs::remove_file(&log).ok();
 }
 
@@ -302,6 +317,45 @@ fn syscalls_runs_jni_on_load_when_asked() {
     assert!(
         stdout.contains("JNI_OnLoad") && stdout.contains("0x10006"),
         "JNI_OnLoad must run and report the version it returned:\n{stdout}"
+    );
+}
+
+/// The initialiser phases are marked, in order, before `JNI_OnLoad`.
+///
+/// `libc.so` is the module here for one reason: it is a bundled library that
+/// carries initialisers (eleven `init_array` slots and no `DT_INIT`), and it
+/// exports no `JNI_OnLoad` -- so the run reports that absence and the markers
+/// are what is left to assert.
+#[test]
+fn syscalls_marks_the_initialiser_phases_before_jni_on_load() {
+    let libc = workspace_root().join("libs/android/sdk23/lib64/libc.so");
+    let output = raxdbg(&["syscalls", libc.to_str().unwrap(), "--jni-on-load"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+
+    let markers: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("[libc.so] .init_array["))
+        .collect();
+    assert_eq!(
+        markers.len(),
+        11,
+        "every one of libc's initialisers is marked:\n{stdout}"
+    );
+    for (index, marker) in markers.iter().enumerate() {
+        assert!(
+            marker.starts_with(&format!("[libc.so] .init_array[{}/11] 0x", index + 1)),
+            "the slots are marked in order: {marker}"
+        );
+    }
+
+    let last = markers.last().expect("eleven markers");
+    let on_load = stdout
+        .find("does not export JNI_OnLoad")
+        .expect("the run reports that libc has no entry point");
+    assert!(
+        stdout.find(last).expect("the marker is in the output") < on_load,
+        "the constructors come before the entry point:\n{stdout}"
     );
 }
 

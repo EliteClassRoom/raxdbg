@@ -89,6 +89,9 @@ pub struct SyntheticLibrary {
     pub symbols: Vec<SyntheticSymbol>,
     pub relocations: Vec<SyntheticRelocation>,
     pub init_array: Vec<u64>,
+    /// `DT_INIT`, the `.init` entry: an offset from the load base, which a
+    /// shared object carries when it has a `.init` section.
+    pub dt_init: Option<u64>,
     pub code: Vec<u32>,
 }
 
@@ -101,6 +104,7 @@ impl SyntheticLibrary {
             symbols: Vec::new(),
             relocations: Vec::new(),
             init_array: vec![MARKER_ADDRESS],
+            dt_init: None,
             // `ret`, then padding; the marker's address is the first word.
             code: vec![0xd65f_03c0, 0xd503_201f],
         }
@@ -266,6 +270,9 @@ impl SyntheticLibrary {
         if !self.init_array.is_empty() {
             entries.push((25, OFF_INIT_ARRAY as u64)); // DT_INIT_ARRAY
             entries.push((27, (self.init_array.len() * 8) as u64)); // DT_INIT_ARRAYSZ
+        }
+        if let Some(init) = self.dt_init {
+            entries.push((12, init)); // DT_INIT
         }
         entries.push((0, 0)); // DT_NULL
         entries

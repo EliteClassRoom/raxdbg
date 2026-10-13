@@ -6,6 +6,9 @@
 //! through the `JNIEnv` table — so every test below exercises the guest's own
 //! code reaching our table, not a host-side shortcut.
 
+#[path = "synthetic/mod.rs"]
+mod synthetic;
+
 use std::rc::Rc;
 
 use raxdbg_android::android_file::ElfLibraryFile;
@@ -579,4 +582,58 @@ fn the_hasher_decides_the_method_ids() {
         "Lcom/raxdbg/test/JniTest;->getSeed()I",
     );
     assert_eq!(vm.hash_method(CLASS, "getSeed", "()I"), expected);
+}
+
+/// `JNI_OnLoad` runs after the module's constructors, the way a device does.
+///
+/// The library here is assembled byte by byte so the two functions are the
+/// whole program: `.init` writes a magic word, and `JNI_OnLoad` reads it back
+/// and returns it. The value can only come back if the constructor ran first --
+/// without it the word is zero, `0` is neither a version nor `JNI_OK`, and
+/// the call fails as `OnLoadFailed(0)`.
+#[test]
+fn jni_on_load_runs_after_the_librarys_initialisers() {
+    use raxdbg_android::android_file::ElfLibraryRawFile;
+    use synthetic::{BINDING_GLOBAL, SHN_ABS, TYPE_FUNC};
+
+    let emulator = AndroidEmulatorBuilder::for_64bit()
+        .process_name("raxdbg-jni-constructors")
+        .seed(31)
+        .build()
+        .expect("emulator");
+    // The load is asked not to run initialisers; `JNI_OnLoad` has to bring
+    // them up itself, which is the case a `--jni-on-load` run creates.
+    emulator.loader().set_call_init_function(false);
+
+    let mut library = synthetic::SyntheticLibrary::new("libjnionload.so");
+    library.init_array.clear();
+    library.dt_init = Some(synthetic::MARKER_ADDRESS);
+    library.symbols.push(synthetic::SyntheticSymbol {
+        name: "JNI_OnLoad".into(),
+        value: 0x120,
+        size: 4,
+        info: (BINDING_GLOBAL << 4) | TYPE_FUNC,
+        shndx: SHN_ABS,
+    });
+    library.code = vec![
+        // .init: adr x1, #0x40 ; movz w2, #6 ; movk w2, #1, lsl #16 ;
+        //         str w2, [x1] ; ret
+        0x1000_0201, 0x5280_00c2, 0x72a0_0022, 0xb900_0022, 0xd65f_03c0,
+        // padding to 0x120
+        0xd503_201f, 0xd503_201f, 0xd503_201f,
+        // JNI_OnLoad: adr x1, #0x20 ; ldr w0, [x1] ; ret
+        0x1000_0101, 0xb940_0020, 0xd65f_03c0,
+    ];
+    let name = emulator
+        .load(Box::new(ElfLibraryRawFile::new("libjnionload.so", library.build())), false)
+        .expect("load");
+    emulator.loader().set_call_init_function(true);
+    assert_eq!(name, "libjnionload.so");
+
+    let vm = Vm::create(&emulator).expect("vm");
+    assert_eq!(
+        Vm::call_jni_on_load(&emulator, &vm, "libjnionload.so").expect("JNI_OnLoad"),
+        JNI_VERSION_1_6,
+        "the constructor's word came back, so it ran first"
+    );
 }

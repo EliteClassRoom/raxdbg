@@ -107,15 +107,26 @@ fn run(options: &Options) -> Result<(), String> {
 fn syscalls(options: &Options, library: &str) -> Result<(), String> {
     let emulator = boot_traced(options, library)?;
     let handle = emulator.syscall().borrow_mut().set_trace();
+    // The markers share the terminal, and a `--jni-on-load` run defers its
+    // load so the constructors are in the trace like everything else. The
+    // listener is installed first either way: a normal load runs its
+    // initialisers during the load below, and their syscalls are recorded
+    // whether or not they are marked.
+    let sink = TraceSink::stdout();
+    if options.jni_on_load {
+        emulator
+            .loader()
+            .set_init_function_listener(Rc::new(PhaseLog { out: sink.clone() }));
+    }
     // `boot_traced` boots the emulator only; the library is loaded here so
     // the trace is on for the load itself.
-    load_into(&emulator, library)?;
+    load_into_maybe_deferred(&emulator, library, options.jni_on_load)?;
 
     // A JNI library does nothing interesting until the VM hands it an
     // environment, and `JNI_OnLoad` is where a protection wrapper runs most
     // of its setup. Run it first, so the trace covers it.
     let on_load = if options.jni_on_load {
-        run_jni_on_load(&emulator, library)
+        run_jni_on_load(&emulator, library, &sink)
     } else {
         None
     };
@@ -184,7 +195,11 @@ fn syscalls(options: &Options, library: &str) -> Result<(), String> {
 /// A failure is a reported string rather than an `Err`: the interesting
 /// part of a protection analysis is *where* it got to, and an error thrown
 /// out of this function would skip the trace and the report entirely.
-fn run_jni_on_load(emulator: &Rc<AndroidEmulator>, library: &str) -> Option<String> {
+fn run_jni_on_load(
+    emulator: &Rc<AndroidEmulator>,
+    library: &str,
+    sink: &TraceSink,
+) -> Option<String> {
     let vm = match Vm::create(emulator) {
         Ok(vm) => vm,
         Err(error) => return Some(format!("could not create the VM: {error}")),
@@ -218,6 +233,16 @@ fn run_jni_on_load(emulator: &Rc<AndroidEmulator>, library: &str) -> Option<Stri
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
         })?;
+    // The constructors come first, and the marker says where the entry point
+    // is even when the module has none: on a device the linker has run them by
+    // the time the JVM calls in. `Vm::call_jni_on_load` would run them too, but
+    // its own marker is a log line, and this stream is the one a reader has.
+    if let Err(error) = emulator.loader().call_constructors(&module) {
+        return Some(report(format!("{}: {error}", display_name(&emulator.loader(), &module))));
+    }
+    if let Some(symbol) = emulator.loader().find_symbol(&module, "JNI_OnLoad") {
+        sink.line(&format!("[{module}] JNI_OnLoad 0x{:x}", symbol.address));
+    }
     match Vm::call_jni_on_load(emulator, &vm, &module) {
         Ok(version) => {
             let shown = display_name(&emulator.loader(), &module);
@@ -235,6 +260,22 @@ fn boot(
 ) -> Result<(Rc<AndroidEmulator>, String), String> {
     let emulator = boot_traced(options, library)?;
     let name = load_into(&emulator, library)?;
+    Ok((emulator, name))
+}
+
+/// [`boot`] with the module's initialisers held back until they are asked for.
+///
+/// A `--jni-on-load` run traces from the constructors on, and a constructor's
+/// own calls are the first thing worth seeing: the trace is attached after the
+/// load, so a constructor that ran at load time would call into a guest nothing
+/// was recording. Holding them back is what puts the whole bring-up inside the
+/// trace.
+fn boot_deferred(
+    options: &Options,
+    library: &str,
+) -> Result<(Rc<AndroidEmulator>, String), String> {
+    let emulator = boot_traced(options, library)?;
+    let name = load_into_maybe_deferred(&emulator, library, true)?;
     Ok((emulator, name))
 }
 
@@ -306,6 +347,25 @@ fn load_into(emulator: &Rc<AndroidEmulator>, library: &str) -> Result<String, St
     Ok(name)
 }
 
+/// [`load_into`], optionally holding the initialisers back.
+///
+/// They are not skipped: `call_constructors` runs them when the run is ready
+/// for them, dependencies first. Only the load-time placement changes.
+fn load_into_maybe_deferred(
+    emulator: &Rc<AndroidEmulator>,
+    library: &str,
+    defer: bool,
+) -> Result<String, String> {
+    if defer {
+        emulator.loader().set_call_init_function(false);
+    }
+    let name = load_into(emulator, library);
+    if defer {
+        emulator.loader().set_call_init_function(true);
+    }
+    name
+}
+
 /// `info`: the modules, their dependencies and their exports.
 fn info(options: &Options, library: &str) -> Result<(), String> {
     let (emulator, _) = boot(options, library)?;
@@ -355,7 +415,15 @@ fn info(options: &Options, library: &str) -> Result<(), String> {
 
 /// `run` and `trace`: load, optionally call, and report.
 fn execute(options: &Options, library: &str) -> Result<(), String> {
-    let (emulator, module) = boot(options, library)?;
+    // A `--call` run calls the guest itself, so its initialisers belong to the
+    // load and run there; only a run whose whole point is `JNI_OnLoad` defers
+    // them, so the trace covers the constructors too.
+    let jni_only = options.jni_on_load && options.call.is_none();
+    let (emulator, module) = if jni_only {
+        boot_deferred(options, library)?
+    } else {
+        boot(options, library)?
+    };
 
     let tracker = emulator.memory().tracker();
 
@@ -368,7 +436,7 @@ fn execute(options: &Options, library: &str) -> Result<(), String> {
     let result = match (&options.call, jni_target) {
         (Some(call), _) => {
             let address = resolve_callable(&emulator, call)?;
-            let trace = Trace::attach(options, &emulator, &module)?;
+            let trace = Trace::attach(options, &emulator, &module, None)?;
             // A guest that called `exit` ended on purpose. That is a normal
             // end of a run, not a failure, and reporting it as an error
             // would say the emulation broke when it worked.
@@ -385,10 +453,19 @@ fn execute(options: &Options, library: &str) -> Result<(), String> {
             outcome
         }
         (None, Some(module_name)) => {
-            // The trace is installed before the call, so `JNI_OnLoad` and
-            // everything it reaches is inside it.
-            let trace = Trace::attach(options, &emulator, &module_name)?;
-            let outcome = run_jni_on_load(&emulator, library);
+            // One sink for the markers and the calls, so the log reads in the
+            // order the phases happened. It is created here, after the
+            // deferred load, because it opens the `--out` file: a log that
+            // existed before the load would be truncated by the load's own
+            // writes.
+            let sink = TraceSink::new(options)?;
+            emulator
+                .loader()
+                .set_init_function_listener(Rc::new(PhaseLog { out: sink.clone() }));
+            // The trace is installed before the call, so the constructors,
+            // `JNI_OnLoad` and everything it reaches are inside it.
+            let trace = Trace::attach(options, &emulator, &module_name, Some(sink.clone()))?;
+            let outcome = run_jni_on_load(&emulator, library, &sink);
             if let Some(trace) = trace {
                 trace.report();
             }
@@ -476,6 +553,7 @@ impl Trace {
         options: &Options,
         emulator: &Rc<AndroidEmulator>,
         module: &str,
+        sink: Option<TraceSink>,
     ) -> Result<Option<Self>, String> {
         if !matches!(options.command, Command::Trace { .. }) {
             return Ok(None);
@@ -516,10 +594,16 @@ impl Trace {
                     .module(module)
                     .ok_or_else(|| format!("cannot find the loaded module `{module}`"))?;
                 let hook = TraceFunctionCall::new(options.is_64bit());
+                // The call lines share the run's sink with the phase markers,
+                // so the log reads in the order things happened. The code and
+                // memory hooks above keep their own `Send` writer: those go to
+                // a file the process never shares, and their sink is not the
+                // one the markers were handed.
+                let sink = sink.unwrap_or_else(TraceSink::stdout);
                 hook.set_listener(Box::new(CallLog {
                     loader: Rc::clone(emulator.loader()),
                     is_64bit: options.is_64bit(),
-                    out: trace_writer(options)?,
+                    out: sink,
                 }));
                 // The module's own range is the point of this trace: only
                 // branch instructions executed inside the library are
@@ -597,11 +681,62 @@ impl Trace {
     }
 }
 
+/// Where a trace's lines go: `--out <file>`, or the terminal.
+///
+/// Shared, so the phase markers a listener writes and the call lines a
+/// function trace writes go through the same handle and land in one stream in
+/// the order they happened. Only the function trace uses it: the code and
+/// memory hooks take a `Send` writer of their own, which this cannot be --
+/// the run is single-threaded and the guest addresses are behind `Rc`.
+#[derive(Clone)]
+struct TraceSink(Rc<RefCell<Box<dyn Write>>>);
+
+impl TraceSink {
+    /// The sink a run's `--out` names, else the terminal.
+    fn new(options: &Options) -> Result<Self, String> {
+        let out: Box<dyn Write> = match &options.out {
+            Some(path) => Box::new(BufWriter::new(File::create(path).map_err(
+                |error| format!("cannot write {}: {error}", path.display()),
+            )?)),
+            None => Box::new(std::io::stdout()),
+        };
+        Ok(TraceSink(Rc::new(RefCell::new(out))))
+    }
+
+    /// The terminal, for a run whose lines are printed rather than redirected.
+    fn stdout() -> Self {
+        TraceSink(Rc::new(RefCell::new(Box::new(std::io::stdout()))))
+    }
+
+    fn line(&self, line: &str) {
+        let mut out = self.0.borrow_mut();
+        let _ = writeln!(out, "{line}");
+    }
+
+    fn flush(&self) {
+        let _ = self.0.borrow_mut().flush();
+    }
+}
+
+/// The initialiser markers, in the run's own trace stream.
+///
+/// Port of unidbg's `InitFunctionListener`: it reports each initialiser as it
+/// starts, which is what makes the phases of a run readable in order.
+struct PhaseLog {
+    out: TraceSink,
+}
+
+impl raxdbg_android::elf::InitFunctionListener for PhaseLog {
+    fn on_pre_call_init_function(&self, call: &raxdbg_android::elf::InitCall<'_>) {
+        self.out.line(&call.label());
+    }
+}
+
 /// Streams the calls the library made, naming each through the loader.
 struct CallLog {
     loader: Rc<raxdbg_android::elf::AndroidElfLoader>,
     is_64bit: bool,
-    out: Box<dyn Write>,
+    out: TraceSink,
 }
 
 impl FunctionCallListener for CallLog {
@@ -613,7 +748,7 @@ impl FunctionCallListener for CallLog {
         // module -- a host service on the SVC page -- prints as `-` rather
         // than as a bare offset that looks like it belongs to nothing.
         let _ = writeln!(
-            self.out,
+            self.out.0.borrow_mut(),
             "call {} {} -> {} {}",
             at(&self.loader, call.caller),
             name_caller(&self.loader, call.caller),
@@ -623,7 +758,7 @@ impl FunctionCallListener for CallLog {
     }
 
     fn flush(&mut self) {
-        let _ = self.out.flush();
+        self.out.flush();
     }
 }
 

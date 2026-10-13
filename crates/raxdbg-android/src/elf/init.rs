@@ -38,7 +38,7 @@ fn rebase(load_base: u64, slot: u64, value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::rebase;
+    use super::{InitCall, InitKind, rebase};
 
     const BASE: u64 = 0x1214_9000;
     const SLOT: u64 = BASE + 0x8efd0;
@@ -73,6 +73,32 @@ mod tests {
         // and the module's own code sits on odd addresses.
         assert_eq!(rebase(BASE, SLOT, 0x8efd1), BASE + 0x8efd1);
     }
+
+    #[test]
+    fn a_dot_init_marker_carries_no_ordinal() {
+        // `DT_INIT` is a single entry, so an index would say "1 of 1" about
+        // something the module has no list of.
+        let call = InitCall {
+            module: "libapk_android_a64.so",
+            kind: InitKind::Init,
+            index: 0,
+            count: 5,
+            address: BASE + 0x101590,
+        };
+        assert_eq!(call.label(), "[libapk_android_a64.so] .init 0x1224a590");
+    }
+
+    #[test]
+    fn an_init_array_marker_names_its_slot_and_the_list_length() {
+        let call = InitCall {
+            module: "libc.so",
+            kind: InitKind::InitArray,
+            index: 2,
+            count: 11,
+            address: BASE + 0xd3700,
+        };
+        assert_eq!(call.label(), "[libc.so] .init_array[3/11] 0x1221c700");
+    }
 }
 
 /// Decides whether a module initialiser runs.
@@ -91,6 +117,78 @@ pub trait InitFunctionFilter {
     fn accept(&self, lib_name: &str, address: u64) -> bool;
 }
 
+/// Which of a module's three initialiser lists an entry came from.
+///
+/// The three are separate dynamic tags with a fixed call order, and a marker's
+/// name says which one ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitKind {
+    /// `DT_PREINIT_ARRAY`, the main executable's array; a shared object
+    /// cannot carry one.
+    PreinitArray,
+    /// `DT_INIT`, the single `.init` entry.
+    Init,
+    /// `DT_INIT_ARRAY`, the `.init_array` slots.
+    InitArray,
+}
+
+impl InitKind {
+    /// The ELF section name this kind of initialiser is collected from.
+    pub fn name(&self) -> &'static str {
+        match self {
+            InitKind::PreinitArray => ".preinit_array",
+            InitKind::Init => ".init",
+            InitKind::InitArray => ".init_array",
+        }
+    }
+}
+
+/// One initialiser about to run.
+pub struct InitCall<'a> {
+    /// The module the initialiser belongs to.
+    pub module: &'a str,
+    /// Which list it came from.
+    pub kind: InitKind,
+    /// The entry's position in the module's whole initialiser list, from
+    /// zero; a filtered entry keeps its slot, so the ordinal stays true.
+    pub index: usize,
+    /// How many initialisers the module carries.
+    pub count: usize,
+    /// The address about to be called.
+    pub address: u64,
+}
+
+impl InitCall<'_> {
+    /// The marker's text, the one place it is built, so the loader's log line
+    /// and the CLI's trace line are the same string.
+    pub fn label(&self) -> String {
+        if self.kind == InitKind::Init {
+            // `DT_INIT` is one entry, not a list, so an ordinal would be noise.
+            return format!("[{}] {} 0x{:x}", self.module, self.kind.name(), self.address);
+        }
+        format!(
+            "[{}] {}[{}/{}] 0x{:x}",
+            self.module,
+            self.kind.name(),
+            self.index + 1,
+            self.count,
+            self.address
+        )
+    }
+}
+
+/// Reports each initialiser as it is about to run.
+///
+/// Port of unidbg: `unidbg-api/src/main/java/com/github/unidbg/spi/InitFunctionListener.java`,
+/// reduced to the pre-call half -- the marker is about the start, and a
+/// post-call report would say the same address a moment later. It lives on the
+/// loader rather than on each module, because what a run wants to see is one
+/// stream of phases across every module it loaded.
+pub trait InitFunctionListener {
+    /// An initialiser is about to run at `call.address`.
+    fn on_pre_call_init_function(&self, call: &InitCall<'_>);
+}
+
 /// One module initialiser.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InitFunction {
@@ -100,6 +198,8 @@ pub enum InitFunction {
         load_base: u64,
         /// The module's name.
         lib_name: String,
+        /// Which list the slot belongs to.
+        kind: InitKind,
         /// The guest address of the array slot.
         ptr: u64,
         /// The address read from the slot when the module was mapped.
@@ -123,6 +223,14 @@ impl InitFunction {
             InitFunction::Absolute { lib_name, .. } | InitFunction::Linux { lib_name, .. } => {
                 lib_name
             }
+        }
+    }
+
+    /// Which list this initialiser was collected from.
+    pub fn kind(&self) -> InitKind {
+        match self {
+            InitFunction::Absolute { kind, .. } => *kind,
+            InitFunction::Linux { .. } => InitKind::Init,
         }
     }
 

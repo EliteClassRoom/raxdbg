@@ -13,7 +13,7 @@ prints what every loaded module offers:
 
 ```console
 $ raxdbg info test_lib/l1296851e_a64.so
-libapk_android_a64.so base=0x12000000 size=0x1b8000 entry=0x7b2d0 init=0 refs=1
+libapk_android_a64.so base=0x12000000 size=0x1b8000 entry=0x7b2d0 init=5 refs=1
   needs: libandroid.so, liblog.so, libm.so, libdl.so, libc.so
   exports (1):
     JNI_OnLoad@0x120ff250

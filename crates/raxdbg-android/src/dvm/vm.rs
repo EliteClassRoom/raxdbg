@@ -26,6 +26,7 @@ use crate::dvm::object::{
     normalize_class_name, DvmClass, DvmField, DvmMethod, DvmObject, InstanceObject,
     IntArrayObject, NumberObject, StringObject,
 };
+use crate::elf::loader::ElfError;
 use crate::emulator::AndroidEmulator;
 
 /// `JNI_VERSION_1_6`, what bionic and the fixtures expect.
@@ -253,6 +254,9 @@ pub enum JniError {
     /// Guest memory refused the access.
     #[error(transparent)]
     Memory(#[from] MemoryError),
+    /// A module initialiser faulted before `JNI_OnLoad` could run.
+    #[error(transparent)]
+    Initialisers(#[from] ElfError),
     /// The module does not export `JNI_OnLoad`.
     #[error("{0} does not export JNI_OnLoad")]
     NoOnLoad(String),
@@ -785,6 +789,13 @@ impl Vm {
 
     /// Runs `JNI_OnLoad` in `module`, if it has one.
     ///
+    /// The module's outstanding initialisers run first: on a device the linker
+    /// constructs the library's whole closure before `dlopen` returns, and the
+    /// JVM calls `JNI_OnLoad` only after that. A caller that loaded the module
+    /// with `set_call_init_function(false)` has not done it, and a packer
+    /// whose state its constructor sets up faults without it. After a normal
+    /// load this is a no-op -- those initialisers already ran.
+    ///
     /// Port of unidbg: `DalvikModule.callJNI_OnLoad`, which passes the
     /// `JavaVM`, accepts `JNI_VERSION_1_6`/`1_8`/`JNI_OK` and refuses
     /// `JNI_ERR`.
@@ -793,10 +804,12 @@ impl Vm {
         vm: &Rc<RefCell<Vm>>,
         module: &str,
     ) -> Result<i32, JniError> {
-        let java_vm = vm.borrow().java_vm();
         let Some(symbol) = emulator.loader().find_symbol(module, "JNI_OnLoad") else {
             return Err(JniError::NoOnLoad(module.to_string()));
         };
+        emulator.loader().call_constructors(module)?;
+        log::info!("[{module}] JNI_OnLoad 0x{:x}", symbol.address);
+        let java_vm = vm.borrow().java_vm();
         let result = emulator.call_function(symbol.address, &[java_vm])? as i32;
         if result == JNI_ERR {
             return Err(JniError::OnLoadFailed(result));

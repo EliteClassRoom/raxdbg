@@ -20,6 +20,7 @@ use raxdbg_android::android_file::{
     DirectoryResolver, ElfLibraryFile, ElfLibraryRawFile, LibraryFile, LibraryResolver,
 };
 use raxdbg_android::elf::loader::{AndroidElfLoader, reloc_type};
+use raxdbg_android::elf::{InitCall, InitFunctionListener, InitKind};
 use synthetic::{
     BINDING_GLOBAL, GLOB_DAT_SLOT, MARKER_ADDRESS, RELATIVE_ADDEND, RELATIVE_WORD, SHN_ABS,
     SHN_UNDEF, TYPE_FUNC, TYPE_OBJECT,
@@ -343,6 +344,164 @@ fn a_wrong_architecture_is_rejected() {
         Err(error) => assert!(error.to_string().contains("AArch64"), "{error}"),
         Ok(name) => panic!("expected a rejection, got {name}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Initialiser order
+// ---------------------------------------------------------------------------
+
+/// Records which initialisers ran, in order.
+#[derive(Default)]
+struct RecordingCaller {
+    calls: Rc<RefCell<Vec<u64>>>,
+}
+
+impl raxdbg_android::elf::loader::InitCaller for RecordingCaller {
+    fn call_init(&self, address: u64) -> Result<(), raxdbg_android::elf::ElfError> {
+        self.calls.borrow_mut().push(address);
+        Ok(())
+    }
+}
+
+/// Records the marker each initialiser carried before it ran.
+#[derive(Default)]
+struct RecordingListener {
+    calls: Rc<RefCell<Vec<(String, InitKind, usize, usize)>>>,
+}
+
+impl InitFunctionListener for RecordingListener {
+    fn on_pre_call_init_function(&self, call: &InitCall<'_>) {
+        self.calls
+            .borrow_mut()
+            .push((call.label(), call.kind, call.index, call.count));
+    }
+}
+
+/// A library whose `.init` is at 0x100 and whose `init_array` holds
+/// `init_array` entries.
+fn init_library(name: &str, init_array: Vec<u64>, dt_init: Option<u64>) -> Vec<u8> {
+    let mut library = synthetic::SyntheticLibrary::new(name);
+    library.init_array = init_array;
+    library.dt_init = dt_init;
+    library.build()
+}
+
+#[test]
+fn initialisers_run_init_before_init_array() {
+    let loader = new_loader(20);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    loader.set_init_caller(Rc::new(RecordingCaller {
+        calls: Rc::clone(&calls),
+    }));
+    let marks = Rc::new(RefCell::new(Vec::new()));
+    loader.set_init_function_listener(Rc::new(RecordingListener {
+        calls: Rc::clone(&marks),
+    }));
+    loader
+        .load(
+            Box::new(ElfLibraryRawFile::new(
+                "libsynthetic.so",
+                init_library("libsynthetic.so", vec![0x120], Some(MARKER_ADDRESS)),
+            )),
+            false,
+        )
+        .expect("load");
+
+    let base = loader.module("libsynthetic.so").expect("module").base;
+    assert_eq!(
+        *calls.borrow(),
+        vec![base + MARKER_ADDRESS, base + 0x120],
+        "DT_INIT runs before the DT_INIT_ARRAY slots"
+    );
+    assert_eq!(
+        *marks.borrow(),
+        vec![
+            (
+                format!("[libsynthetic.so] .init 0x{:x}", base + MARKER_ADDRESS),
+                InitKind::Init,
+                0,
+                2
+            ),
+            (
+                format!("[libsynthetic.so] .init_array[2/2] 0x{:x}", base + 0x120),
+                InitKind::InitArray,
+                1,
+                2
+            ),
+        ],
+        "each marker names the list, the slot and the length"
+    );
+
+    // A normal load already settled them, so constructing them again is a
+    // no-op rather than a second run.
+    assert_eq!(loader.call_constructors("libsynthetic.so").unwrap(), 0);
+    assert_eq!(calls.borrow().len(), 2, "nothing ran twice");
+}
+
+#[test]
+fn a_dependencys_initialisers_run_first() {
+    let loader = new_loader(21);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    loader.set_init_caller(Rc::new(RecordingCaller {
+        calls: Rc::clone(&calls),
+    }));
+    // The dependent names the dependency, so `load` pulls `libdep.so` in
+    // before it maps `libmain.so` -- which is what puts the two in that order.
+    let mut table = BTreeMap::new();
+    table.insert("libdep.so".to_string(), init_library("libdep.so", vec![], Some(0x100)));
+    loader.set_library_resolver(Rc::new(MapResolver(table)));
+
+    let mut main = synthetic::SyntheticLibrary::new("libmain.so");
+    main.needed.push("libdep.so".into());
+    main.init_array = vec![];
+    main.dt_init = Some(0x120);
+    loader
+        .load(Box::new(ElfLibraryRawFile::new("libmain.so", main.build())), false)
+        .expect("load");
+
+    let dependency = loader.module("libdep.so").expect("dependency").base;
+    let dependent = loader.module("libmain.so").expect("dependent").base;
+    assert_eq!(
+        *calls.borrow(),
+        vec![dependency + 0x100, dependent + 0x120],
+        "a dependency is constructed before the module that needs it"
+    );
+}
+
+#[test]
+fn a_deferred_load_keeps_its_initialisers_pending() {
+    let loader = new_loader(22);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    loader.set_init_caller(Rc::new(RecordingCaller {
+        calls: Rc::clone(&calls),
+    }));
+    loader.set_call_init_function(false);
+    loader
+        .load(
+            Box::new(ElfLibraryRawFile::new(
+                "libsynthetic.so",
+                init_library("libsynthetic.so", vec![], Some(MARKER_ADDRESS)),
+            )),
+            false,
+        )
+        .expect("load");
+    loader.set_call_init_function(true);
+
+    assert!(calls.borrow().is_empty(), "a deferred load runs nothing");
+    assert_eq!(
+        loader.module_init_functions("libsynthetic.so").len(),
+        1,
+        "and keeps what it wanted to run"
+    );
+
+    let base = loader.module("libsynthetic.so").expect("module").base;
+    assert_eq!(loader.call_constructors("libsynthetic.so").unwrap(), 1);
+    assert_eq!(*calls.borrow(), vec![base + MARKER_ADDRESS]);
+    assert_eq!(
+        loader.call_constructors("libsynthetic.so").unwrap(),
+        0,
+        "an initialiser runs at most once"
+    );
 }
 
 // ---------------------------------------------------------------------------

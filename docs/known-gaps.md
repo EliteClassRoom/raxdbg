@@ -157,11 +157,15 @@ The last piece is honest rather than a fix. libc++'s initialiser still needs
 `__libc_init` to have built the pthread structures it walks, and this port does
 not run the two in the order a device would. unidbg never gets there at all,
 because it does not decode the packed relocations -- the *less* correct path.
-`elf/init.rs` therefore has `InitFunctionFilter`, the extension point unidbg
-itself defines for this (`InitFunctionFilter`, which `LinuxModule.callInitFunction`
-consults and a `LibraryResolver` may implement), and the emulator installs one
-that holds libc++'s initialiser back. Every other module's initialisers run, so
-the fixtures' own C constructors still do.
+Module order is dependency-first now (`AndroidElfLoader::call_constructors`
+walks the dependency closure), so a module is constructed after everything it
+needs; what is still missing is that libc++'s initialiser runs at all, because
+bionic's own `__libc_init` builds what it walks from a thread state this port
+does not model. `elf/init.rs` therefore has `InitFunctionFilter`, the extension
+point unidbg itself defines for this (`InitFunctionFilter`, which
+`LinuxModule.callInitFunction` consults and a `LibraryResolver` may implement),
+and the emulator installs one that holds libc++'s initialiser back. Every other
+module's initialisers run, so the fixtures' own C constructors still do.
 
 Both suites are green again, and the packed relocations stay in place: libc++'s
 data is relocated correctly, which is what made the gap visible in the first

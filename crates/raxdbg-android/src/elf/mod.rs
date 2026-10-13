@@ -20,7 +20,7 @@ pub mod module;
 pub mod symbol;
 
 pub use auxv::MainProgram;
-pub use init::InitFunction;
+pub use init::{InitCall, InitFunction, InitFunctionListener, InitKind};
 pub use loader::{AndroidElfLoader, ElfError, InitCaller, ModuleInfo};
 pub use module::{MemRegion, Module};
 pub use names::{display_name, name_callee, name_caller, stub_name};

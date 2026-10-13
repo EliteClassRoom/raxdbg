@@ -441,3 +441,71 @@ fn dlopen_and_dlsym_reach_the_linkers_private_symbols() {
         "/system/bin/linker64 opened"
     );
 }
+
+#[test]
+fn bionics_initialisers_run_on_demand_after_a_deferred_load() {
+    let emulator = AndroidEmulatorBuilder::for_64bit()
+        .process_name("raxdbg-deferred")
+        .seed(23)
+        .build()
+        .expect("emulator");
+    // The load is asked not to run initialisers, which is what a `--jni-on-load`
+    // run does so its trace covers them.
+    emulator.loader().set_call_init_function(false);
+    emulator.load_library("libc.so").expect("libc.so loads");
+    emulator.loader().set_call_init_function(true);
+
+    let marks = Rc::new(std::cell::RefCell::new(Vec::new()));
+    emulator
+        .loader()
+        .set_init_function_listener(Rc::new(MarkerLog {
+            marks: Rc::clone(&marks),
+        }));
+
+    assert_eq!(
+        emulator.loader().module_init_functions("libc.so").len(),
+        11,
+        "libc carries 11 init_array entries and no DT_INIT"
+    );
+    assert!(marks.borrow().is_empty(), "nothing ran at load time");
+
+    let count = emulator
+        .loader()
+        .call_constructors("libc.so")
+        .expect("bionic's own initialisers run on real guest code");
+    assert_eq!(count, 11);
+    assert_eq!(marks.borrow().len(), 11);
+    assert!(
+        marks
+            .borrow()
+            .iter()
+            .all(|label| label.starts_with("[libc.so] .init_array[")),
+        "every entry came from init_array: {marks:?}"
+    );
+    let pending = emulator.loader().module_init_functions("libc.so");
+    assert_eq!(
+        marks.borrow()[0],
+        format!("[libc.so] .init_array[1/11] 0x{:x}", pending[0]),
+        "the first marker names the first slot"
+    );
+    assert_eq!(
+        marks.borrow()[10],
+        format!("[libc.so] .init_array[11/11] 0x{:x}", pending[10]),
+        "and the last names the eleventh"
+    );
+    assert_eq!(
+        emulator.loader().call_constructors("libc.so").unwrap(),
+        0,
+        "and they run at most once"
+    );
+}
+
+struct MarkerLog {
+    marks: Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+impl raxdbg_android::elf::InitFunctionListener for MarkerLog {
+    fn on_pre_call_init_function(&self, call: &raxdbg_android::elf::InitCall<'_>) {
+        self.marks.borrow_mut().push(call.label());
+    }
+}
