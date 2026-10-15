@@ -12,20 +12,20 @@ use raxdbg_core::memory::{Memory, MemoryError};
 
 /// Adds a module's load base to an initialiser address that is still relative.
 ///
-/// `slot` is the guest address of the `init_array` entry being read. A slot's
-/// owner is the module it sits in, so a value below the slot that is not already
-/// a guest address is a link-time offset: every module here is mapped above
-/// `MMAP_BASE` (0x12000000) and runs with the load base nowhere near zero, so a
-/// slot value that is *smaller than the slot itself* cannot be a real address.
-/// That test is sharper than a range check, which would also catch a genuine
+/// A value below the load base that is not already a guest address is a
+/// link-time offset: every module here is mapped above `MMAP_BASE`
+/// (0x12000000) and runs with the load base nowhere near zero, so a value that
+/// is *smaller than the load base itself* cannot be a real address. That test
+/// is sharper than a range check, which would also catch a genuine
 /// unrelocated address and silently repair it.
-fn rebase(load_base: u64, slot: u64, value: u64) -> u64 {
-    // Every module is mapped above `MMAP_BASE`, so a slot value that is *below*
+fn rebase(load_base: u64, value: u64) -> u64 {
+    // Every module is mapped above `MMAP_BASE`, so a value that is *below*
     // the base was never a guest address: it is a link-time offset, and adding
     // the base to it is the only way it can become one. The comparison is
-    // against the load base rather than against the slot, because a slot's own
-    // address says nothing about the module's own size -- a `DT_INIT` entry
-    // routinely lives in a segment the module's load base sits below.
+    // against the load base rather than against the address of the slot the
+    // value came from, because a slot's own address says nothing about the
+    // module's size -- a `DT_INIT` entry routinely lives in a segment the
+    // module's load base sits below.
     if value == 0 {
         return 0;
     }
@@ -41,37 +41,41 @@ mod tests {
     use super::{InitCall, InitKind, rebase};
 
     const BASE: u64 = 0x1214_9000;
+    /// Where the `init_array` slot these values come from sits inside the
+    /// module — used to show that a slot's own address is not what `rebase`
+    /// compares against.
     const SLOT: u64 = BASE + 0x8efd0;
 
     #[test]
     fn a_link_time_offset_gets_the_load_base() {
         // libc++'s init_array entry: a bare offset, never relocated.
-        assert_eq!(rebase(BASE, SLOT, 0x8efd1), BASE + 0x8efd0 | 1);
+        assert_eq!(rebase(BASE, 0x8efd1), (BASE + 0x8efd0) | 1);
     }
 
     #[test]
     fn an_already_relocated_pointer_is_left_alone() {
-        assert_eq!(rebase(BASE, SLOT, BASE + 0x8efd0), BASE + 0x8efd0);
-        assert_eq!(rebase(BASE, SLOT, BASE + 0x8efd1), BASE + 0x8efd1);
+        assert_eq!(rebase(BASE, BASE + 0x8efd0), BASE + 0x8efd0);
+        assert_eq!(rebase(BASE, BASE + 0x8efd1), BASE + 0x8efd1);
     }
 
     #[test]
     fn zero_stays_zero_so_the_caller_can_skip_it() {
-        assert_eq!(rebase(BASE, SLOT, 0), 0);
+        assert_eq!(rebase(BASE, 0), 0);
     }
 
     #[test]
     fn a_forward_or_higher_value_is_never_rebased() {
-        // At or above the base means it is already a guest address.
-        assert_eq!(rebase(BASE, SLOT, BASE), BASE);
-        assert_eq!(rebase(BASE, SLOT, SLOT + 0x40), SLOT + 0x40);
+        // At or above the base means it is already a guest address, wherever
+        // in the module the slot that carried it happened to sit.
+        assert_eq!(rebase(BASE, BASE), BASE);
+        assert_eq!(rebase(BASE, SLOT + 0x40), SLOT + 0x40);
     }
 
     #[test]
     fn the_low_bit_survives_the_rebase() {
         // Thumb sets the low bit as a flag rather than as part of the address,
         // and the module's own code sits on odd addresses.
-        assert_eq!(rebase(BASE, SLOT, 0x8efd1), BASE + 0x8efd1);
+        assert_eq!(rebase(BASE, 0x8efd1), BASE + 0x8efd1);
     }
 
     #[test]
@@ -164,7 +168,12 @@ impl InitCall<'_> {
     pub fn label(&self) -> String {
         if self.kind == InitKind::Init {
             // `DT_INIT` is one entry, not a list, so an ordinal would be noise.
-            return format!("[{}] {} 0x{:x}", self.module, self.kind.name(), self.address);
+            return format!(
+                "[{}] {} 0x{:x}",
+                self.module,
+                self.kind.name(),
+                self.address
+            );
         }
         format!(
             "[{}] {}[{}/{}] 0x{:x}",
@@ -275,7 +284,7 @@ impl InitFunction {
                     u64::from_le_bytes(buf)
                 };
                 let value = if current == 0 { *address } else { current };
-                Ok(rebase(*load_base, *ptr, value))
+                Ok(rebase(*load_base, value))
             }
             InitFunction::Linux {
                 load_base, address, ..

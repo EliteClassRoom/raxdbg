@@ -1,13 +1,12 @@
 //! Host files and the `/dev/*` specials unidbg resolves through `DriverFileIO`.
 //!
-//! Port of unidbg:
+//! Port of unidbg@7f5da98e:
 //!
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/DriverFileIO.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/Stdin.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/Stdout.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/NullFileIO.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/RandomFileIO.java`
-//! @7f5da98e.
 //!
 //! `DriverFileIO` is the per-`/dev/*`-path factory unidbg's
 //! `LinuxFileSystem.open` calls first; for the file-based path unidbg falls
@@ -22,12 +21,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-
-
 use crate::backend::Prot;
 use crate::errno::{EINVAL, ENOENT, ENOSYS};
-use crate::file::structs::{IOConstants, Stat};
 use crate::file::FileIO;
+use crate::file::structs::{IOConstants, Stat};
 use crate::memory::Memory;
 
 /// A host file at `<root_dir>/<path>`, opened through [`OpenOptions`].
@@ -134,7 +131,7 @@ impl FileIO for HostFileIO {
         let mut local = vec![0u8; count];
         let file: Arc<File> = Arc::clone(&self.file);
         let result: std::io::Result<usize> = (|| {
-            let mut file: &File = &*file;
+            let mut file: &File = &file;
             file.seek(SeekFrom::Start(self.cursor))?;
             file.read(&mut local)
         })();
@@ -324,11 +321,9 @@ impl FileIO for NullFileIO {
     }
 
     fn fstat(&self, stat: &mut Stat) -> i32 {
-        if self.is_tty() {
-            stat.st_mode = IOConstants::S_IFCHR | 0o666;
-        } else {
-            stat.st_mode = IOConstants::S_IFCHR | 0o666;
-        }
+        // unidbg's `NullFileIO.getStat` reports a character device for every
+        // `/dev/*` shim, `/dev/tty` included.
+        stat.st_mode = IOConstants::S_IFCHR | 0o666;
         stat.st_size = 0;
         stat.st_blksize = 0;
         0
@@ -503,7 +498,6 @@ fn rand_bytes(bytes: &mut [u8]) {
     }
 }
 
-
 ///
 /// The host-file branch lives elsewhere; this is only the special devices.
 pub fn create_driver_file(
@@ -534,7 +528,6 @@ pub fn create_driver_file(
         _ => None,
     }
 }
-
 
 /// Reads guest input from a host `Read` source. Writes fail.
 pub struct StdinFileIO {
@@ -583,7 +576,6 @@ impl FileIO for StdinFileIO {
     fn read(&mut self, memory: &dyn Memory, buffer: u64, count: usize) -> i32 {
         let mut local = vec![0u8; count];
         match self.source.read(&mut local) {
-
             Ok(0) => 0,
             Ok(n) => {
                 if memory.write_bytes(buffer, &local[..n]).is_err() {
@@ -621,9 +613,6 @@ impl FileIO for StdinFileIO {
         self
     }
 }
-
-
-
 
 /// Resolves a host file path under `root`, refuses to escape via `..`.
 pub fn resolve_in_root(root: &Path, pathname: &str) -> Option<PathBuf> {

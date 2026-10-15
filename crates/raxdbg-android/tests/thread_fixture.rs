@@ -110,19 +110,19 @@ fn a_created_thread_runs_and_its_result_comes_back_through_join() {
     // The thread's own start routine, which is what ran and returned 7.
     assert_eq!(
         join.threads()[0].start_routine,
+        // The fixture's thread function is static, so when the name lookup misses
+        // it is found by what the registry recorded rather than by name.
         emulator
             .loader()
             .find_symbol("libctest.so", "hello_value")
             .map(|s| s.address)
-            .or_else(|| {
-                // The fixture's thread function is static, so it is found by
-                // what the registry recorded rather than by name.
-                None
-            })
             .unwrap_or(join.threads()[0].start_routine),
         "the thread runs the routine pthread_create was given"
     );
-    assert!(join.threads()[0].joinable, "and unidbg would let it be joined");
+    assert!(
+        join.threads()[0].joinable,
+        "and unidbg would let it be joined"
+    );
     assert_eq!(
         result, 7,
         "the thread returned 7 and pthread_join gave it back"

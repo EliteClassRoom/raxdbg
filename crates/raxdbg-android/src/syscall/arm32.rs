@@ -228,7 +228,6 @@ mod arm64_nr {
     pub const DUP3: i32 = 24;
     pub const FCNTL: i32 = 25;
     pub const IOCTL: i32 = 29;
-    pub const FLOCK: i32 = 32;
     pub const MUNMAP: i32 = 215;
     pub const MPROTECT: i32 = 226;
     pub const MREMAP: i32 = 216;
@@ -242,7 +241,6 @@ mod arm64_nr {
     pub const RT_SIGACTION: i32 = 134;
     pub const RT_SIGPROCMASK: i32 = 135;
     pub const RT_SIGPENDING: i32 = 136;
-    pub const STAT64: i32 = 79;
 }
 
 /// Translates an arm32 syscall into the arm64 one the shared table handles,
@@ -323,7 +321,6 @@ pub fn translate(nr: i32, args: &mut [u64; 8]) -> Option<i32> {
             args[4..].copy_from_slice(&rest[..4]);
             arm64_nr::OPENAT
         }
-        nr::ACCESS => arm64_nr::FACCESSAT,
         nr::LLSEEK => {
             // `_llseek(fd, offset_high, offset_low, result, whence)` becomes
             // `lseek(fd, (high << 32) | low, whence)`.

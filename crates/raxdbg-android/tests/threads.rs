@@ -14,7 +14,6 @@ use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder};
 use raxdbg_android::thread::ThreadRuntime;
 use raxdbg_core::backend::{Backend, Prot, RunError};
 use raxdbg_core::memory::Memory;
-use raxdbg_core::reg::RegId;
 use raxdbg_core::svc::{Svc, SvcKind, SvcMemory};
 
 /// Assembles a code page and returns its address.
@@ -97,7 +96,10 @@ fn a_task_runs_its_function_and_its_result_comes_back() {
         dispatcher.run(&mut *backend).expect("run")
     };
     assert_eq!(results, vec![(id, 42)]);
-    assert_eq!(dispatcher.task(id).expect("task").state(), raxdbg_core::thread::TaskState::Finished);
+    assert_eq!(
+        dispatcher.task(id).expect("task").state(),
+        raxdbg_core::thread::TaskState::Finished
+    );
     assert_eq!(dispatcher.pending(), 0);
 }
 
@@ -310,9 +312,9 @@ fn a_task_that_waits_on_a_futex_runs_again_when_it_is_woken() {
         &[
             hi,
             lo,
-            movz_x(1, 0),     // FUTEX_WAIT
-            movz_x(2, 0),     // the value it expects to find
-            movz_x(8, 98),    // futex
+            movz_x(1, 0),  // FUTEX_WAIT
+            movz_x(2, 0),  // the value it expects to find
+            movz_x(8, 98), // futex
             svc(0),
             movz_x(0, 1),
             RET,
@@ -328,10 +330,10 @@ fn a_task_that_waits_on_a_futex_runs_again_when_it_is_woken() {
             b_hi,
             b_lo,
             movz_x(9, 1),
-            0xb900_0009,      // str w9, [x0]
-            movz_x(1, 1),     // FUTEX_WAKE
-            movz_x(2, 1),     // wake one
-            movz_x(8, 98),    // futex
+            0xb900_0009,   // str w9, [x0]
+            movz_x(1, 1),  // FUTEX_WAKE
+            movz_x(2, 1),  // wake one
+            movz_x(8, 98), // futex
             svc(0),
             movz_x(0, 2),
             RET,
@@ -349,14 +351,24 @@ fn a_task_that_waits_on_a_futex_runs_again_when_it_is_woken() {
         dispatcher.run(&mut *backend).expect("run")
     };
     assert_eq!(dispatcher.pending(), 0, "both tasks finished: {results:?}");
-    assert!(results.contains(&(a, 1)), "the waiting task ran to the end: {results:?}");
+    assert!(
+        results.contains(&(a, 1)),
+        "the waiting task ran to the end: {results:?}"
+    );
     assert!(results.contains(&(b, 2)), "{results:?}");
     assert_eq!(
-        emulator.memory().pointer(u64::from(futex)).read_u32(0).expect("read"),
+        emulator
+            .memory()
+            .pointer(u64::from(futex))
+            .read_u32(0)
+            .expect("read"),
         1,
         "the waker's store landed"
     );
-    assert!(dispatcher.switches() >= 2, "the wait and the wake both switched");
+    assert!(
+        dispatcher.switches() >= 2,
+        "the wait and the wake both switched"
+    );
 }
 
 #[test]
@@ -385,7 +397,7 @@ fn a_futex_wait_on_a_changed_value_does_not_park() {
             movz_x(2, 0),  // expects 0, finds 7
             movz_x(8, 98), // futex
             svc(0),
-            RET,           // x0 is the syscall's return: -EAGAIN
+            RET, // x0 is the syscall's return: -EAGAIN
         ],
     );
     let mut dispatcher = runtime.dispatcher(&emulator);
@@ -422,7 +434,11 @@ fn the_entry_code_calls_the_routine_and_keeps_its_result() {
         .memory()
         .mmap2_impl(0, 0x1000, Prot::from_bits(0x5), 0x22, -1, 0)
         .expect("routine");
-    emulator.memory().pointer(routine).write_u32(0, 0xd280_00e0).expect("mov x0, #7");
+    emulator
+        .memory()
+        .pointer(routine)
+        .write_u32(0, 0xd280_00e0)
+        .expect("mov x0, #7");
     emulator
         .memory()
         .pointer(routine + 4)
@@ -441,7 +457,11 @@ fn the_entry_code_calls_the_routine_and_keeps_its_result() {
     // aligned, which a fresh mmap in a test is not.
     let runtime = ThreadRuntime::install(&emulator).expect("runtime");
     let stack = runtime.allocate_stack(&emulator).expect("thread stack");
-    emulator.memory().pointer(stack).write_u64(0, routine).expect("routine");
+    emulator
+        .memory()
+        .pointer(stack)
+        .write_u64(0, routine)
+        .expect("routine");
     emulator
         .memory()
         .pointer(stack + 8)
@@ -454,13 +474,14 @@ fn the_entry_code_calls_the_routine_and_keeps_its_result() {
     // prepared, and `call_function` would overwrite the stack pointer; set it
     // back afterwards and run the entry by hand.
     let value = {
-        use raxdbg_core::backend::Backend;
         use raxdbg_core::reg::RegId;
         let mut backend = emulator.backend().borrow_mut();
         // The entry loads the routine and its argument from [sp] and [sp, #8],
         // so sp points at them -- exactly what the clone handler arranges.
         backend.reg_write(RegId::Sp, stack).expect("sp");
-        backend.reg_write(RegId::Lr, emulator.trap_address()).expect("lr");
+        backend
+            .reg_write(RegId::Lr, emulator.trap_address())
+            .expect("lr");
         let outcome = backend.emu_start(start.entry, emulator.trap_address(), 0, 0);
         let _ = outcome;
         // The exit `svc` ends the thread; the run reports PopContext with the
@@ -500,7 +521,11 @@ fn a_join_records_the_thread_and_reports_it() {
 
     let second = join.record(0x3000, 0x4000);
     assert_eq!(second, 2);
-    assert_eq!(join.value(), 2, "the most recent thread is the one reported");
+    assert_eq!(
+        join.value(),
+        2,
+        "the most recent thread is the one reported"
+    );
     assert_eq!(join.threads().len(), 2);
 }
 
@@ -518,12 +543,7 @@ fn a_join_parks_the_caller_and_the_result_arrives_when_the_thread_finishes() {
     let runtime = ThreadRuntime::install(&emulator).expect("runtime");
     let start = emulator.thread_start().expect("entry point");
     let join = raxdbg_android::thread::join::install(&emulator, &start).expect("install");
-    let waiters = emulator
-        .syscall()
-        .borrow()
-        .unix_handler()
-        .waiters()
-        .clone();
+    let waiters = emulator.syscall().borrow().unix_handler().waiters().clone();
 
     // The thread: return 7.
     let routine = emulator
@@ -569,10 +589,11 @@ fn a_join_parks_the_caller_and_the_result_arrives_when_the_thread_finishes() {
 
     // The clone stub runs first: it records the thread and prepares its stack.
     {
-        use raxdbg_core::backend::Backend;
         use raxdbg_core::reg::RegId;
         let mut backend = emulator.backend().borrow_mut();
-        backend.reg_write(RegId::X(1), child_stack).expect("child stack");
+        backend
+            .reg_write(RegId::X(1), child_stack)
+            .expect("child stack");
         backend.reg_write(RegId::X(2), internal).expect("internal");
     }
     // The thread's own stack holds its operands, where the entry will find them.
@@ -597,16 +618,21 @@ fn a_join_parks_the_caller_and_the_result_arrives_when_the_thread_finishes() {
     assert_eq!(threads[0].id, id);
     assert_eq!(threads[0].start_routine, routine);
     assert_eq!(threads[0].arg, 0);
-    assert!(threads[0].joinable, "and unidbg would let the guest join it");
+    assert!(
+        threads[0].joinable,
+        "and unidbg would let the guest join it"
+    );
 
     // Run the thread to completion. Its last instruction is the exit `svc`, so
     // the run reports `PopContext` -- that is the thread ending, not a failure.
     {
-        use raxdbg_core::backend::{Backend, RunError};
+        use raxdbg_core::backend::RunError;
         use raxdbg_core::reg::RegId;
         let mut backend = emulator.backend().borrow_mut();
         backend.reg_write(RegId::Sp, child_stack).expect("sp");
-        backend.reg_write(RegId::Lr, emulator.trap_address()).expect("lr");
+        backend
+            .reg_write(RegId::Lr, emulator.trap_address())
+            .expect("lr");
         let outcome = backend.emu_start(start.entry, emulator.trap_address(), 0, 0);
         assert!(
             matches!(outcome, Err(RunError::PopContext)),
@@ -647,7 +673,6 @@ fn each_thread_gets_its_own_pthread_internal() {
         .memory()
         .mmap2_impl(0, 0x1000, Prot::from_bits(0x3), 0x22, -1, 0)
         .expect("the head");
-    use raxdbg_core::backend::Backend;
     emulator
         .backend()
         .borrow_mut()
@@ -700,7 +725,7 @@ fn each_thread_gets_its_own_pthread_internal() {
         second,
         "for both nodes"
     );
-    for (block, tid_at, want) in [(first, first_tid, 11u64), (second, second_tid, 12u64)] {
+    for (_block, tid_at, want) in [(first, first_tid, 11u64), (second, second_tid, 12u64)] {
         assert_eq!(
             memory.pointer(tid_at).read_u32(0).expect("tid"),
             want as u32,
@@ -730,16 +755,21 @@ fn each_thread_gets_its_own_pthread_internal() {
 #[ignore = "bionic's thread-pointer block layout is not yet modelled; see docs/known-gaps.md"]
 fn pthread_getattr_np_answers_for_the_running_thread() {
     let emulator = emulator();
-    let libc = emulator
-        .load_library("libc.so")
-        .expect("libc.so loads");
+    let libc = emulator.load_library("libc.so").expect("libc.so loads");
     let symbol = emulator
         .loader()
         .find_symbol(&libc, "pthread_getattr_np")
         .expect("pthread_getattr_np");
     let attr = emulator
         .memory()
-        .mmap2_impl(0, 0x1000, raxdbg_core::backend::Prot::from_bits(0x3), 0x22, -1, 0)
+        .mmap2_impl(
+            0,
+            0x1000,
+            raxdbg_core::backend::Prot::from_bits(0x3),
+            0x22,
+            -1,
+            0,
+        )
         .expect("attr");
     let result = emulator
         .call_function(symbol.address, &[1, attr])

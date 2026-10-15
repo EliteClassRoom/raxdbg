@@ -372,12 +372,7 @@ impl SyscallTrace {
     ///
     /// Returns the slot the event was stored in, which [`Self::on_exit`]
     /// takes to fill in the result.
-    pub(crate) fn on_enter(
-        &mut self,
-        number: i32,
-        args: [u64; 8],
-        call: &CallSite<'_>,
-    ) -> u64 {
+    pub(crate) fn on_enter(&mut self, number: i32, args: [u64; 8], call: &CallSite<'_>) -> u64 {
         let paths = read_paths(number, &args, self.path_args, call.handler);
         let mut buffers = BTreeMap::new();
         for (wanted, index, length) in self.buffer_in {
@@ -410,13 +405,7 @@ impl SyscallTrace {
     ///
     /// `result` is what the table returned, which is the count for a
     /// `read`/`write` and the byte count bounds the captured output.
-    pub(crate) fn on_exit(
-        &mut self,
-        slot: u64,
-        result: i64,
-        errno: i32,
-        memory: &dyn Memory,
-    ) {
+    pub(crate) fn on_exit(&mut self, slot: u64, result: i64, errno: i32, memory: &dyn Memory) {
         let Some(event) = self.events.get_mut(slot as usize) else {
             return;
         };
@@ -508,11 +497,7 @@ pub const BUFFER_CAPTURE_LIMIT: usize = 512;
 /// A failure is recorded as an empty buffer rather than dropped, so the
 /// trace still shows the call was made. Reading guest memory cannot
 /// change what the guest sees, so a tracer that fails here is harmless.
-fn read_buffer(
-    memory: &dyn Memory,
-    address: u64,
-    length: u64,
-) -> Option<Vec<u8>> {
+fn read_buffer(memory: &dyn Memory, address: u64, length: u64) -> Option<Vec<u8>> {
     if address == 0 || address > 0x0000_7fff_ffff_ffff {
         return None;
     }
@@ -632,7 +617,13 @@ impl ProtectionReport {
         report
     }
 
-    fn push(&mut self, kind: &str, severity: Severity, evidence: String, detail: impl Into<String>) {
+    fn push(
+        &mut self,
+        kind: &str,
+        severity: Severity,
+        evidence: String,
+        detail: impl Into<String>,
+    ) {
         self.findings.push(Finding {
             kind: kind.to_string(),
             severity,
@@ -762,7 +753,10 @@ impl ProtectionReport {
                 self.push(
                     "prctl",
                     severity,
-                    format!("{label}({name}, 0x{:x}) -> {:?}", event.args[1], event.result),
+                    format!(
+                        "{label}({name}, 0x{:x}) -> {:?}",
+                        event.args[1], event.result
+                    ),
                     if option == 4 {
                         "the table always answers 0, so a guest that clears dumpable \
                          keeps a readable /proc/self/* here while a real device would \
@@ -975,12 +969,7 @@ fn escape(bytes: &[u8]) -> String {
 pub fn format_event(event: &SyscallEvent) -> String {
     let mut line = format!("#{:<5} pid={:<6} ", event.index, event.pid);
     let module = event.module.as_deref().unwrap_or("-");
-    let _ = write!(
-        line,
-        "{:>10}@0x{:x} in {module}(",
-        event.label(),
-        event.pc
-    );
+    let _ = write!(line, "{:>10}@0x{:x} in {module}(", event.label(), event.pc);
     for (index, arg) in event.args.iter().enumerate() {
         if index > 0 {
             line.push_str(", ");
@@ -1014,9 +1003,7 @@ pub fn render(trace: &SyscallTrace, verbosity: Verbosity) -> String {
     }
     let mut out = String::new();
     for event in trace.events() {
-        if verbosity == Verbosity::Interesting
-            && event.paths.is_empty()
-            && event.buffers.is_empty()
+        if verbosity == Verbosity::Interesting && event.paths.is_empty() && event.buffers.is_empty()
         {
             continue;
         }
@@ -1061,4 +1048,3 @@ impl ProtectionReport {
             .collect()
     }
 }
-

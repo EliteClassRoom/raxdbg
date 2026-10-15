@@ -191,9 +191,25 @@ impl std::fmt::Debug for AndroidElfLoader {
         f.debug_struct("AndroidElfLoader")
             .field("is_64bit", &self.is_64bit)
             .field("modules", &self.modules.borrow().len())
-            .field("mmap_base", &format_args!("{:#x}", self.memory.mmap_base_address()))
+            .field(
+                "mmap_base",
+                &format_args!("{:#x}", self.memory.mmap_base_address()),
+            )
             .finish()
     }
+}
+
+/// The module a relocation belongs to, plus the addend its symbol value is
+/// biased by -- the three arguments every `push_relocation` call site had to
+/// spell out, and the ones that never vary per relocation type.
+#[derive(Clone, Copy)]
+struct RelocationTarget<'a> {
+    /// The load base of the module being relocated.
+    load_base: u64,
+    /// Its soname, as the guest will see it.
+    so_name: &'a str,
+    /// The addend folded into the symbol's value.
+    offset: i64,
 }
 
 impl AndroidElfLoader {
@@ -271,7 +287,14 @@ impl AndroidElfLoader {
 
         let stack_chk_guard = memory.allocate_stack(pointer_size)?;
         let guard = self.rng.borrow_mut().next_u64();
-        stack_chk_guard.write_pointer(0, if self.is_64bit { guard } else { guard & 0xffff_ffff })?;
+        stack_chk_guard.write_pointer(
+            0,
+            if self.is_64bit {
+                guard
+            } else {
+                guard & 0xffff_ffff
+            },
+        )?;
 
         let program_name = memory.write_stack_string(process_name)?;
         let program_name_pointer = memory.allocate_stack(pointer_size)?;
@@ -301,8 +324,8 @@ impl AndroidElfLoader {
         // overflow ran into the `argv` block allocated next to it and
         // corrupted the argc the guest reads at startup. One page covers
         // every tag Linux defines on either ABI with room to spare.
-        let auxv_size = ((entries.len() as u64 + 1) * pointer_size as u64 * 2)
-            .next_multiple_of(PAGE_SIZE as u64);
+        let auxv_size =
+            ((entries.len() as u64 + 1) * pointer_size as u64 * 2).next_multiple_of(PAGE_SIZE);
         let auxv = memory.allocate_stack(auxv_size as usize)?;
         // An auxv entry is a `(tag, value)` pair of words, so the stride
         // between entries is twice the pointer size. Advancing by one word
@@ -530,10 +553,10 @@ impl AndroidElfLoader {
             if address == 0 || address == u64::MAX {
                 continue;
             }
-            if let Some(filter) = filter.as_ref() {
-                if !filter.accept(name, address) {
-                    continue;
-                }
+            if let Some(filter) = filter.as_ref()
+                && !filter.accept(name, address)
+            {
+                continue;
             }
             // The ordinal is the entry's slot in the module's whole list, so
             // a filtered entry leaves a gap rather than renumbering the rest.
@@ -549,9 +572,7 @@ impl AndroidElfLoader {
                 listener.on_pre_call_init_function(&init_call);
             }
             if let (Some(pointer), true) = (thread_pointer, self.is_64bit) {
-                self.backend
-                    .borrow_mut()
-                    .reg_write(RegId::X(18), pointer)?;
+                self.backend.borrow_mut().reg_write(RegId::X(18), pointer)?;
             }
             if let Some(caller) = &caller {
                 caller.call_init(address)?;
@@ -561,10 +582,10 @@ impl AndroidElfLoader {
         // A fault inside an initialiser leaves the flag unset, which is the
         // honest state: the run is over anyway, because every caller
         // propagates the `Err`.
-        if caller.is_some() {
-            if let Some(module) = self.modules.borrow_mut().get_mut(name) {
-                module.init_functions_ran = true;
-            }
+        if caller.is_some()
+            && let Some(module) = self.modules.borrow_mut().get_mut(name)
+        {
+            module.init_functions_ran = true;
         }
         Ok(called)
     }
@@ -698,11 +719,11 @@ impl AndroidElfLoader {
         }
         let mut found = None;
         for module in self.modules.borrow().values() {
-            if module.base == handle {
-                if let Some(symbol) = module.find_symbol(symbol_name) {
-                    found = Some(symbol);
-                    break;
-                }
+            if module.base == handle
+                && let Some(symbol) = module.find_symbol(symbol_name)
+            {
+                found = Some(symbol);
+                break;
             }
         }
         if found.is_none() && (handle == 0 || handle as i64 == -1) {
@@ -751,7 +772,9 @@ impl AndroidElfLoader {
             drop(modules);
             // The load order holds the same name; leaving it would make a
             // later walk look for a module that is no longer mapped.
-            self.module_order.borrow_mut().retain(|other| other != &name);
+            self.module_order
+                .borrow_mut()
+                .retain(|other| other != &name);
             self.unload(&module);
         }
         true
@@ -816,7 +839,9 @@ impl AndroidElfLoader {
 
     /// The module with this name, if it is loaded.
     pub fn module(&self, name: &str) -> Option<ModuleInfo> {
-        self.module_infos().into_iter().find(|info| info.name == name)
+        self.module_infos()
+            .into_iter()
+            .find(|info| info.name == name)
     }
 
     /// How many relocations the module still has nowhere to resolve, with the
@@ -917,10 +942,10 @@ impl AndroidElfLoader {
             return Some(symbol);
         }
         for needed in &module.needed_libraries {
-            if let Some(dependency) = modules.get(needed) {
-                if let Some(symbol) = dependency.find_symbol(name) {
-                    return Some(symbol);
-                }
+            if let Some(dependency) = modules.get(needed)
+                && let Some(symbol) = dependency.find_symbol(name)
+            {
+                return Some(symbol);
             }
         }
         None
@@ -930,7 +955,10 @@ impl AndroidElfLoader {
 
     fn note_module_name(&self, name: &str) {
         let mut max = self.max_so_name.borrow_mut();
-        if max.as_ref().is_none_or(|current| name.len() > current.len()) {
+        if max
+            .as_ref()
+            .is_none_or(|current| name.len() > current.len())
+        {
             *max = Some(name.to_string());
         }
     }
@@ -997,7 +1025,8 @@ impl AndroidElfLoader {
                 Some(last) => {
                     let overall_size = last.end - check_address;
                     let perms = Prot::from_bits(last.perms | prot.bits());
-                    self.memory.mprotect_impl(check_address, overall_size as usize, perms)?;
+                    self.memory
+                        .mprotect_impl(check_address, overall_size as usize, perms)?;
                     if let Some(region) = regions.last_mut() {
                         region.perms = perms.bits();
                     }
@@ -1041,8 +1070,14 @@ impl AndroidElfLoader {
                         let base = previous.address + previous.size;
                         let gap = mapped.address.saturating_sub(base);
                         if gap > 0 {
-                            self.memory
-                                .mmap2(base, gap as usize, Prot::NONE, MAP_FIXED | MAP_ANONYMOUS, -1, 0)?;
+                            self.memory.mmap2(
+                                base,
+                                gap as usize,
+                                Prot::NONE,
+                                MAP_FIXED | MAP_ANONYMOUS,
+                                -1,
+                                0,
+                            )?;
                         }
                     }
                     mapped
@@ -1083,10 +1118,10 @@ impl AndroidElfLoader {
                 continue;
             }
             let mut resolved = file.resolve_library(&needed);
-            if resolved.is_none() {
-                if let Some(resolver) = self.library_resolver.borrow().as_ref() {
-                    resolved = resolver.resolve_library(&needed);
-                }
+            if resolved.is_none()
+                && let Some(resolver) = self.library_resolver.borrow().as_ref()
+            {
+                resolved = resolver.resolve_library(&needed);
             }
             match resolved {
                 Some(needed_file) => match self.load_internal(needed_file.as_ref()) {
@@ -1132,11 +1167,7 @@ impl AndroidElfLoader {
                 None
             } else {
                 elf.dynsyms.get(relocation.r_sym).map(|sym| ElfSymbol {
-                    name: elf
-                        .dynstrtab
-                        .get_at(sym.st_name)
-                        .unwrap_or("")
-                        .to_string(),
+                    name: elf.dynstrtab.get_at(sym.st_name).unwrap_or("").to_string(),
                     value: sym.st_value,
                     size: sym.st_size,
                     info: sym.st_info,
@@ -1168,11 +1199,13 @@ impl AndroidElfLoader {
                     self.push_relocation(
                         &mut unresolved,
                         &mut resolved,
-                        load_base,
+                        &RelocationTarget {
+                            load_base,
+                            so_name: &so_name,
+                            offset,
+                        },
                         symbol,
                         relocation_addr,
-                        &so_name,
-                        offset,
                     );
                 }
                 reloc_type::R_AARCH64_ABS64 => {
@@ -1180,11 +1213,13 @@ impl AndroidElfLoader {
                     self.push_relocation(
                         &mut unresolved,
                         &mut resolved,
-                        load_base,
+                        &RelocationTarget {
+                            load_base,
+                            so_name: &so_name,
+                            offset,
+                        },
                         symbol,
                         relocation_addr,
-                        &so_name,
-                        offset,
                     );
                 }
                 reloc_type::R_ARM_RELATIVE => {
@@ -1212,22 +1247,26 @@ impl AndroidElfLoader {
                     self.push_relocation(
                         &mut unresolved,
                         &mut resolved,
-                        load_base,
+                        &RelocationTarget {
+                            load_base,
+                            so_name: &so_name,
+                            offset: 0,
+                        },
                         symbol,
                         relocation_addr,
-                        &so_name,
-                        0,
                     );
                 }
                 reloc_type::R_AARCH64_GLOB_DAT | reloc_type::R_AARCH64_JUMP_SLOT => {
                     self.push_relocation(
                         &mut unresolved,
                         &mut resolved,
-                        load_base,
+                        &RelocationTarget {
+                            load_base,
+                            so_name: &so_name,
+                            offset: addend,
+                        },
                         symbol,
                         relocation_addr,
-                        &so_name,
-                        addend,
                     );
                 }
                 reloc_type::R_ARM_COPY | reloc_type::R_AARCH64_COPY => {
@@ -1254,9 +1293,8 @@ impl AndroidElfLoader {
             let count = preinit_size / self.pointer_size as u64;
             if count > 0 {
                 let array = load_base
-                    + dynamic_value(dynamic, dynamic::DT_PREINIT_ARRAY).ok_or_else(|| {
-                        ElfError::Message("DT_PREINIT_ARRAY is missing".into())
-                    })?;
+                    + dynamic_value(dynamic, dynamic::DT_PREINIT_ARRAY)
+                        .ok_or_else(|| ElfError::Message("DT_PREINIT_ARRAY is missing".into()))?;
                 for index in 0..count {
                     let ptr = array + index * self.pointer_size as u64;
                     let address = self.read_pointer(ptr)?;
@@ -1271,14 +1309,14 @@ impl AndroidElfLoader {
             }
         }
         if elf.header.e_type == header::ET_DYN {
-            if let Some(init) = dynamic_value(dynamic, dynamic::DT_INIT) {
-                if init != 0 {
-                    init_functions.push(InitFunction::Linux {
-                        load_base,
-                        lib_name: so_name.clone(),
-                        address: init,
-                    });
-                }
+            if let Some(init) = dynamic_value(dynamic, dynamic::DT_INIT)
+                && init != 0
+            {
+                init_functions.push(InitFunction::Linux {
+                    load_base,
+                    lib_name: so_name.clone(),
+                    address: init,
+                });
             }
             let init_array_size = dynamic_value(dynamic, dynamic::DT_INIT_ARRAYSZ).unwrap_or(0);
             let count = init_array_size / self.pointer_size as u64;
@@ -1301,7 +1339,9 @@ impl AndroidElfLoader {
         }
 
         if load_virtual_address == 0 {
-            return Err(ElfError::Message("the module has no loadable segment".into()));
+            return Err(ElfError::Message(
+                "the module has no loadable segment".into(),
+            ));
         }
 
         let symbols = elf
@@ -1345,13 +1385,15 @@ impl AndroidElfLoader {
             self.relocate_against(&module);
         }
 
-        if so_name == "libc.so" {
-            if let (Some(malloc), Some(free)) = (
-                module.find_symbol("malloc"),
-                module.find_symbol("free"),
-            ) {
-                log::debug!("libc.so provides malloc={:#x} free={:#x}", malloc.address, free.address);
-            }
+        if so_name == "libc.so"
+            && let (Some(malloc), Some(free)) =
+                (module.find_symbol("malloc"), module.find_symbol("free"))
+        {
+            log::debug!(
+                "libc.so provides malloc={:#x} free={:#x}",
+                malloc.address,
+                free.address
+            );
         }
 
         self.modules.borrow_mut().insert(so_name.clone(), module);
@@ -1397,21 +1439,26 @@ impl AndroidElfLoader {
         &self,
         unresolved: &mut Vec<ModuleSymbol>,
         resolved: &mut Vec<ModuleSymbol>,
-        load_base: u64,
+        target: &RelocationTarget<'_>,
         symbol: Option<ElfSymbol>,
         relocation_addr: u64,
-        so_name: &str,
-        offset: i64,
     ) {
-        match self.resolve_symbol(load_base, symbol.clone(), relocation_addr, so_name, offset) {
+        let target = *target;
+        match self.resolve_symbol(
+            target.load_base,
+            symbol.clone(),
+            relocation_addr,
+            target.so_name,
+            target.offset,
+        ) {
             Some(pending) => resolved.push(pending),
             None => unresolved.push(ModuleSymbol::new(
-                so_name,
-                load_base,
+                target.so_name,
+                target.load_base,
                 symbol,
                 relocation_addr,
                 None,
-                offset,
+                target.offset,
             )),
         }
     }
@@ -1538,18 +1585,24 @@ impl AndroidElfLoader {
             });
         }
 
-        if is_dl_symbol(&symbol_name) && resolve_weak {
-            if let Some(svc_memory) = self.svc_memory.borrow().as_ref() {
-                for listener in self.hook_listeners.borrow().iter() {
-                    let hook = listener.hook(svc_memory, Some("libdl.so"), &symbol_name, pending.offset as u64);
-                    if hook > 0 {
-                        return Some(ModuleSymbol {
-                            load_base: WEAK_BASE,
-                            to_so_name: Some("libdl.so".into()),
-                            offset: hook as i64,
-                            ..pending.clone()
-                        });
-                    }
+        if is_dl_symbol(&symbol_name)
+            && resolve_weak
+            && let Some(svc_memory) = self.svc_memory.borrow().as_ref()
+        {
+            for listener in self.hook_listeners.borrow().iter() {
+                let hook = listener.hook(
+                    svc_memory,
+                    Some("libdl.so"),
+                    &symbol_name,
+                    pending.offset as u64,
+                );
+                if hook > 0 {
+                    return Some(ModuleSymbol {
+                        load_base: WEAK_BASE,
+                        to_so_name: Some("libdl.so".into()),
+                        offset: hook as i64,
+                        ..pending.clone()
+                    });
                 }
             }
         }
@@ -1575,12 +1628,12 @@ impl AndroidElfLoader {
             );
             return;
         }
-        if let Some(module) = self.modules.borrow_mut().get_mut(owner) {
-            if let Some(symbol) = pending.symbol.as_ref() {
-                module
-                    .resolved_symbols
-                    .insert(symbol.name.clone(), pending.clone());
-            }
+        if let Some(module) = self.modules.borrow_mut().get_mut(owner)
+            && let Some(symbol) = pending.symbol.as_ref()
+        {
+            module
+                .resolved_symbols
+                .insert(symbol.name.clone(), pending.clone());
         }
     }
 
@@ -1650,7 +1703,9 @@ impl AndroidElfLoader {
             )));
         }
         if elf.header.e_ident[header::EI_DATA] != header::ELFDATA2LSB {
-            return Err(ElfError::Message("the library must be little-endian".into()));
+            return Err(ElfError::Message(
+                "the library must be little-endian".into(),
+            ));
         }
         if self.is_64bit && elf.header.e_machine != header::EM_AARCH64 {
             return Err(ElfError::Message(format!(
@@ -1810,10 +1865,7 @@ mod tests {
     fn segment_protection_follows_the_flags() {
         assert_eq!(prot_of_flags(PF_R), Prot::READ);
         assert_eq!(prot_of_flags(PF_R | PF_W), Prot::READ.union(Prot::WRITE));
-        assert_eq!(
-            prot_of_flags(PF_R | PF_X),
-            Prot::READ.union(Prot::EXEC)
-        );
+        assert_eq!(prot_of_flags(PF_R | PF_X), Prot::READ.union(Prot::EXEC));
         assert_eq!(prot_of_flags(0), Prot::NONE);
     }
 

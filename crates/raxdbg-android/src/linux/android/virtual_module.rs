@@ -1,9 +1,8 @@
 //! Android virtual modules.
 //!
-//! Port of unidbg:
+//! Port of unidbg @7f5da98e:
 //! - `unidbg-api/src/main/java/com/github/unidbg/virtualmodule/{VirtualModule,VirtualSymbol}.java`
 //! - `unidbg-android/src/main/java/com/github/unidbg/virtualmodule/android/{AndroidModule,SystemProperties,JniGraphics,MediaNdkModule}.java`
-//! @7f5da98e.
 //!
 //! A virtual module is a named entry in the loader's module table whose symbols
 //! are not backed by any ELF file — they are host-side stubs the guest jumps
@@ -77,35 +76,9 @@ fn kind_for(loader: &Rc<AndroidElfLoader>) -> SvcKind {
     }
 }
 
-/// Writes the C string `value` into `pointer`, capped at `max_inclusive` bytes
-/// (a NUL terminator is always written; the value is truncated with a debug
-/// log if it does not fit). The property layer and the asset helpers both
-/// need this.
-pub(crate) fn write_c_string(
-    pointer: &Pointer,
-    value: &str,
-    max_inclusive: usize,
-) -> Result<(), MemoryError> {
-    let bytes = value.as_bytes();
-    if bytes.len() > max_inclusive {
-        log::debug!(
-            "truncating value ({} bytes) to fit the {} byte limit",
-            bytes.len(),
-            max_inclusive
-        );
-    }
-    let limit = bytes.len().min(max_inclusive);
-    pointer.write_bytes(0, &bytes[..limit])?;
-    pointer.write_byte(limit as u64, 0)?;
-    Ok(())
-}
-
 /// Reads a NUL-terminated C string from `pointer`. Bounded by `max_bytes` so a
 /// bad guest cannot exhaust the host.
-pub(crate) fn read_c_string(
-    pointer: &Pointer,
-    max_bytes: usize,
-) -> Result<String, MemoryError> {
+pub(crate) fn read_c_string(pointer: &Pointer, max_bytes: usize) -> Result<String, MemoryError> {
     let mut bytes = Vec::with_capacity(max_bytes.min(128));
     for i in 0..max_bytes {
         let b = pointer.read_byte(i as u64)?;
@@ -143,10 +116,19 @@ impl AndroidModule {
                 "AAssetManager_fromJava".into(),
                 Box::new(AssetManagerFromJava::new(kind)),
             ),
-            ("AAssetManager_open".into(), Box::new(AssetManagerOpen::new(kind))),
+            (
+                "AAssetManager_open".into(),
+                Box::new(AssetManagerOpen::new(kind)),
+            ),
             ("AAsset_close".into(), Box::new(AssetClose::new(kind))),
-            ("AAsset_getBuffer".into(), Box::new(AssetGetBuffer::new(kind))),
-            ("AAsset_getLength".into(), Box::new(AssetGetLength::new(kind))),
+            (
+                "AAsset_getBuffer".into(),
+                Box::new(AssetGetBuffer::new(kind)),
+            ),
+            (
+                "AAsset_getLength".into(),
+                Box::new(AssetGetLength::new(kind)),
+            ),
             ("AAsset_read".into(), Box::new(AssetRead::new(kind))),
         ];
         register_virtual_module(loader, "libandroid.so", stubs)
@@ -499,7 +481,10 @@ impl MediaNdkModule {
                 "AMediaDrm_getPropertyString".into(),
                 Box::new(MediaGetPropertyString::new(kind)),
             ),
-            ("AMediaDrm_release".into(), Box::new(MediaRelease::new(kind))),
+            (
+                "AMediaDrm_release".into(),
+                Box::new(MediaRelease::new(kind)),
+            ),
         ];
         register_virtual_module(loader, "libmediandk.so", stubs)
     }
@@ -668,15 +653,15 @@ impl Linker64 {
             ),
             (
                 "__dl__Z9do_dlopenPKciPK17android_dlextinfo".into(),
-                Box::new(LinkerDoDlopen::new(kind, Rc::clone(&shared), false)),
+                Box::new(LinkerDoDlopen::new(kind, Rc::clone(&shared))),
             ),
             (
                 "__dl__Z9do_dlopenPKciPK17android_dlextinfoPKv".into(),
-                Box::new(LinkerDoDlopen::new(kind, Rc::clone(&shared), true)),
+                Box::new(LinkerDoDlopen::new(kind, Rc::clone(&shared))),
             ),
             (
                 "__dl__Z8__dlopenPKciPKv".into(),
-                Box::new(LinkerDoDlopen::new(kind, shared, true)),
+                Box::new(LinkerDoDlopen::new(kind, shared)),
             ),
         ];
         register_virtual_module(loader, "linker64", stubs)
@@ -719,31 +704,31 @@ struct LinkerDoDlopen {
     kind: SvcKind,
     pointer_size: usize,
     loader: Rc<AndroidElfLoader>,
-    /// The `PKv` overload, whose `android_dlextinfo*` argument is followed by
-    /// an extra `loader::FdInput*`. The guest shifts its arguments by one
-    /// pointer when it is the later one, so the filename lands in a different
-    /// register.
-    extended: bool,
 }
 impl LinkerDoDlopen {
-    fn new(kind: SvcKind, loader: Rc<AndroidElfLoader>, extended: bool) -> Self {
+    fn new(kind: SvcKind, loader: Rc<AndroidElfLoader>) -> Self {
         let pointer_size = if loader.is_64bit() { 8 } else { 4 };
         Self {
             kind,
             pointer_size,
             loader,
-            extended,
         }
     }
 
-    /// Reads the filename pointer, honouring the `PKv` overload's extra
-    /// argument.
+    /// Reads the filename pointer.
+    ///
+    /// All three overloads take the filename *first*; the two that take an
+    /// extra argument (`...android_dlextinfoPKv` and `__dl__Z8__dlopenPKciPKv`)
+    /// differ from the short one only by a trailing `void*`, so the extra
+    /// argument is in the register after the filename, never before it. One
+    /// stub therefore answers all three, and the filename is always the first
+    /// argument register.
     fn filename_pointer(&self, backend: &mut dyn Backend) -> Result<u64, RunError> {
         if self.pointer_size == 8 {
             Ok(backend.reg_read(raxdbg_core::reg::RegId::X(0))?)
         } else {
             Ok(u64::from(
-                backend.reg_read(raxdbg_core::reg::RegId::R(0))? as u32,
+                backend.reg_read(raxdbg_core::reg::RegId::R(0))? as u32
             ))
         }
     }

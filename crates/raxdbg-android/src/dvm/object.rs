@@ -194,7 +194,10 @@ impl IntArrayObject {
 
     /// The guest pointer the elements live at, allocating it on first use and
     /// refreshing it from `values`.
-    pub fn elements_pointer(&self, allocate: impl FnOnce(usize) -> Option<MemoryBlock>) -> Option<u64> {
+    pub fn elements_pointer(
+        &self,
+        allocate: impl FnOnce(usize) -> Option<MemoryBlock>,
+    ) -> Option<u64> {
         let mut elements = self.elements.borrow_mut();
         if elements.is_none() {
             let values = self.values.borrow();
@@ -280,7 +283,10 @@ impl DvmClass {
 
     /// A `RegisterNatives` entry, if the class has one for `name(signature)`.
     pub fn native_address(&self, name: &str, signature: &str) -> Option<u64> {
-        self.natives.borrow().get(&format!("{name}{signature}")).copied()
+        self.natives
+            .borrow()
+            .get(&format!("{name}{signature}"))
+            .copied()
     }
 
     /// Every `RegisterNatives` entry, as `name(signature)` → address.
@@ -297,10 +303,7 @@ impl DvmClass {
     ///
     /// Port of unidbg: `DvmClass.mangleForJni`.
     pub fn mangled_symbol(&self, name: &str, is_static: bool) -> String {
-        let class = self
-            .name
-            .trim_start_matches('L')
-            .trim_end_matches(';');
+        let class = self.name.trim_start_matches('L').trim_end_matches(';');
         let mut symbol = String::from("Java_");
         symbol.push_str(&mangle_for_jni(class));
         symbol.push('_');
@@ -513,7 +516,10 @@ mod tests {
     #[test]
     fn jni_mangling_matches_the_specification() {
         // JNI's "name mangling" table.
-        assert_eq!(mangle_for_jni("com/raxdbg/test/JniTest"), "com_raxdbg_test_JniTest");
+        assert_eq!(
+            mangle_for_jni("com/raxdbg/test/JniTest"),
+            "com_raxdbg_test_JniTest"
+        );
         assert_eq!(mangle_for_jni("add"), "add");
         assert_eq!(mangle_for_jni("a_b"), "a_1b");
         assert_eq!(mangle_for_jni("a.b"), "a_b");

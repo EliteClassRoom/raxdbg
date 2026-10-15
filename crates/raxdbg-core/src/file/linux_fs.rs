@@ -1,10 +1,9 @@
 //! The Linux-shaped file system the guest sees.
 //!
-//! Port of unidbg:
+//! Port of unidbg@7f5da98e:
 //!
 //! * `unidbg-android/src/main/java/com/github/unidbg/file/linux/LinuxFileSystem.java`
 //! * `unidbg-api/src/main/java/com/github/unidbg/file/BaseFileSystem.java`
-//! @7f5da98e.
 //!
 //! `LinuxFileSystem` is the file-system half unidbg's resolver chains into
 //! first. It resolves guest paths against a root directory and answers the
@@ -17,9 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::errno::{EACCES, EEXIST};
 use crate::file::byte_array::ByteArrayFileIO;
-use crate::file::driver::{
-    HostFileIO, RandomFileIO, StdoutFileIO, StdinFileIO, NullFileIO,
-};
+use crate::file::driver::{HostFileIO, NullFileIO, RandomFileIO, StdinFileIO, StdoutFileIO};
 use crate::file::structs::IOConstants;
 use crate::file::{FileIO, FileResult, FileSystem};
 
@@ -240,10 +237,8 @@ impl FileSystem for LinuxFileSystem {
         if let Some(parent) = new.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if old.exists() {
-            if fs::rename(&old, &new).is_err() {
-                return -EACCES;
-            }
+        if old.exists() && fs::rename(&old, &new).is_err() {
+            return -EACCES;
         }
         0
     }
@@ -254,15 +249,15 @@ impl LinuxFileSystem {
         match path {
             "/proc/self/maps" => {
                 let mut out = String::new();
-                if let Some(root) = self.root_dir.as_ref() {
-                    if let Ok(canonical) = fs::canonicalize(root) {
-                        out.push_str(&format!(
-                            "{:x}-{:x} r--p 00000000 00:00 0 {}\n",
-                            0,
-                            canonical.to_string_lossy().len(),
-                            canonical.display(),
-                        ));
-                    }
+                if let Some(root) = self.root_dir.as_ref()
+                    && let Ok(canonical) = fs::canonicalize(root)
+                {
+                    out.push_str(&format!(
+                        "{:x}-{:x} r--p 00000000 00:00 0 {}\n",
+                        0,
+                        canonical.to_string_lossy().len(),
+                        canonical.display(),
+                    ));
                 }
                 out.push_str("ffff_0000-ffff_1000 r--p 00000000 00:00 0 [stack]\n");
                 out
@@ -301,11 +296,7 @@ impl DirectoryFileIO {
     /// Builds a directory descriptor for `host` (a host path) under the
     /// guest `path`.
     pub fn new(oflags: i32, path: String, host: PathBuf) -> Self {
-        DirectoryFileIO {
-            oflags,
-            path,
-            host,
-        }
+        DirectoryFileIO { oflags, path, host }
     }
 }
 

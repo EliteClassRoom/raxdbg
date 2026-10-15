@@ -4,13 +4,11 @@
 //! arguments), `run` (which calls it through a volatile pointer, so the call is
 //! not inlined away) and `imported_target` (which calls libc through the PLT).
 
-use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use raxdbg_android::android_file::ElfLibraryFile;
 use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder};
 use raxdbg_android::hook::{ReplaceCallback, ReplaceHook};
-use raxdbg_core::memory::Memory;
 
 fn boot() -> Rc<AndroidEmulator> {
     let emulator = AndroidEmulatorBuilder::for_64bit()
@@ -116,7 +114,14 @@ fn the_replaced_function_still_returns_to_its_own_caller() {
 fn page(emulator: &std::rc::Rc<AndroidEmulator>, what: &str) -> u64 {
     emulator
         .memory()
-        .mmap2_impl(0, 0x1000, raxdbg_core::backend::Prot::from_bits(0x5), 0x22, -1, 0)
+        .mmap2_impl(
+            0,
+            0x1000,
+            raxdbg_core::backend::Prot::from_bits(0x5),
+            0x22,
+            -1,
+            0,
+        )
         .unwrap_or_else(|error| panic!("{what} page: {error}"))
 }
 
@@ -151,28 +156,22 @@ fn the_bundled_hook_engines_load_and_resolve() {
         .build()
         .expect("emulator");
 
-    let dobby = raxdbg_android::hook::HookEngine::load(
-        &emulator,
-        raxdbg_android::hook::Engine::Dobby,
-    )
-    .expect("libdobby.so loads");
+    let dobby =
+        raxdbg_android::hook::HookEngine::load(&emulator, raxdbg_android::hook::Engine::Dobby)
+            .expect("libdobby.so loads");
     assert_eq!(dobby.engine(), raxdbg_android::hook::Engine::Dobby);
     assert_ne!(dobby.entry(), 0, "DobbyHook resolved");
     assert!(dobby.module().contains("dobby"), "{}", dobby.module());
 
-    let hookzz = raxdbg_android::hook::HookEngine::load(
-        &emulator,
-        raxdbg_android::hook::Engine::HookZz,
-    )
-    .expect("libhookzz.so loads");
+    let hookzz =
+        raxdbg_android::hook::HookEngine::load(&emulator, raxdbg_android::hook::Engine::HookZz)
+            .expect("libhookzz.so loads");
     assert_ne!(hookzz.entry(), 0, "ZzReplace resolved");
     assert!(hookzz.module().contains("hookzz"), "{}", hookzz.module());
 
-    let xhook = raxdbg_android::hook::HookEngine::load(
-        &emulator,
-        raxdbg_android::hook::Engine::XHook,
-    )
-    .expect("libxhook.so loads");
+    let xhook =
+        raxdbg_android::hook::HookEngine::load(&emulator, raxdbg_android::hook::Engine::XHook)
+            .expect("libxhook.so loads");
     assert_ne!(xhook.entry(), 0, "the JNI entry point resolved");
     assert!(
         xhook.engine().needs_vm(),
@@ -208,16 +207,9 @@ fn an_inline_hook_redirects_a_call_and_can_be_removed() {
 
     let hooks = std::rc::Rc::new(raxdbg_android::hook::InlineHooks::new());
     {
-        use raxdbg_core::backend::Backend;
         let mut backend = emulator.backend().borrow_mut();
-        raxdbg_android::hook::inline::install(
-            &mut *backend,
-            &hooks,
-            target,
-            trampoline,
-            true,
-        )
-        .expect("the hook installs");
+        raxdbg_android::hook::inline::install(&mut *backend, &hooks, target, trampoline, true)
+            .expect("the hook installs");
     }
     assert_eq!(hooks.len(), 1);
     assert_eq!(hooks.trampoline_for(target), Some(trampoline));
@@ -228,7 +220,6 @@ fn an_inline_hook_redirects_a_call_and_can_be_removed() {
     );
 
     {
-        use raxdbg_core::backend::Backend;
         let mut backend = emulator.backend().borrow_mut();
         assert!(raxdbg_android::hook::inline::uninstall(
             &mut *backend,
@@ -256,18 +247,15 @@ fn an_out_of_range_trampoline_is_refused() {
     returns(&emulator, target, 42);
     let hooks = std::rc::Rc::new(raxdbg_android::hook::InlineHooks::new());
     {
-        use raxdbg_core::backend::Backend;
         let mut backend = emulator.backend().borrow_mut();
-        let error = raxdbg_android::hook::inline::install(
-            &mut *backend,
-            &hooks,
-            target,
-            0xffff_0000,
-            true,
-        )
-        .expect_err("the SVC page is too far away to branch to");
+        let error =
+            raxdbg_android::hook::inline::install(&mut *backend, &hooks, target, 0xffff_0000, true)
+                .expect_err("the SVC page is too far away to branch to");
         assert!(
-            matches!(error, raxdbg_android::hook::inline::HookError::OutOfRange { .. }),
+            matches!(
+                error,
+                raxdbg_android::hook::inline::HookError::OutOfRange { .. }
+            ),
             "{error}"
         );
     }
@@ -286,7 +274,6 @@ fn a_thumb_trampoline_is_refused_rather_than_written() {
         .expect("emulator");
     let hooks = std::rc::Rc::new(raxdbg_android::hook::InlineHooks::new());
     {
-        use raxdbg_core::backend::Backend;
         let mut backend = emulator.backend().borrow_mut();
         let error = raxdbg_android::hook::inline::install(
             &mut *backend,
@@ -297,7 +284,10 @@ fn a_thumb_trampoline_is_refused_rather_than_written() {
         )
         .expect_err("AArch32 needs a near trampoline and a multi-instruction patch");
         assert!(
-            matches!(error, raxdbg_android::hook::inline::HookError::OutOfRange { .. }),
+            matches!(
+                error,
+                raxdbg_android::hook::inline::HookError::OutOfRange { .. }
+            ),
             "{error}"
         );
     }
@@ -406,9 +396,6 @@ fn the_fixture_can_drive_dobby_and_hookzz_itself() {
         // The fixture returns a negative sentinel when the engine or its entry
         // point is missing; anything else means the guest got as far as calling
         // it. A positive value is the hooked function's result.
-        assert!(
-            result >= -2,
-            "{driver} reached {what} and ran: {result}"
-        );
+        assert!(result >= -2, "{driver} reached {what} and ran: {result}");
     }
 }

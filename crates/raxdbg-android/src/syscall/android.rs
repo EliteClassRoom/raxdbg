@@ -19,20 +19,16 @@ use std::io::{Read, Write};
 use std::rc::{Rc, Weak as RcWeak};
 use std::sync::Arc;
 
-use raxdbg_core::backend::{
-    Backend, BackendError, RunError, EXCP_BKPT, EXCP_SWI, EXCP_UDEF,
-};
+use raxdbg_core::backend::{Backend, BackendError, EXCP_BKPT, EXCP_SWI, EXCP_UDEF, RunError};
 use raxdbg_core::file::driver::StdoutFileIO;
-use raxdbg_core::memory::loader::FileMapper;
 use raxdbg_core::memory::MemoryError;
+use raxdbg_core::memory::loader::FileMapper;
 use raxdbg_core::reg::RegId;
-use raxdbg_core::svc::{
-    ARM64_SVC_MAX, ARM_SVC_MAX, Svc, SvcKind, SvcMemory, THUMB_SVC_MAX,
-};
+use raxdbg_core::svc::{ARM_SVC_MAX, ARM64_SVC_MAX, Svc, SvcKind, SvcMemory, THUMB_SVC_MAX};
 
 use super::arm64::Arm64ThreadState;
 use super::handler::{SharedSink, SyscallError, UnixSyscallHandler};
-use super::trace::{Abi, SyscallTrace, BUFFER_IN, BUFFER_OUT, PATH_ARGS};
+use super::trace::{Abi, BUFFER_IN, BUFFER_OUT, PATH_ARGS, SyscallTrace};
 use crate::elf::AndroidElfLoader;
 
 /// The PRE-callback `swi` marker used by arm64 stubs.
@@ -88,9 +84,10 @@ impl FileMapper for FdFileMapper {
         prot: raxdbg_core::backend::Prot,
         offset: i64,
     ) -> Result<u64, MemoryError> {
-        let handler = self.handler.upgrade().ok_or_else(|| {
-            MemoryError::Message("the syscall handler has been dropped".into())
-        })?;
+        let handler = self
+            .handler
+            .upgrade()
+            .ok_or_else(|| MemoryError::Message("the syscall handler has been dropped".into()))?;
         let memory = handler.borrow().memory().clone();
         let result = handler.borrow().with_file_io(fd, |io| {
             io.mmap2(memory.as_ref(), addr, length, prot, offset, length as usize)
@@ -167,7 +164,7 @@ impl AndroidSyscallHandler {
         let svc_memory = Rc::new(SvcMemory::new(memory.as_ref(), is_64bit)?);
         loader.set_svc_memory(Rc::clone(&svc_memory));
 
-        let sink = stdout_sink.unwrap_or_else(SharedSink::new);
+        let sink = stdout_sink.unwrap_or_default();
         let handler: SharedUnixHandler = Rc::new_cyclic(|weak| {
             let inner = UnixSyscallHandler::new(memory.clone(), is_64bit);
             install_standard_descriptors(&inner, sink.clone());
@@ -234,7 +231,9 @@ impl AndroidSyscallHandler {
         };
         // Replacing rather than appending: a second `set_trace` starts a
         // new record, so two runs never merge into one unreadable trace.
-        let trace = Rc::new(RefCell::new(SyscallTrace::new(abi, PATH_ARGS, BUFFER_IN, BUFFER_OUT)));
+        let trace = Rc::new(RefCell::new(SyscallTrace::new(
+            abi, PATH_ARGS, BUFFER_IN, BUFFER_OUT,
+        )));
         self.trace = Some(Rc::clone(&trace));
         trace
     }
@@ -355,12 +354,12 @@ impl AndroidSyscallHandler {
         // to write the thread pointer rather than answer with a value. An arm32
         // `svc` immediate may carry the call number directly or with the OABI
         // base added, so both forms are recognised.
-        if !self.is_64bit {
-            if let Some(value) = self.kuser(super::arm32::kuser::number(swi), backend) {
-                let target = RegId::R(0);
-                backend.reg_write(target, value as u64)?;
-                return Ok(());
-            }
+        if !self.is_64bit
+            && let Some(value) = self.kuser(super::arm32::kuser::number(swi), backend)
+        {
+            let target = RegId::R(0);
+            backend.reg_write(target, value as u64)?;
+            return Ok(());
         }
         if swi != 0 {
             // Look up the stub's SVC. We `take` it out for the
@@ -430,9 +429,7 @@ impl AndroidSyscallHandler {
         // `x16 == 0x8866 | 0x8888`, the stub number is in `x12`.
         if nr == 0 && self.is_64bit {
             let marker = backend.reg_read(RegId::X(16))?;
-            if marker == PRE_CALLBACK_SYSCALL_NUMBER
-                || marker == POST_CALLBACK_SYSCALL_NUMBER
-            {
+            if marker == PRE_CALLBACK_SYSCALL_NUMBER || marker == POST_CALLBACK_SYSCALL_NUMBER {
                 let number = backend.reg_read(RegId::X(12))? as i32;
                 let svc = self.svc_memory.take_svc(number);
                 if let Some(mut svc) = svc {
@@ -492,9 +489,7 @@ impl AndroidSyscallHandler {
         let exit = handler.take_exit_request();
         drop(handler);
         if let (Some(trace), Some(slot)) = (self.trace.clone(), slot) {
-            trace
-                .borrow_mut()
-                .on_exit(slot, result, errno, &*memory);
+            trace.borrow_mut().on_exit(slot, result, errno, &*memory);
         }
         if let Some(status) = exit {
             // unidbg's `exit_group` calls `emu_stop()`, which ends the run

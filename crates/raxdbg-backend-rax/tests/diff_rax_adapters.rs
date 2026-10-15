@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{a32, a64, new_space, CODE, DATA};
+use common::{CODE, DATA, a32, a64, new_space};
 use rax::isa::arm::aarch64::AArch64Config;
 use rax::isa::arm::aarch64::AArch64Cpu;
 use rax::isa::arm::common::cpu::ArmCpu;
@@ -26,7 +26,11 @@ use raxdbg_backend_rax::{MemShared, RaxArm32Cpu};
 fn space_with(code: &[u8], data: &[u8]) -> AddressSpace {
     let space = new_space();
     space
-        .map(CODE, 0x1000, Mapping::anonymous(Perms::READ | Perms::WRITE | Perms::EXEC))
+        .map(
+            CODE,
+            0x1000,
+            Mapping::anonymous(Perms::READ | Perms::WRITE | Perms::EXEC),
+        )
         .expect("map code");
     space
         .map(DATA, 0x1000, Mapping::anonymous(Perms::READ | Perms::WRITE))
@@ -85,7 +89,10 @@ fn assert_arm64_matches(label: &str, code: &[u32], budget: u64, setup: impl Fn(&
     let ours_space = space_with(&words(code), &0x1234_5678_9abc_def0u64.to_le_bytes());
     let theirs_space = space_with(&words(code), &0x1234_5678_9abc_def0u64.to_le_bytes());
 
-    let mut ours = RaxArm64Cpu::new(AArch64Config::v8_2(), Arc::new(MemShared::new(ours_space.clone())));
+    let mut ours = RaxArm64Cpu::new(
+        AArch64Config::v8_2(),
+        Arc::new(MemShared::new(ours_space.clone())),
+    );
     let mut theirs = A64UserCpu::new(&theirs_space);
 
     setup(ours.core_mut());
@@ -137,7 +144,13 @@ fn no_setup(_cpu: &mut AArch64Cpu) {}
 #[test]
 fn arm64_arithmetic_matches_rax() {
     // mov x1,#5; mov x2,#7; add x3,x1,x2; sub x4,x1,x2; mul x5,x1,x2
-    let code = [0xd280_00a1, 0xd280_00e2, 0x8b02_0023, 0xcb02_0024, 0x9b02_7c25];
+    let code = [
+        0xd280_00a1,
+        0xd280_00e2,
+        0x8b02_0023,
+        0xcb02_0024,
+        0x9b02_7c25,
+    ];
     assert_arm64_matches("arithmetic", &code, 5, no_setup);
 }
 
@@ -236,7 +249,13 @@ fn arm64_unmapped_fetch_agrees_on_the_fault() {
 #[test]
 fn arm32_arm_state_arithmetic_matches_rax() {
     // mov r1,#5; mov r2,#7; add r3,r1,r2; sub r4,r1,r2; mul r5,r1,r2
-    let code = words(&[0xe3a0_1005, 0xe3a0_2007, 0xe081_3002, 0xe041_4002, 0xe000_0592]);
+    let code = words(&[
+        0xe3a0_1005,
+        0xe3a0_2007,
+        0xe081_3002,
+        0xe041_4002,
+        0xe000_0592,
+    ]);
     assert_arm32_matches("arm arithmetic", &code, 5);
 }
 

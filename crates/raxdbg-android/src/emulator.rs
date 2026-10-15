@@ -10,14 +10,12 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use raxdbg_backend_rax::RaxBackend;
 use raxdbg_core::alloc::GuestCall;
-use raxdbg_core::backend::{
-    Backend, BackendError, EventMemHook, Prot, RunError, UnmappedKind,
-};
+use raxdbg_core::backend::{Backend, BackendError, EventMemHook, Prot, RunError, UnmappedKind};
 use raxdbg_core::memory::loader::Loader;
 use raxdbg_core::memory::{Memory, MemoryError};
 use raxdbg_core::reg::RegId;
-use raxdbg_backend_rax::RaxBackend;
 
 use crate::android_file::LibraryFile;
 use crate::elf::loader::{AndroidElfLoader, ElfError, InitCaller};
@@ -34,7 +32,7 @@ use crate::syscall::android::{AndroidSyscallHandler, SyscallHook};
 /// Port of unidbg: `AbstractARM64Emulator.LR`. A function call returns by
 /// branching here; the page is filled with `svc #0`, and the run loop stops
 /// *before* executing the instruction at `until`, so the call ends.
-pub const ARM64_TRAP_ADDRESS: u64 = 0x7ffff_0000;
+pub const ARM64_TRAP_ADDRESS: u64 = 0x0007_ffff_0000;
 
 /// The `LR` trap page's address on arm32.
 pub const ARM32_TRAP_ADDRESS: u64 = 0xffff_0000;
@@ -120,13 +118,8 @@ impl AndroidEmulator {
         let guest = backend.guest_memory();
         let backend: Rc<RefCell<dyn Backend>> = Rc::new(RefCell::new(backend));
 
-        let loader = AndroidElfLoader::new(
-            Rc::clone(&backend),
-            guest,
-            is_64bit,
-            process_name,
-            seed,
-        )?;
+        let loader =
+            AndroidElfLoader::new(Rc::clone(&backend), guest, is_64bit, process_name, seed)?;
 
         {
             let mut backend = backend.borrow_mut();
@@ -158,12 +151,9 @@ impl AndroidEmulator {
         // -- `/dev/__properties__` above all -- answers ENOENT. arm64 hid it
         // because `__system_property_get` is answered by a hook, but arm32's
         // `__system_property_area_init` opens the file for real.
-        syscall
-            .borrow()
-            .unix_handler()
-            .add_io_resolver(Box::new(crate::linux::android::resolver::SharedResolver(
-                Rc::clone(&resolver),
-            )));
+        syscall.borrow().unix_handler().add_io_resolver(Box::new(
+            crate::linux::android::resolver::SharedResolver(Rc::clone(&resolver)),
+        ));
 
         let emulator = Rc::new(AndroidEmulator {
             backend: Rc::clone(&backend),
@@ -222,7 +212,10 @@ impl AndroidEmulator {
     /// Registers the `libdl` trampolines, the virtual modules and the system
     /// property hook, in unidbg's order.
     fn install_host_services(&self) -> Result<(), EmulatorError> {
-        let svc_memory = self.loader.svc_memory().expect("the syscall layer built one");
+        let svc_memory = self
+            .loader
+            .svc_memory()
+            .expect("the syscall layer built one");
         if self.is_64bit {
             let arm_ld = ArmLd64::register(
                 svc_memory.as_ref(),
@@ -234,10 +227,7 @@ impl AndroidEmulator {
                 .add_hook_listener(Rc::new(arm_ld) as Rc<dyn raxdbg_core::hook::HookListener>);
         }
 
-        let provider = SystemPropertyProvider::with_defaults(
-            self.resolver.sdk(),
-            self.is_64bit,
-        );
+        let provider = SystemPropertyProvider::with_defaults(self.resolver.sdk(), self.is_64bit);
         let dispatch = Rc::new(crate::linux::android::system_property::StubDispatch::new());
         let property_hook = SystemPropertyHook::register(
             svc_memory.as_ref(),
@@ -260,13 +250,11 @@ impl AndroidEmulator {
         // `pthread_mutex_lock`, which walks a bionic pthread structure this
         // port does not model. The filter says exactly that, so the skip is a
         // decision rather than a fault. See docs/known-gaps.md.
-        self.loader
-            .set_init_function_filter(Rc::new(SkipCxxInit));
+        self.loader.set_init_function_filter(Rc::new(SkipCxxInit));
 
         // `clone` and `pthread_join`, the two libc functions unidbg replaces to
         // make threads (plan P7). The entry code is precomputed (plan D9).
-        let start = crate::thread::join::install_entry(self)
-            .map_err(EmulatorError::Memory)?;
+        let start = crate::thread::join::install_entry(self).map_err(EmulatorError::Memory)?;
         let joint = crate::thread::join::install(self, &start).map_err(EmulatorError::Memory)?;
         *self.thread_start.borrow_mut() = Some(Rc::new(start));
         joint.set_memory(Rc::clone(self.loader.memory()));
@@ -355,9 +343,7 @@ impl AndroidEmulator {
     pub fn load_library(&self, name: &str) -> Result<String, EmulatorError> {
         let file = crate::android_file::LibraryResolver::resolve_library(&*self.resolver, name)
             .ok_or_else(|| EmulatorError::Message(format!("cannot resolve {name}")))?;
-        self.loader
-            .load(file, false)
-            .map_err(EmulatorError::from)
+        self.loader.load(file, false).map_err(EmulatorError::from)
     }
 
     /// Loads a library file, running its initialisers.
@@ -388,7 +374,11 @@ impl AndroidEmulator {
     /// the caller's saved context back and the `svc` returns the value it owes.
     /// Running the caller on a stack of its own and handing its context to the
     /// dispatcher makes the same thing true here.
-    pub fn call_function_driven(self: &Rc<Self>, address: u64, args: &[u64]) -> Result<u64, EmulatorError> {
+    pub fn call_function_driven(
+        self: &Rc<Self>,
+        address: u64,
+        args: &[u64],
+    ) -> Result<u64, EmulatorError> {
         const MAX_SWITCHES: usize = 4096;
         let Some(start) = self.thread_start.borrow().clone() else {
             // Nothing installed the thread machinery, so nothing can park.
@@ -398,21 +388,16 @@ impl AndroidEmulator {
             return self.call_function(address, args);
         };
         let runtime = crate::thread::ThreadRuntime::install(self).map_err(EmulatorError::Memory)?;
-        let waiters = self
-            .syscall
-            .borrow()
-            .unix_handler()
-            .waiters()
-            .clone();
+        let waiters = self.syscall.borrow().unix_handler().waiters().clone();
         let mut dispatcher = runtime.dispatcher(self);
         dispatcher.set_waiters(Rc::clone(&waiters));
 
         // The caller, as a task, on a stack of its own.
-        let caller_stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
+        let caller_stack = runtime
+            .allocate_stack(self)
+            .map_err(EmulatorError::Memory)?;
         let caller = dispatcher.create(address, args, caller_stack);
-        let mut passes = 0usize;
         for _ in 0..MAX_SWITCHES {
-            passes += 1;
             if dispatcher.pending() == 0 && join.pending_count() == 0 {
                 // The caller has finished and nothing new was created.
                 break;
@@ -423,7 +408,9 @@ impl AndroidEmulator {
             // join exactly like any other. A thread can be created by another
             // thread, so this happens every pass, not just the first.
             for thread in join.take_pending() {
-                let stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
+                let stack = runtime
+                    .allocate_stack(self)
+                    .map_err(EmulatorError::Memory)?;
                 self.loader
                     .memory()
                     .pointer(stack)
@@ -444,7 +431,9 @@ impl AndroidEmulator {
             // up both before and after a pass: a thread the caller makes while
             // it runs is not there when the pass it is in starts.
             for thread in join.take_pending() {
-                let stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
+                let stack = runtime
+                    .allocate_stack(self)
+                    .map_err(EmulatorError::Memory)?;
                 // The clone replacement put the routine and its argument at the
                 // top of the child's stack, which is where the entry code reads
                 // them.
@@ -466,7 +455,7 @@ impl AndroidEmulator {
             let results = {
                 let mut backend = self.backend.borrow_mut();
                 let mut refill = |dispatcher: &mut raxdbg_core::thread::ThreadDispatcher,
-                                   _backend: &mut dyn Backend| {
+                                  _backend: &mut dyn Backend| {
                     // A thread is created by the running code, so the dispatcher
                     // only learns about one when a pass ends.
                     for thread in join.take_pending() {
@@ -498,7 +487,9 @@ impl AndroidEmulator {
             let results = results.unwrap_or_default();
             // Whatever the pass created, and whatever it woke, is next.
             for thread in join.take_pending() {
-                let stack = runtime.allocate_stack(self).map_err(EmulatorError::Memory)?;
+                let stack = runtime
+                    .allocate_stack(self)
+                    .map_err(EmulatorError::Memory)?;
                 self.loader
                     .memory()
                     .pointer(stack)

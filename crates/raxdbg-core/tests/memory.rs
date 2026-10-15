@@ -70,16 +70,13 @@ impl TestBackend {
                     kind: MemoryFaultKind::Unmapped,
                 });
             };
-            self.regions
-                .get_mut(&base)
-                .expect("just found")
-                .data[offset] = *byte;
+            self.regions.get_mut(&base).expect("just found").data[offset] = *byte;
         }
         Ok(())
     }
 
     fn map(&mut self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
-        if addr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 || size == 0 {
+        if !addr.is_multiple_of(PAGE_SIZE) || !size.is_multiple_of(PAGE_SIZE) || size == 0 {
             return Err(BackendError::Map {
                 addr,
                 size,
@@ -242,7 +239,8 @@ impl Backend for TestBackend {
 fn loader() -> (Rc<Loader>, Arc<parking_lot::Mutex<TestBackend>>) {
     let space = Arc::new(parking_lot::Mutex::new(TestBackend::default()));
     let guest: Arc<dyn GuestMemory> = Arc::new(TestMemory(Arc::clone(&space)));
-    let backend: Rc<RefCell<dyn Backend>> = Rc::new(RefCell::new(SharedBackend(Arc::clone(&space))));
+    let backend: Rc<RefCell<dyn Backend>> =
+        Rc::new(RefCell::new(SharedBackend(Arc::clone(&space))));
     (Loader::new(backend, guest, 8), space)
 }
 
@@ -271,10 +269,16 @@ impl Backend for SharedBackend {
         Ok(buf)
     }
     fn mem_read_into(&self, addr: u64, buf: &mut [u8]) -> Result<(), BackendError> {
-        self.0.lock().read_raw(addr, buf).map_err(BackendError::Memory)
+        self.0
+            .lock()
+            .read_raw(addr, buf)
+            .map_err(BackendError::Memory)
     }
     fn mem_write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), BackendError> {
-        self.0.lock().write_raw(addr, bytes).map_err(BackendError::Memory)
+        self.0
+            .lock()
+            .write_raw(addr, bytes)
+            .map_err(BackendError::Memory)
     }
     fn mem_map(&mut self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
         TestBackend::map(&mut self.0.lock(), addr, size, perms)
@@ -304,13 +308,7 @@ impl Backend for SharedBackend {
         0
     }
     fn hook_del(&mut self, _id: HookId) {}
-    fn emu_start(
-        &mut self,
-        _b: u64,
-        _u: u64,
-        _t: u64,
-        _c: u64,
-    ) -> Result<RunOutcome, RunError> {
+    fn emu_start(&mut self, _b: u64, _u: u64, _t: u64, _c: u64) -> Result<RunOutcome, RunError> {
         Ok(RunOutcome::Stopped)
     }
     fn emu_stop(&mut self) {}
@@ -366,10 +364,24 @@ fn mmap_starts_at_the_mmap_base() {
 fn allocate_map_address_fills_the_first_gap() {
     let (loader, _) = loader();
     loader
-        .mmap2(0x1000_0000, 0x1000, Prot::READ, MAP_FIXED | MAP_ANONYMOUS, -1, 0)
+        .mmap2(
+            0x1000_0000,
+            0x1000,
+            Prot::READ,
+            MAP_FIXED | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
         .unwrap();
     loader
-        .mmap2(0x1000_4000, 0x1000, Prot::READ, MAP_FIXED | MAP_ANONYMOUS, -1, 0)
+        .mmap2(
+            0x1000_4000,
+            0x1000,
+            Prot::READ,
+            MAP_FIXED | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
         .unwrap();
     // The gap between the two regions holds one more page.
     assert_eq!(loader.allocate_map_address(0, 0x1000), 0x1000_1000);
@@ -418,7 +430,7 @@ fn munmap_of_the_whole_region_drops_it_and_resets_the_cursor() {
 
 #[test]
 fn mprotect_splits_the_region_tree() {
-    let (loader, backend) = loader();
+    let (loader, _) = loader();
     let base = 0x4000_0000;
     loader
         .mmap2(base, 0x3000, Prot::READ, MAP_FIXED | MAP_ANONYMOUS, -1, 0)
@@ -441,7 +453,10 @@ fn mprotect_splits_the_region_tree() {
 fn mprotect_rejects_a_misaligned_address() {
     let (loader, _) = loader();
     loader.mmap(0x1000, Prot::READ).unwrap();
-    assert_eq!(loader.mprotect(MMAP_BASE + 1, 0x1000, Prot::READ).unwrap(), -1);
+    assert_eq!(
+        loader.mprotect(MMAP_BASE + 1, 0x1000, Prot::READ).unwrap(),
+        -1
+    );
     assert_eq!(loader.get_last_errno(), raxdbg_core::errno::EINVAL);
 }
 
@@ -473,9 +488,15 @@ fn brk_grows_and_shrinks_the_heap() {
     let (loader, _) = loader();
     assert_eq!(loader.brk(0).unwrap(), HEAP_BASE);
     assert_eq!(loader.brk(HEAP_BASE + 0x2000).unwrap(), HEAP_BASE + 0x2000);
-    assert_eq!(loader.region_at(HEAP_BASE).map(|map| map.size), Some(0x2000));
+    assert_eq!(
+        loader.region_at(HEAP_BASE).map(|map| map.size),
+        Some(0x2000)
+    );
     assert_eq!(loader.brk(HEAP_BASE + 0x1000).unwrap(), HEAP_BASE + 0x1000);
-    assert_eq!(loader.region_at(HEAP_BASE).map(|map| map.size), Some(0x1000));
+    assert_eq!(
+        loader.region_at(HEAP_BASE).map(|map| map.size),
+        Some(0x1000)
+    );
     assert_eq!(loader.brk(HEAP_BASE).unwrap(), HEAP_BASE);
     assert!(loader.region_at(HEAP_BASE).is_none());
 }
@@ -489,7 +510,9 @@ fn brk_rejects_a_misaligned_address() {
 #[test]
 fn pointer_round_trips_every_typed_access() {
     let (loader, _) = loader();
-    let pointer = loader.mmap(0x10_0000, Prot::READ.union(Prot::WRITE)).unwrap();
+    let pointer = loader
+        .mmap(0x10_0000, Prot::READ.union(Prot::WRITE))
+        .unwrap();
 
     pointer.write_byte(0, 0xab).unwrap();
     assert_eq!(pointer.read_byte(0).unwrap(), 0xab);
@@ -588,7 +611,10 @@ fn thread_stacks_sit_below_the_main_stack() {
     let index = loader.allocate_thread_index().unwrap();
     let stack = loader.allocate_thread_stack(index).unwrap();
     let base = STACK_BASE - STACK_SIZE_OF_MAIN_PAGE * PAGE_SIZE;
-    assert_eq!(stack.peer(), base - THREAD_STACK_PAGE * index as u64 * PAGE_SIZE);
+    assert_eq!(
+        stack.peer(),
+        base - THREAD_STACK_PAGE * index as u64 * PAGE_SIZE
+    );
 }
 
 #[test]
@@ -617,7 +643,10 @@ fn errno_is_written_to_the_guest_slot() {
     loader.set_errno_address(pointer.peer());
     loader.set_errno(raxdbg_core::errno::ENOENT);
     assert_eq!(loader.get_last_errno(), raxdbg_core::errno::ENOENT);
-    assert_eq!(pointer.read_u32(0).unwrap(), raxdbg_core::errno::ENOENT as u32);
+    assert_eq!(
+        pointer.read_u32(0).unwrap(),
+        raxdbg_core::errno::ENOENT as u32
+    );
 }
 
 #[test]
@@ -661,8 +690,8 @@ fn tracker_records_mappings_and_forgets_unmappings() {
 
 #[test]
 fn tracker_chains_to_the_listener_it_replaced() {
-    use std::cell::Cell;
     use raxdbg_core::memory::MMapListener;
+    use std::cell::Cell;
 
     struct Counter(Rc<Cell<u32>>);
     impl MMapListener for Counter {
@@ -682,6 +711,10 @@ fn tracker_chains_to_the_listener_it_replaced() {
     raxdbg_core::alloc::MemoryTracker::install(&tracker, &*loader);
 
     loader.malloc(0x1000, true).unwrap();
-    assert_eq!(seen.get(), 1, "the replaced listener still sees the mapping");
+    assert_eq!(
+        seen.get(),
+        1,
+        "the replaced listener still sees the mapping"
+    );
     assert_eq!(tracker.allocations().len(), 1);
 }

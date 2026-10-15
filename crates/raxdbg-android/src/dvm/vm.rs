@@ -23,8 +23,8 @@ use raxdbg_core::svc::{Svc, SvcKind, SvcMemory};
 
 use crate::dvm::hash::Hasher;
 use crate::dvm::object::{
-    normalize_class_name, DvmClass, DvmField, DvmMethod, DvmObject, InstanceObject,
-    IntArrayObject, NumberObject, StringObject,
+    DvmClass, DvmField, DvmMethod, DvmObject, InstanceObject, IntArrayObject, StringObject,
+    normalize_class_name,
 };
 use crate::elf::loader::ElfError;
 use crate::emulator::AndroidEmulator;
@@ -316,10 +316,7 @@ impl std::fmt::Debug for Vm {
 impl Vm {
     /// Creates a VM and builds its `JNIEnv` and `JavaVM` tables.
     pub fn create(emulator: &Rc<AndroidEmulator>) -> Result<Rc<RefCell<Vm>>, JniError> {
-        let svc = emulator
-            .loader()
-            .svc_memory()
-            .ok_or(JniError::NoSvcPage)?;
+        let svc = emulator.loader().svc_memory().ok_or(JniError::NoSvcPage)?;
         let vm = Rc::new(RefCell::new(Vm {
             hasher: Hasher::Default,
             is_64bit: emulator.is_64bit(),
@@ -419,8 +416,12 @@ impl Vm {
     /// Port of unidbg: `DvmClass.getMethodID`, which hashes
     /// `L<Class>;-><name><signature>`.
     pub fn hash_method(&self, class: &str, name: &str, signature: &str) -> i32 {
-        self.hasher
-            .hash(&format!("{}->{}{}", normalize_class_name(class), name, signature))
+        self.hasher.hash(&format!(
+            "{}->{}{}",
+            normalize_class_name(class),
+            name,
+            signature
+        ))
     }
 
     /// The id for a field of `class`.
@@ -428,8 +429,12 @@ impl Vm {
     /// Port of unidbg: `DvmClass.getFieldID`, which hashes
     /// `L<Class>;-><name>:<type>`.
     pub fn hash_field(&self, class: &str, name: &str, field_type: &str) -> i32 {
-        self.hasher
-            .hash(&format!("{}->{}:{}", normalize_class_name(class), name, field_type))
+        self.hasher.hash(&format!(
+            "{}->{}:{}",
+            normalize_class_name(class),
+            name,
+            field_type
+        ))
     }
 
     /// Resolves a class, creating it on first use.
@@ -771,7 +776,10 @@ impl Vm {
             let class = vm.resolve_class(class_name);
             let address = class
                 .find_native_function(name, signature, |symbol| {
-                    emulator.loader().dlsym(0, symbol).map(|symbol| symbol.address)
+                    emulator
+                        .loader()
+                        .dlsym(0, symbol)
+                        .map(|symbol| symbol.address)
                 })
                 .ok_or_else(|| JniError::NoNative(format!("{class_name}->{name}{signature}")))?;
             (vm.jni_env(), class.hash_code(), address)
@@ -837,7 +845,12 @@ struct JniFunction {
 }
 
 impl JniFunction {
-    fn new(function: JniFunc, vm: Weak<RefCell<Vm>>, memory: Rc<raxdbg_core::memory::loader::Loader>, is_64bit: bool) -> Self {
+    fn new(
+        function: JniFunc,
+        vm: Weak<RefCell<Vm>>,
+        memory: Rc<raxdbg_core::memory::loader::Loader>,
+        is_64bit: bool,
+    ) -> Self {
         let label = format!("JNIEnv!{}", function.name());
         Self {
             function,
@@ -916,8 +929,7 @@ impl Svc for JavaVmFunction {
         let out = arg(backend, self.is_64bit, 0);
         let requested = arg(backend, self.is_64bit, 1) as i32;
         if out != 0 {
-            write_word(backend, self.is_64bit, out, vm.jni_env(), vm.pointer_size)
-                .map_err(RunError::Backend)?;
+            write_word(backend, out, vm.jni_env(), vm.pointer_size).map_err(RunError::Backend)?;
         }
         // A version the VM does not provide is `JNI_EVERSION` (-3).
         if self.label == "JavaVM!GetEnv" && requested != 0 && requested != vm.jni_version() {
@@ -962,7 +974,6 @@ fn arg(backend: &mut dyn Backend, is_64bit: bool, index: u64) -> u64 {
 
 fn write_word(
     backend: &mut dyn Backend,
-    is_64bit: bool,
     address: u64,
     value: u64,
     pointer_size: u64,
@@ -987,7 +998,9 @@ fn dispatch(
         JniFunc::GetVersion => Ok(vm.jni_version() as i64),
         JniFunc::FindClass => {
             let address = arg(backend, is_64bit, 0);
-            let name = vm.read_cstring(address).map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))?;
+            let name = vm.read_cstring(address).map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })?;
             let class = with_jni(vm, |jni, vm| jni.find_class(vm, &name));
             Ok(match class {
                 Some(class) => {
@@ -1014,10 +1027,13 @@ fn dispatch(
                 let entry = methods + index as u64 * stride;
                 let name_ptr = read_pointer(memory, entry, pointer_size)?;
                 let signature_ptr = read_pointer(memory, entry + pointer_size, pointer_size)?;
-                let function_ptr =
-                    read_pointer(memory, entry + 2 * pointer_size, pointer_size)?;
-                let name = vm.read_cstring(name_ptr).map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))?;
-                let signature = vm.read_cstring(signature_ptr).map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))?;
+                let function_ptr = read_pointer(memory, entry + 2 * pointer_size, pointer_size)?;
+                let name = vm.read_cstring(name_ptr).map_err(|error| {
+                    RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+                })?;
+                let signature = vm.read_cstring(signature_ptr).map_err(|error| {
+                    RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+                })?;
                 class.register_native(&name, &signature, function_ptr);
             }
             Ok(JNI_OK as i64)
@@ -1029,8 +1045,12 @@ fn dispatch(
             let Some(class) = vm.class_by_hash(class_hash) else {
                 return Ok(0);
             };
-            let name = vm.read_cstring(name_ptr).map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))?;
-            let signature = vm.read_cstring(signature_ptr).map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))?;
+            let name = vm.read_cstring(name_ptr).map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })?;
+            let signature = vm.read_cstring(signature_ptr).map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })?;
             let is_static = function == JniFunc::GetStaticMethodID;
             let method = with_jni(vm, |jni, vm| {
                 if is_static {
@@ -1067,12 +1087,15 @@ fn dispatch(
             let object_hash = arg(backend, is_64bit, 0) as i32;
             let method_hash = arg(backend, is_64bit, 1) as i32;
             let args: Vec<u64> = (2..8).map(|i| arg(backend, is_64bit, i)).collect();
-            let (Some(object), Some(method)) = (vm.object(object_hash), vm.method_by_hash(method_hash))
+            let (Some(object), Some(method)) =
+                (vm.object(object_hash), vm.method_by_hash(method_hash))
             else {
                 return Ok(0);
             };
             method.note_invocation();
-            let value = with_jni(vm, |jni, vm| jni.call_int_method(vm, &object, &method, &args));
+            let value = with_jni(vm, |jni, vm| {
+                jni.call_int_method(vm, &object, &method, &args)
+            });
             Ok(value as i64)
         }
         JniFunc::NewObject => {
@@ -1097,7 +1120,9 @@ fn dispatch(
             if address == 0 {
                 return Ok(0);
             }
-            let value = vm.read_cstring(address).map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))?;
+            let value = vm.read_cstring(address).map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })?;
             let hash = vm.new_string(value);
             Ok(hash as i64)
         }
@@ -1114,23 +1139,23 @@ fn dispatch(
             }
             let mut bytes = string.value().as_bytes().to_vec();
             bytes.push(0);
-            let block = vm.allocate_buffer(bytes.len()).map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))?;
-            block
-                .pointer()
-                .write_bytes(0, &bytes)
-                .map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))?;
+            let block = vm.allocate_buffer(bytes.len()).map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })?;
+            block.pointer().write_bytes(0, &bytes).map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })?;
             let pointer = block.pointer().peer();
             *string.buffer.borrow_mut() = Some((pointer, block));
             Ok(pointer as i64)
         }
         JniFunc::ReleaseStringUTFChars => {
             let hash = arg(backend, is_64bit, 0) as i32;
-            if let Some(object) = vm.object(hash) {
-                if let Some(string) = object.as_any().downcast_ref::<StringObject>() {
-                    if let Some((_, block)) = string.buffer.borrow_mut().take() {
-                        let _ = block.free();
-                    }
-                }
+            if let Some(object) = vm.object(hash)
+                && let Some(string) = object.as_any().downcast_ref::<StringObject>()
+                && let Some((_, block)) = string.buffer.borrow_mut().take()
+            {
+                let _ = block.free();
             }
             Ok(0)
         }
@@ -1159,12 +1184,11 @@ fn dispatch(
         JniFunc::ReleaseIntArrayElements => {
             let hash = arg(backend, is_64bit, 0) as i32;
             let mode = arg(backend, is_64bit, 2) as i32;
-            if mode != JNI_ABORT {
-                if let Some(object) = vm.object(hash) {
-                    if let Some(array) = object.as_any().downcast_ref::<IntArrayObject>() {
-                        array.sync_from_guest();
-                    }
-                }
+            if mode != JNI_ABORT
+                && let Some(object) = vm.object(hash)
+                && let Some(array) = object.as_any().downcast_ref::<IntArrayObject>()
+            {
+                array.sync_from_guest();
             }
             Ok(0)
         }
@@ -1175,8 +1199,7 @@ fn dispatch(
             // which is what `arg(0)` returns -- so the out-pointer is `arg(0)`.
             let out = arg(backend, is_64bit, 0);
             if out != 0 {
-                write_word(backend, is_64bit, out, vm.java_vm(), pointer_size)
-                    .map_err(RunError::Backend)?;
+                write_word(backend, out, vm.java_vm(), pointer_size).map_err(RunError::Backend)?;
             }
             Ok(i64::from(JNI_OK))
         }
@@ -1189,7 +1212,9 @@ fn dispatch(
             let message = if message_ptr == 0 {
                 String::new()
             } else {
-                vm.read_cstring(message_ptr).map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))?
+                vm.read_cstring(message_ptr).map_err(|error| {
+                    RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+                })?
             };
             let hash = vm.next_identity();
             vm.set_exception(Rc::new(InstanceObject::new(
@@ -1278,13 +1303,15 @@ fn read_pointer(
 ) -> Result<u64, RunError> {
     let pointer = memory.pointer(address);
     if pointer_size == 8 {
-        pointer
-            .read_u64(0)
-            .map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))
+        pointer.read_u64(0).map_err(|error| {
+            RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+        })
     } else {
         pointer
             .read_u32(0)
             .map(|value| value as u64)
-            .map_err(|error| RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string())))
+            .map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })
     }
 }

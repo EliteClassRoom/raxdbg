@@ -13,12 +13,10 @@ use std::rc::Rc;
 
 use raxdbg_android::android_file::ElfLibraryFile;
 use raxdbg_android::dvm::vm::JniError;
-use raxdbg_android::dvm::{
-    DvmClass, DvmMethod, DvmObject, Jni, JNI_OK, JNI_VERSION_1_6, Vm,
-};
+use raxdbg_android::dvm::{DvmClass, DvmMethod, DvmObject, JNI_OK, JNI_VERSION_1_6, Jni, Vm};
 use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder};
 use raxdbg_core::backend::Prot;
-use raxdbg_core::memory::{Memory, MAP_ANONYMOUS};
+use raxdbg_core::memory::{MAP_ANONYMOUS, Memory};
 
 /// The fixture's class, as the guest names it.
 const CLASS: &str = "com/raxdbg/test/JniTest";
@@ -127,7 +125,6 @@ fn the_vm_builds_a_jni_env_and_java_vm() {
 fn get_java_vm_answers_through_the_jni_env_table() {
     let fixture = Fixture::boot();
     let vm = fixture.vm.borrow();
-    let java_vm = vm.java_vm();
 
     let table = fixture
         .emulator
@@ -143,7 +140,8 @@ fn get_java_vm_answers_through_the_jni_env_table() {
         .read_pointer(0)
         .expect("read GetJavaVM slot");
     assert_ne!(
-        entry, 219 * 8,
+        entry,
+        219 * 8,
         "GetJavaVM must not be the unmapped placeholder the table is filled with"
     );
     let svc_base = fixture
@@ -208,7 +206,7 @@ fn get_java_vm_writes_the_handle_to_the_out_pointer() {
         .call_function(entry, &[env, out])
         .expect("GetJavaVM runs");
 
-    assert_eq!(result as i32, JNI_OK as i32, "GetJavaVM reports JNI_OK");
+    assert_eq!(result as i32, JNI_OK, "GetJavaVM reports JNI_OK");
     let written = fixture
         .emulator
         .memory()
@@ -272,7 +270,7 @@ fn a_jni_env_call_ignores_the_registers_after_its_arguments() {
         .emulator
         .call_function(entry, &[env, out, poison])
         .expect("GetJavaVM runs and does not write through x2");
-    assert_eq!(result as i32, JNI_OK as i32);
+    assert_eq!(result as i32, JNI_OK);
 }
 
 /// Each `JavaVM` function gets its own stub, so a call log names the function
@@ -381,7 +379,10 @@ fn a_java_symbol_is_found_by_mangling() {
 fn get_version_answers_through_the_jni_env_table() {
     let fixture = Fixture::boot();
     fixture.on_load().expect("JNI_OnLoad");
-    assert_eq!(fixture.call("getVersion", "()I", &[]), JNI_VERSION_1_6 as i64);
+    assert_eq!(
+        fixture.call("getVersion", "()I", &[]),
+        JNI_VERSION_1_6 as i64
+    );
 }
 
 #[test]
@@ -389,7 +390,11 @@ fn a_string_round_trips_through_get_and_new_string_utf() {
     let fixture = Fixture::boot();
     fixture.on_load().expect("JNI_OnLoad");
     let hash = fixture.vm.borrow().new_string("abc");
-    let returned = fixture.call("echo", "(Ljava/lang/String;)Ljava/lang/String;", &[hash as u64]);
+    let returned = fixture.call(
+        "echo",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &[hash as u64],
+    );
     assert_ne!(returned, 0, "echo returned a string");
     let object = fixture
         .vm
@@ -408,11 +413,12 @@ fn a_string_with_a_nul_terminator_survives_the_round_trip() {
     let fixture = Fixture::boot();
     fixture.on_load().expect("JNI_OnLoad");
     // `GetStringUTFChars` must hand the guest a NUL-terminated buffer.
-    let hash = fixture
-        .vm
-        .borrow()
-        .new_string("hello from the host");
-    let returned = fixture.call("echo", "(Ljava/lang/String;)Ljava/lang/String;", &[hash as u64]);
+    let hash = fixture.vm.borrow().new_string("hello from the host");
+    let returned = fixture.call(
+        "echo",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &[hash as u64],
+    );
     let object = fixture.vm.borrow().object(returned as i32).expect("object");
     let string = object
         .as_any()
@@ -495,7 +501,11 @@ fn a_global_reference_outlives_the_local_it_came_from() {
     let fixture = Fixture::boot();
     fixture.on_load().expect("JNI_OnLoad");
     let hash = fixture.vm.borrow().new_string("keep me");
-    let returned = fixture.call("globalRef", "(Ljava/lang/Object;)Ljava/lang/Object;", &[hash as u64]);
+    let returned = fixture.call(
+        "globalRef",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[hash as u64],
+    );
     assert_eq!(returned as i32, hash, "the reference keeps its identity");
     {
         let vm = fixture.vm.borrow();
@@ -578,9 +588,8 @@ fn the_hasher_decides_the_method_ids() {
     let vm = fixture.vm.borrow();
     // unidbg's default hasher is Java's String.hashCode over
     // "L<Class>;-><name><signature>".
-    let expected = raxdbg_android::dvm::hash::java_string_hash(
-        "Lcom/raxdbg/test/JniTest;->getSeed()I",
-    );
+    let expected =
+        raxdbg_android::dvm::hash::java_string_hash("Lcom/raxdbg/test/JniTest;->getSeed()I");
     assert_eq!(vm.hash_method(CLASS, "getSeed", "()I"), expected);
 }
 
@@ -618,14 +627,25 @@ fn jni_on_load_runs_after_the_librarys_initialisers() {
     library.code = vec![
         // .init: adr x1, #0x40 ; movz w2, #6 ; movk w2, #1, lsl #16 ;
         //         str w2, [x1] ; ret
-        0x1000_0201, 0x5280_00c2, 0x72a0_0022, 0xb900_0022, 0xd65f_03c0,
+        0x1000_0201,
+        0x5280_00c2,
+        0x72a0_0022,
+        0xb900_0022,
+        0xd65f_03c0,
         // padding to 0x120
-        0xd503_201f, 0xd503_201f, 0xd503_201f,
+        0xd503_201f,
+        0xd503_201f,
+        0xd503_201f,
         // JNI_OnLoad: adr x1, #0x20 ; ldr w0, [x1] ; ret
-        0x1000_0101, 0xb940_0020, 0xd65f_03c0,
+        0x1000_0101,
+        0xb940_0020,
+        0xd65f_03c0,
     ];
     let name = emulator
-        .load(Box::new(ElfLibraryRawFile::new("libjnionload.so", library.build())), false)
+        .load(
+            Box::new(ElfLibraryRawFile::new("libjnionload.so", library.build())),
+            false,
+        )
         .expect("load");
     emulator.loader().set_call_init_function(true);
     assert_eq!(name, "libjnionload.so");

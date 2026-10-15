@@ -17,7 +17,7 @@ use raxdbg_core::reg::RegId;
 use std::collections::BTreeMap;
 
 use raxdbg_android::android_file::{
-    DirectoryResolver, ElfLibraryFile, ElfLibraryRawFile, LibraryFile, LibraryResolver,
+    DirectoryResolver, ElfLibraryRawFile, LibraryFile, LibraryResolver,
 };
 use raxdbg_android::elf::loader::{AndroidElfLoader, reloc_type};
 use raxdbg_android::elf::{InitCall, InitFunctionListener, InitKind};
@@ -45,9 +45,9 @@ struct MapResolver(BTreeMap<String, Vec<u8>>);
 
 impl LibraryResolver for MapResolver {
     fn resolve_library(&self, name: &str) -> Option<Box<dyn LibraryFile>> {
-        self.0
-            .get(name)
-            .map(|data| Box::new(ElfLibraryRawFile::new(name, data.clone())) as Box<dyn LibraryFile>)
+        self.0.get(name).map(|data| {
+            Box::new(ElfLibraryRawFile::new(name, data.clone())) as Box<dyn LibraryFile>
+        })
     }
 }
 
@@ -126,7 +126,13 @@ fn synthetic_library() -> Vec<u8> {
 fn synthetic_library_maps_relocates_and_registers() {
     let loader = loader_with_dependency(1);
     let module = loader
-        .load(Box::new(ElfLibraryRawFile::new("libsynthetic.so", synthetic_library())), false)
+        .load(
+            Box::new(ElfLibraryRawFile::new(
+                "libsynthetic.so",
+                synthetic_library(),
+            )),
+            false,
+        )
         .expect("load");
 
     assert_eq!(module, "libsynthetic.so");
@@ -137,7 +143,10 @@ fn synthetic_library_maps_relocates_and_registers() {
     // binary is the case that matters, where `file` is the file on disk and
     // `name` is the `DT_SONAME` the guest's `dlsym` uses.
     assert_eq!(info.file, "libsynthetic.so");
-    assert!(info.base >= 0x1200_0000, "the module is mapped above MMAP_BASE");
+    assert!(
+        info.base >= 0x1200_0000,
+        "the module is mapped above MMAP_BASE"
+    );
     assert_eq!(info.base % 0x1000, 0, "the base is page-aligned");
     assert!(info.size >= 0x1000);
     assert_eq!(info.needed_libraries, vec!["libdep.so".to_string()]);
@@ -155,17 +164,26 @@ fn synthetic_library_maps_relocates_and_registers() {
     let memory = loader.memory();
     // R_AARCH64_RELATIVE: load_base + addend.
     assert_eq!(
-        memory.pointer(info.base + RELATIVE_WORD).read_u64(0).unwrap(),
+        memory
+            .pointer(info.base + RELATIVE_WORD)
+            .read_u64(0)
+            .unwrap(),
         info.base + RELATIVE_ADDEND as u64
     );
     // R_AARCH64_GLOB_DAT: the dependency's definition.
     assert_eq!(
-        memory.pointer(info.base + GLOB_DAT_SLOT).read_u64(0).unwrap(),
+        memory
+            .pointer(info.base + GLOB_DAT_SLOT)
+            .read_u64(0)
+            .unwrap(),
         dependency.base + 0x40
     );
     // The file's own bytes are mapped.
     assert_eq!(
-        memory.pointer(info.base + MARKER_ADDRESS).read_u32(0).unwrap(),
+        memory
+            .pointer(info.base + MARKER_ADDRESS)
+            .read_u32(0)
+            .unwrap(),
         0xd65f_03c0
     );
 }
@@ -174,7 +192,13 @@ fn synthetic_library_maps_relocates_and_registers() {
 fn synthetic_library_exposes_its_symbols() {
     let loader = loader_with_dependency(2);
     loader
-        .load(Box::new(ElfLibraryRawFile::new("libsynthetic.so", synthetic_library())), false)
+        .load(
+            Box::new(ElfLibraryRawFile::new(
+                "libsynthetic.so",
+                synthetic_library(),
+            )),
+            false,
+        )
         .expect("load");
 
     let marker = loader
@@ -224,7 +248,10 @@ fn a_module_loaded_later_satisfies_an_earlier_import() {
         addend: 0,
     });
     loader
-        .load(Box::new(ElfLibraryRawFile::new("libimporter.so", importer.build())), false)
+        .load(
+            Box::new(ElfLibraryRawFile::new("libimporter.so", importer.build())),
+            false,
+        )
         .expect("load importer");
 
     let importer_info = loader.module("libimporter.so").unwrap();
@@ -239,7 +266,10 @@ fn a_module_loaded_later_satisfies_an_earlier_import() {
     );
 
     loader
-        .load(Box::new(ElfLibraryRawFile::new("libdep.so", dependency_library())), false)
+        .load(
+            Box::new(ElfLibraryRawFile::new("libdep.so", dependency_library())),
+            false,
+        )
         .expect("load dependency");
     assert!(loader.module("libdep.so").is_some());
 
@@ -270,13 +300,18 @@ fn dlopen_and_dlclose_reference_count() {
     assert_eq!(loader.module("libsynthetic.so").unwrap().reference_count, 1);
 
     // A second `dlopen` of the same name only bumps the count.
-    let second = loader.dlopen("libsynthetic.so", true).expect("dlopen again");
+    let second = loader
+        .dlopen("libsynthetic.so", true)
+        .expect("dlopen again");
     assert_eq!(second, "libsynthetic.so");
     assert_eq!(loader.module("libsynthetic.so").unwrap().reference_count, 2);
 
     let module = loader.module("libsynthetic.so").unwrap();
     assert!(loader.dlclose(module.base));
-    assert!(loader.module("libsynthetic.so").is_some(), "still referenced");
+    assert!(
+        loader.module("libsynthetic.so").is_some(),
+        "still referenced"
+    );
     assert!(loader.dlclose(module.base));
     assert!(
         loader.module("libsynthetic.so").is_none(),
@@ -294,11 +329,18 @@ fn initialize_tls_sets_the_thread_pointer_and_errno_slot() {
 
     let tpidr = backend.borrow().reg_read(RegId::TpidrEl0).unwrap();
     assert_ne!(tpidr, 0, "TPIDR_EL0 holds the TLS block");
-    assert_eq!(tpidr % 16, 0, "the Android ABI requires a 16-byte-aligned thread pointer");
+    assert_eq!(
+        tpidr % 16,
+        0,
+        "the Android ABI requires a 16-byte-aligned thread pointer"
+    );
 
     // Slot 1 of the TLS block is the thread pointer, slot 3 the argv array.
     let thread = memory.pointer(tpidr).read_u64(8).unwrap();
-    assert!(thread > tpidr, "the thread control block sits below the TLS block");
+    assert!(
+        thread > tpidr,
+        "the thread control block sits below the TLS block"
+    );
     let argv = memory.pointer(tpidr).read_u64(24).unwrap();
     assert_ne!(argv, 0);
 
@@ -312,10 +354,7 @@ fn initialize_tls_sets_the_thread_pointer_and_errno_slot() {
     memory.set_errno(raxdbg_core::errno::ENOENT);
     assert_eq!(memory.get_last_errno(), raxdbg_core::errno::ENOENT);
     assert_eq!(
-        memory
-            .pointer(memory.errno_address())
-            .read_u32(0)
-            .unwrap(),
+        memory.pointer(memory.errno_address()).read_u32(0).unwrap(),
         raxdbg_core::errno::ENOENT as u32
     );
 }
@@ -328,10 +367,12 @@ fn the_stack_region_is_mapped_and_writable() {
     memory.write_bytes(top, &[0xab; 16]).expect("stack write");
     assert_eq!(memory.pointer(top).read_byte(0).unwrap(), 0xab);
 
-    let below = raxdbg_core::memory::STACK_BASE
-        - raxdbg_core::memory::STACK_SIZE_OF_PAGE * 4096
-        - 1;
-    assert!(memory.write_bytes(below, &[0]).is_err(), "below the stack area");
+    let below =
+        raxdbg_core::memory::STACK_BASE - raxdbg_core::memory::STACK_SIZE_OF_PAGE * 4096 - 1;
+    assert!(
+        memory.write_bytes(below, &[0]).is_err(),
+        "below the stack area"
+    );
 }
 
 #[test]
@@ -340,7 +381,10 @@ fn a_wrong_architecture_is_rejected() {
     let mut bytes = synthetic_library();
     // Flip e_machine to EM_X86_64.
     bytes[18] = 62;
-    match loader.load(Box::new(ElfLibraryRawFile::new("libsynthetic.so", bytes)), false) {
+    match loader.load(
+        Box::new(ElfLibraryRawFile::new("libsynthetic.so", bytes)),
+        false,
+    ) {
         Err(error) => assert!(error.to_string().contains("AArch64"), "{error}"),
         Ok(name) => panic!("expected a rejection, got {name}"),
     }
@@ -363,10 +407,14 @@ impl raxdbg_android::elf::loader::InitCaller for RecordingCaller {
     }
 }
 
+/// One recorded initialiser call: its label, what kind of initialiser it was,
+/// its index and how many the list holds.
+type RecordedCall = (String, InitKind, usize, usize);
+
 /// Records the marker each initialiser carried before it ran.
 #[derive(Default)]
 struct RecordingListener {
-    calls: Rc<RefCell<Vec<(String, InitKind, usize, usize)>>>,
+    calls: Rc<RefCell<Vec<RecordedCall>>>,
 }
 
 impl InitFunctionListener for RecordingListener {
@@ -448,7 +496,10 @@ fn a_dependencys_initialisers_run_first() {
     // The dependent names the dependency, so `load` pulls `libdep.so` in
     // before it maps `libmain.so` -- which is what puts the two in that order.
     let mut table = BTreeMap::new();
-    table.insert("libdep.so".to_string(), init_library("libdep.so", vec![], Some(0x100)));
+    table.insert(
+        "libdep.so".to_string(),
+        init_library("libdep.so", vec![], Some(0x100)),
+    );
     loader.set_library_resolver(Rc::new(MapResolver(table)));
 
     let mut main = synthetic::SyntheticLibrary::new("libmain.so");
@@ -456,7 +507,10 @@ fn a_dependencys_initialisers_run_first() {
     main.init_array = vec![];
     main.dt_init = Some(0x120);
     loader
-        .load(Box::new(ElfLibraryRawFile::new("libmain.so", main.build())), false)
+        .load(
+            Box::new(ElfLibraryRawFile::new("libmain.so", main.build())),
+            false,
+        )
         .expect("load");
 
     let dependency = loader.module("libdep.so").expect("dependency").base;
@@ -543,7 +597,14 @@ fn bionic_libc_loads_and_exports_its_symbols() {
         info.needed_libraries
     );
 
-    for symbol in ["malloc", "free", "printf", "pthread_create", "strlen", "__errno"] {
+    for symbol in [
+        "malloc",
+        "free",
+        "printf",
+        "pthread_create",
+        "strlen",
+        "__errno",
+    ] {
         let found = loader
             .find_symbol("libc.so", symbol)
             .unwrap_or_else(|| panic!("{symbol} is not exported"));
@@ -582,7 +643,10 @@ fn bionic_libc_has_no_unresolved_relocations() {
     // libc must have none left, since it only imports from libdl.so which is
     // bundled alongside it.
     let unresolved = loader.unresolved_relocation_count("libc.so");
-    assert_eq!(unresolved, 0, "libc.so left {unresolved} relocations unresolved");
+    assert_eq!(
+        unresolved, 0,
+        "libc.so left {unresolved} relocations unresolved"
+    );
 }
 
 #[test]
@@ -593,7 +657,10 @@ fn loading_libc_twice_is_idempotent() {
     let name = loader.dlopen("libc.so", true).expect("dlopen libc.so");
     assert_eq!(name, "libc.so");
     let second = loader.module("libc.so").unwrap();
-    assert_eq!(first.base, second.base, "the same module, not a second copy");
+    assert_eq!(
+        first.base, second.base,
+        "the same module, not a second copy"
+    );
     assert_eq!(second.reference_count, first.reference_count + 1);
 }
 
@@ -620,12 +687,22 @@ fn packed_relocations_land_inside_the_librarys_segments() {
         let bytes = std::fs::read(&path).expect("read libcpp");
         let elf = goblin::elf::Elf::parse(&bytes).expect("parse libcpp");
         let dynamic = elf.dynamic.as_ref().expect("dynamic section");
-        let tag = |name: u64| dynamic.dyns.iter().find(|e| e.d_tag == name).map(|e| e.d_val);
+        let tag = |name: u64| {
+            dynamic
+                .dyns
+                .iter()
+                .find(|e| e.d_tag == name)
+                .map(|e| e.d_val)
+        };
 
         let (offset, size, rela) = if tag(0x6000_0011).is_some() {
             (tag(0x6000_0011).unwrap(), tag(0x6000_0012).unwrap(), true)
         } else {
-            (tag(0x6000_000f).expect("DT_ANDROID_REL"), tag(0x6000_0010).expect("DT_ANDROID_RELSZ"), false)
+            (
+                tag(0x6000_000f).expect("DT_ANDROID_REL"),
+                tag(0x6000_0010).expect("DT_ANDROID_RELSZ"),
+                false,
+            )
         };
         // `DT_ANDROID_REL` is a virtual address, so it has to be turned into a
         // file offset through the segment that contains it.
@@ -633,9 +710,7 @@ fn packed_relocations_land_inside_the_librarys_segments() {
             .program_headers
             .iter()
             .filter(|header| header.p_type == goblin::elf::program_header::PT_LOAD)
-            .find(|header| {
-                offset >= header.p_vaddr && offset < header.p_vaddr + header.p_filesz
-            })
+            .find(|header| offset >= header.p_vaddr && offset < header.p_vaddr + header.p_filesz)
             .map(|header| header.p_offset + (offset - header.p_vaddr))
             .expect("the packed table lives in a mapped segment");
         let table = &bytes[file_offset as usize..(file_offset + size) as usize];
@@ -663,7 +738,11 @@ fn packed_relocations_land_inside_the_librarys_segments() {
         let outside: Vec<u64> = relocations
             .iter()
             .map(|relocation| relocation.r_offset)
-            .filter(|offset| !segments.iter().any(|(start, end)| offset >= start && offset < end))
+            .filter(|offset| {
+                !segments
+                    .iter()
+                    .any(|(start, end)| offset >= start && offset < end)
+            })
             .collect();
         assert!(
             outside.is_empty(),
@@ -753,19 +832,26 @@ fn a_packed_init_array_entry_becomes_a_function_address() {
     let bytes = std::fs::read(&path).expect("read libcpp");
     let elf = goblin::elf::Elf::parse(&bytes).expect("parse libcpp");
     let dynamic = elf.dynamic.as_ref().expect("dynamic");
-    let tag = |name: u64| dynamic.dyns.iter().find(|e| e.d_tag == name).map(|e| e.d_val);
+    let tag = |name: u64| {
+        dynamic
+            .dyns
+            .iter()
+            .find(|e| e.d_tag == name)
+            .map(|e| e.d_val)
+    };
     let init_array = tag(0x6000_0011).expect("DT_ANDROID_RELA");
     let size = tag(0x6000_0012).expect("DT_ANDROID_RELASZ");
     let file_offset = elf
         .program_headers
         .iter()
         .filter(|header| header.p_type == goblin::elf::program_header::PT_LOAD)
-        .find(|header| init_array >= header.p_vaddr && init_array < header.p_vaddr + header.p_filesz)
+        .find(|header| {
+            init_array >= header.p_vaddr && init_array < header.p_vaddr + header.p_filesz
+        })
         .map(|header| header.p_offset + (init_array - header.p_vaddr))
         .expect("the table is in a mapped segment");
     let table = &bytes[file_offset as usize..(file_offset + size) as usize];
-    let relocations =
-        raxdbg_android::elf::packed::decode(&table[4..], true, 64).expect("decode");
+    let relocations = raxdbg_android::elf::packed::decode(&table[4..], true, 64).expect("decode");
 
     // The real `init_array` lives in the .dynamic section, and its entry is
     // written by a relative relocation.
@@ -795,7 +881,9 @@ fn a_packed_init_array_entry_becomes_a_function_address() {
         .map(|header| (header.p_vaddr, header.p_vaddr + header.p_memsz))
         .collect();
     assert!(
-        loads.iter().any(|(start, end)| target as u64 >= *start && (target as u64) < *end),
+        loads
+            .iter()
+            .any(|(start, end)| target as u64 >= *start && (target as u64) < *end),
         "the initialiser {target:#x} is inside a loadable segment"
     );
 }

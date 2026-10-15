@@ -76,11 +76,7 @@ const INTERNAL_32: (u64, u64) = (0x30, 0x34);
 /// reads `0x30` and `0x34`. Public because the offsets are part of the contract
 /// the replacement depends on, and a test asserts them against the reference.
 pub fn internal_offsets(is_64bit: bool) -> (u64, u64) {
-    if is_64bit {
-        INTERNAL_64
-    } else {
-        INTERNAL_32
-    }
+    if is_64bit { INTERNAL_64 } else { INTERNAL_32 }
 }
 
 /// Decides whether a thread may be joined.
@@ -228,11 +224,7 @@ impl ThreadJoin {
     /// the `retval` the guest passed to `pthread_join`. Nothing else can do
     /// this: a waiter stays asleep until something wakes it, and a joiner that
     /// is never woken is a deadlock.
-    pub fn deliver_result(
-        &self,
-        waiters: &raxdbg_core::thread::Waiters,
-        result: u64,
-    ) -> bool {
+    pub fn deliver_result(&self, waiters: &raxdbg_core::thread::Waiters, result: u64) -> bool {
         let waiting: Vec<(usize, u64)> = self
             .joins()
             .into_iter()
@@ -351,11 +343,7 @@ impl Svc for CloneStub {
 
 impl CloneStub {
     fn word_size(&self) -> u64 {
-        if self.kind == SvcKind::Arm64 {
-            8
-        } else {
-            4
-        }
+        if self.kind == SvcKind::Arm64 { 8 } else { 4 }
     }
 
     fn read_pointer(&self, address: u64) -> Result<u64, RunError> {
@@ -495,7 +483,9 @@ impl std::fmt::Debug for ThreadStart {
 }
 
 /// Installs the thread entry point and returns it.
-pub fn install_entry(emulator: &AndroidEmulator) -> Result<ThreadStart, raxdbg_core::memory::MemoryError> {
+pub fn install_entry(
+    emulator: &AndroidEmulator,
+) -> Result<ThreadStart, raxdbg_core::memory::MemoryError> {
     let memory = emulator.memory();
     let kind = if emulator.is_64bit() {
         SvcKind::Arm64
@@ -509,7 +499,8 @@ pub fn install_entry(emulator: &AndroidEmulator) -> Result<ThreadStart, raxdbg_c
 
     // The exit stub: the entry's last instruction, so a thread that returns
     // leaves the same way `ThreadExit` does.
-    let (exit, exit_number) = svc.register_svc_numbered(memory.as_ref(), Box::new(ExitStub { kind }))?;
+    let (_exit, exit_number) =
+        svc.register_svc_numbered(memory.as_ref(), Box::new(ExitStub { kind }))?;
 
     let is_64bit = emulator.is_64bit();
     let mut words: Vec<u32> = Vec::new();
@@ -523,9 +514,10 @@ pub fn install_entry(emulator: &AndroidEmulator) -> Result<ThreadStart, raxdbg_c
         for half in ENTRY32 {
             words.push(u32::from(*half));
         }
-        // `svc #exit` in Thumb
+        // `svc #exit` in Thumb: the call number goes in the `svc` immediate
+        // unshifted, which is why there is nothing to mask but the low byte.
         let immediate = (exit_number as u32) & 0xff;
-        words.push(0xdf00 | (immediate << 0));
+        words.push(0xdf00 | immediate);
     }
 
     // Inside the SVC page, which is where unidbg puts every piece of code it
@@ -537,7 +529,6 @@ pub fn install_entry(emulator: &AndroidEmulator) -> Result<ThreadStart, raxdbg_c
         bytes.extend_from_slice(&word.to_le_bytes());
     }
     memory.pointer(entry).write_bytes(0, &bytes)?;
-    let _ = exit;
 
     Ok(ThreadStart {
         entry,
@@ -648,8 +639,7 @@ mod tests {
         let text: Vec<String> = (0..ENTRY32.len())
             .map(|index| {
                 let mut reader = yaxpeax_arch::U8Reader::new(&bytes[index * 2..]);
-                let decoder =
-                    yaxpeax_arm::armv7::InstDecoder::default().with_thumb_mode(true);
+                let decoder = yaxpeax_arm::armv7::InstDecoder::default().with_thumb_mode(true);
                 yaxpeax_arch::Decoder::decode(&decoder, &mut reader)
                     .map(|instruction| instruction.to_string())
                     .unwrap_or_else(|error| format!("<{error:?}>"))

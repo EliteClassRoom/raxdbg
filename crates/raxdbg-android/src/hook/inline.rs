@@ -35,7 +35,9 @@ pub enum HookError {
     #[error("cannot read the instructions at {0:#x}")]
     Unreadable(u64),
     /// The ISA cannot reach the trampoline from the target.
-    #[error("a branch from {target:#x} to {trampoline:#x} is out of range on this ISA: the target needs a near trampoline")]
+    #[error(
+        "a branch from {target:#x} to {trampoline:#x} is out of range on this ISA: the target needs a near trampoline"
+    )]
     OutOfRange {
         /// Where the branch starts.
         target: u64,
@@ -148,7 +150,8 @@ pub fn encode_branch64(from: u64, to: u64) -> Option<u32> {
         return None;
     }
     let words = delta / 4;
-    if words < -(1 << 25) || words > (1 << 25) - 1 {
+    // `b`'s imm26 is a signed word offset in [-2^25, 2^25 - 1]: ±128 MiB.
+    if !(-(1 << 25)..=(1 << 25) - 1).contains(&words) {
         return None;
     }
     // opcode 000101 in the top 6 bits, imm26, then the fixed 26-bit zero.
@@ -253,13 +256,29 @@ mod tests {
         let svc_page = 0xfffe_0000u64;
         assert!(!InlineHooks::branch_reaches(module, svc_page, true));
         // Within a megabyte of the target it is fine, on either ISA's terms.
-        assert!(InlineHooks::branch_reaches(module, module + 0x10_0000, true));
-        assert!(InlineHooks::branch_reaches(module, module + 0x10_0000, false));
+        assert!(InlineHooks::branch_reaches(
+            module,
+            module + 0x10_0000,
+            true
+        ));
+        assert!(InlineHooks::branch_reaches(
+            module,
+            module + 0x10_0000,
+            false
+        ));
         // But a Thumb branch only reaches 4 MiB, so an AArch32 trampoline has to
         // be much closer than an AArch64 one: 8 MiB away is fine on AArch64 and
         // out of range on AArch32.
-        assert!(!InlineHooks::branch_reaches(module, module + 0x80_0000, false));
-        assert!(InlineHooks::branch_reaches(module, module + 0x80_0000, true));
+        assert!(!InlineHooks::branch_reaches(
+            module,
+            module + 0x80_0000,
+            false
+        ));
+        assert!(InlineHooks::branch_reaches(
+            module,
+            module + 0x80_0000,
+            true
+        ));
     }
 
     #[test]

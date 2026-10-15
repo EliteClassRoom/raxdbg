@@ -41,6 +41,12 @@ pub enum CpuEvent {
 }
 
 /// A guest CPU of either supported ISA.
+// `RaxArm64Cpu` and `RaxArm32Cpu` differ by thousands of bytes because each one
+// is a whole CPU: register file, VFP bank, coprocessor state, MMU walk caches.
+// They are stored inline because the step loop matches `Cpu` by reference on
+// every instruction; boxing a variant would add a heap allocation to the
+// hottest path in the emulator to save memory the emulator has already paid for.
+#[allow(clippy::large_enum_variant)]
 pub enum Cpu {
     /// AArch64 at EL0.
     Arm64(RaxArm64Cpu),

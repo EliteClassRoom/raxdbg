@@ -262,7 +262,8 @@ impl SvcMemory {
     ///
     /// Port of unidbg: `ARMSvcMemory.registerSvc`.
     pub fn register_svc(&self, memory: &dyn Memory, svc: Box<dyn Svc>) -> Result<u64, MemoryError> {
-        self.register_svc_numbered(memory, svc).map(|(address, _)| address)
+        self.register_svc_numbered(memory, svc)
+            .map(|(address, _)| address)
     }
 
     /// Registers a call, returning the stub's address and its number.
@@ -279,7 +280,9 @@ impl SvcMemory {
         let number = match kind {
             SvcKind::Thumb => {
                 if self.is_64bit {
-                    return Err(MemoryError::Message("a Thumb stub in a 64-bit guest".into()));
+                    return Err(MemoryError::Message(
+                        "a Thumb stub in a 64-bit guest".into(),
+                    ));
                 }
                 let next = self.thumb_svc_number.get() + 1;
                 let next = if next == DARWIN_SWI_SYSCALL {
@@ -305,7 +308,9 @@ impl SvcMemory {
             }
             SvcKind::Arm64 => {
                 if !self.is_64bit {
-                    return Err(MemoryError::Message("an arm64 stub in a 32-bit guest".into()));
+                    return Err(MemoryError::Message(
+                        "an arm64 stub in a 32-bit guest".into(),
+                    ));
                 }
                 let next = self.arm_svc_number.get() + 1;
                 let next = if next == DARWIN_SWI_SYSCALL {
@@ -358,14 +363,23 @@ mod tests {
             u32::from_le_bytes(stub[..4].try_into().unwrap()),
             0xd400_0001 | (0x1234 << 5)
         );
-        assert_eq!(u32::from_le_bytes(stub[4..].try_into().unwrap()), 0xd65f_03c0);
+        assert_eq!(
+            u32::from_le_bytes(stub[4..].try_into().unwrap()),
+            0xd65f_03c0
+        );
     }
 
     #[test]
     fn arm_stub_is_svc_then_bx_lr() {
         let stub = SvcKind::Arm.stub(0x100);
-        assert_eq!(u32::from_le_bytes(stub[..4].try_into().unwrap()), 0xef00_0100);
-        assert_eq!(u32::from_le_bytes(stub[4..].try_into().unwrap()), 0xe12f_ff1e);
+        assert_eq!(
+            u32::from_le_bytes(stub[..4].try_into().unwrap()),
+            0xef00_0100
+        );
+        assert_eq!(
+            u32::from_le_bytes(stub[4..].try_into().unwrap()),
+            0xe12f_ff1e
+        );
     }
 
     #[test]

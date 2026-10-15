@@ -38,7 +38,11 @@ pub struct ManifestMeta {
 #[derive(Debug)]
 pub enum AxmlError {
     /// Chunk header reports a size larger than the input.
-    Truncated { chunk_type: u16, declared: u32, available: usize },
+    Truncated {
+        chunk_type: u16,
+        declared: u32,
+        available: usize,
+    },
     /// A chunk's `header_size` is smaller than the chunk header itself.
     BadHeaderSize { chunk_type: u16, header_size: u16 },
     /// An attribute referenced a string-pool index out of range.
@@ -48,7 +52,11 @@ pub enum AxmlError {
     /// String entry length or encoding was corrupt.
     BadStringEntry(&'static str),
     /// A start tag referenced more attributes than its chunk could hold.
-    AttributeOverflow { declared: u16, chunk_size: u32, header_size: u16 },
+    AttributeOverflow {
+        declared: u16,
+        chunk_size: u32,
+        header_size: u16,
+    },
     /// Required top-level `<manifest>` element was not seen.
     MissingManifest,
     /// `android:versionCode` was present but not a parseable integer.
@@ -58,11 +66,18 @@ pub enum AxmlError {
 impl fmt::Display for AxmlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AxmlError::Truncated { chunk_type, declared, available } => write!(
+            AxmlError::Truncated {
+                chunk_type,
+                declared,
+                available,
+            } => write!(
                 f,
                 "AXML chunk 0x{chunk_type:04x} declares size {declared} but only {available} bytes remain"
             ),
-            AxmlError::BadHeaderSize { chunk_type, header_size } => write!(
+            AxmlError::BadHeaderSize {
+                chunk_type,
+                header_size,
+            } => write!(
                 f,
                 "AXML chunk 0x{chunk_type:04x} has headerSize {header_size} < 8"
             ),
@@ -72,12 +87,18 @@ impl fmt::Display for AxmlError {
             ),
             AxmlError::BadStringPool(msg) => write!(f, "AXML string pool: {msg}"),
             AxmlError::BadStringEntry(msg) => write!(f, "AXML string entry: {msg}"),
-            AxmlError::AttributeOverflow { declared, chunk_size, header_size } => write!(
+            AxmlError::AttributeOverflow {
+                declared,
+                chunk_size,
+                header_size,
+            } => write!(
                 f,
                 "AXML start tag declares {declared} attributes but chunk size {chunk_size} and headerSize {header_size} cannot contain them"
             ),
             AxmlError::MissingManifest => write!(f, "AXML did not contain a <manifest> start tag"),
-            AxmlError::BadVersionCode(s) => write!(f, "AXML android:versionCode={s:?} is not an integer"),
+            AxmlError::BadVersionCode(s) => {
+                write!(f, "AXML android:versionCode={s:?} is not an integer")
+            }
         }
     }
 }
@@ -108,7 +129,10 @@ pub fn parse_manifest(data: &[u8]) -> Result<ManifestMeta, AxmlError> {
         let header_size = cursor.u16()?;
         let chunk_size = cursor.u32()?;
         if header_size < 8 {
-            return Err(AxmlError::BadHeaderSize { chunk_type, header_size });
+            return Err(AxmlError::BadHeaderSize {
+                chunk_type,
+                header_size,
+            });
         }
         let declared = chunk_size as usize;
         let available = data.len().saturating_sub(chunk_start);
@@ -133,9 +157,7 @@ pub fn parse_manifest(data: &[u8]) -> Result<ManifestMeta, AxmlError> {
                     resource_map.push(id);
                 }
             }
-            RES_XML_START_NAMESPACE_TYPE
-            | RES_XML_END_NAMESPACE_TYPE
-            | RES_XML_CDATA_TYPE => {
+            RES_XML_START_NAMESPACE_TYPE | RES_XML_END_NAMESPACE_TYPE | RES_XML_CDATA_TYPE => {
                 // No fields of interest; skip the entire chunk body.
             }
             RES_XML_START_ELEMENT_TYPE => {
@@ -156,9 +178,7 @@ pub fn parse_manifest(data: &[u8]) -> Result<ManifestMeta, AxmlError> {
                 if element_name == "manifest" && meta.is_none() {
                     let after_header = chunk_start + header_size as usize;
                     let attr_bytes_total = chunk_size as usize - header_size as usize;
-                    if attr_bytes_total
-                        < (attribute_count as usize) * (attribute_size as usize)
-                    {
+                    if attr_bytes_total < (attribute_count as usize) * (attribute_size as usize) {
                         return Err(AxmlError::AttributeOverflow {
                             declared: attribute_count,
                             chunk_size,
@@ -362,7 +382,9 @@ fn decode_utf16_at(data: &[u8]) -> Result<String, AxmlError> {
     }
     let len = u16::from_be_bytes([data[0], data[1]]) as usize;
     let bytes = &data[2..];
-    let need = len.checked_mul(2).ok_or(AxmlError::BadStringEntry("utf16 length overflow"))?;
+    let need = len
+        .checked_mul(2)
+        .ok_or(AxmlError::BadStringEntry("utf16 length overflow"))?;
     if bytes.len() < need {
         return Err(AxmlError::BadStringEntry("utf16 payload truncated"));
     }
@@ -385,7 +407,12 @@ fn decode_utf8_at(data: &[u8]) -> Result<String, AxmlError> {
         }
         let high = (first & 0x7f) as usize;
         let low = data[1] as usize;
-        (high.checked_shl(8).ok_or(AxmlError::BadStringEntry("utf8 length overflow"))? | low, 2)
+        (
+            high.checked_shl(8)
+                .ok_or(AxmlError::BadStringEntry("utf8 length overflow"))?
+                | low,
+            2,
+        )
     } else {
         (first as usize, 1)
     };
@@ -462,10 +489,7 @@ mod tests {
         out
     }
 
-    fn build_start_tag(
-        name_idx: u32,
-        attrs: &[(u32, u32, u32)],
-    ) -> Vec<u8> {
+    fn build_start_tag(name_idx: u32, attrs: &[(u32, u32, u32)]) -> Vec<u8> {
         let header_size: u16 = 36;
         let attr_size: u16 = 20;
         let attr_count = attrs.len() as u16;

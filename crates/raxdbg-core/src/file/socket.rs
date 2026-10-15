@@ -1,13 +1,12 @@
 //! Host-backed sockets for raxdbg.
 //!
-//! Port of unidbg:
+//! Port of unidbg@7f5da98e:
 //!
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/TcpSocket.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/UdpSocket.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/LocalSocketIO.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/NetLinkSocket.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/PipedSocketIO.java`
-//! @7f5da98e.
 //!
 //! The classes model a `SocketIO` hierarchy where `TcpSocket`, `UdpSocket` and
 //! the local-socket classes share a single `SocketIO` base that knows how to
@@ -23,11 +22,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::errno::{EFAULT, 
-    EAFNOSUPPORT, EAGAIN, EBADF, ECONNREFUSED, EINVAL, ENOTCONN, EOPNOTSUPP, EPIPE,
+use crate::errno::{
+    EAFNOSUPPORT, EAGAIN, EBADF, ECONNREFUSED, EFAULT, EINVAL, ENOTCONN, EOPNOTSUPP, EPIPE,
 };
-use crate::file::structs::{IOConstants, Stat};
 use crate::file::FileIO;
+use crate::file::structs::{IOConstants, Stat};
 use crate::memory::Memory;
 
 /// `AF_UNIX` (also called `AF_LOCAL`).
@@ -69,20 +68,27 @@ pub trait SocketIO: FileIO {
     }
 
     /// `accept(2)`.
-    fn accept(&mut self, _addr: u64, _addrlen: u64, _memory: &dyn Memory) -> Option<Box<dyn SocketIO>> {
+    fn accept(
+        &mut self,
+        _addr: u64,
+        _addrlen: u64,
+        _memory: &dyn Memory,
+    ) -> Option<Box<dyn SocketIO>> {
         None
     }
 }
 
 /// Reads a `sockaddr_in` from guest memory, returning the host address.
-pub fn read_inet_addr(memory: &dyn Memory, addr: u64, addrlen: i32) -> Result<std::net::SocketAddr, i32> {
+pub fn read_inet_addr(
+    memory: &dyn Memory,
+    addr: u64,
+    addrlen: i32,
+) -> Result<std::net::SocketAddr, i32> {
     if addrlen < 8 {
         return Err(-EINVAL);
     }
     let mut buf = vec![0u8; addrlen as usize];
-    memory
-        .read_bytes(addr, &mut buf)
-        .map_err(|_| -EINVAL)?;
+    memory.read_bytes(addr, &mut buf).map_err(|_| -EINVAL)?;
     let family = u16::from_le_bytes([buf[0], buf[1]]);
     let port = u16::from_be_bytes([buf[2], buf[3]]);
     const AF_INET_I: i32 = AF_INET as i32;
@@ -228,11 +234,7 @@ impl SocketIO for TcpSocket {
         // unidbg's TcpSocket `listen` builds a ServerSocket on demand; for
         // the descriptor-model we just verify the descriptor is in the right
         // shape and let `bind` have produced a `TcpListener`.
-        if self.listener.is_some() {
-            0
-        } else {
-            -EINVAL
-        }
+        if self.listener.is_some() { 0 } else { -EINVAL }
     }
 
     fn accept(

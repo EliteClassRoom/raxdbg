@@ -94,10 +94,9 @@ impl AtExit {
 #[derive(Debug)]
 pub struct AtExitModule {
     registry: Rc<AtExit>,
-    stubs: Stubs,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Stubs {
     cxa_atexit: u64,
     cxa_finalize: u64,
@@ -105,7 +104,6 @@ struct Stubs {
     register_atfork: u64,
     __cxa_thread_atexit_impl: u64,
     __cxa_thread_atexit: u64,
-    get_dso_handle: u64,
 }
 
 impl AtExitModule {
@@ -129,7 +127,7 @@ impl AtExitModule {
         };
         let registry = Rc::new(AtExit::new());
 
-        let mut make = |svc_box: Box<dyn Svc>| -> Result<u64, MemoryError> {
+        let make = |svc_box: Box<dyn Svc>| -> Result<u64, MemoryError> {
             let (address, _number) = svc.register_svc_numbered(memory.as_ref(), svc_box)?;
             Ok(address)
         };
@@ -168,15 +166,13 @@ impl AtExitModule {
             register_atfork,
             __cxa_thread_atexit_impl: thread_atexit_impl,
             __cxa_thread_atexit: thread_atexit,
-            get_dso_handle,
         };
-        let hook = AtExitHook { stubs: stubs.clone() };
+        let hook = AtExitHook { stubs };
         // libc already exports these, so the virtual module alone would never
         // be consulted; the hook has to win for the guest's calls to land here.
         loader.add_hook_listener(Rc::new(hook) as Rc<dyn HookListener>);
         let module = AtExitModule {
             registry: Rc::clone(&registry),
-            stubs,
         };
         loader.load_virtual_module(
             "libatexit.so",

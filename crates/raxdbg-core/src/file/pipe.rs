@@ -1,10 +1,9 @@
 //! A bounded pipe pair — `pipe(2)` over a shared ring buffer.
 //!
-//! Port of unidbg:
+//! Port of unidbg@7f5da98e:
 //!
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/PipedReadFileIO.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/file/PipedWriteFileIO.java`
-//! @7f5da98e.
 //!
 //! unidbg pipes the bytes between a `PipedInputStream` and a `PipedOutputStream`.
 //! raxdbg's syscall layer drives waiting, so reads on an empty pipe return
@@ -20,8 +19,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::errno::{EAGAIN, EBADF, EINVAL, EPIPE};
-use crate::file::structs::{IOConstants, Stat};
 use crate::file::FileIO;
+use crate::file::structs::{IOConstants, Stat};
 use crate::memory::Memory;
 /// The default capacity for a pipe (16 pages of 4 KiB).
 pub const DEFAULT_PIPE_CAPACITY: usize = 64 * 1024;
@@ -185,14 +184,26 @@ mod tests {
         fn pointer(&self, _address: u64) -> crate::pointer::Pointer {
             unimplemented!("pipe tests do not need pointers")
         }
-        fn read_bytes(&self, _address: u64, _buf: &mut [u8]) -> Result<(), crate::memory::MemoryError> {
+        fn read_bytes(
+            &self,
+            _address: u64,
+            _buf: &mut [u8],
+        ) -> Result<(), crate::memory::MemoryError> {
             Ok(())
         }
-        fn write_bytes(&self, _address: u64, data: &[u8]) -> Result<(), crate::memory::MemoryError> {
+        fn write_bytes(
+            &self,
+            _address: u64,
+            data: &[u8],
+        ) -> Result<(), crate::memory::MemoryError> {
             self.bytes.lock().extend_from_slice(data);
             Ok(())
         }
-        fn mmap(&self, _length: usize, _prot: crate::backend::Prot) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
+        fn mmap(
+            &self,
+            _length: usize,
+            _prot: crate::backend::Prot,
+        ) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
             unimplemented!()
         }
         fn mmap2(
@@ -206,7 +217,12 @@ mod tests {
         ) -> Result<u64, crate::memory::MemoryError> {
             unimplemented!()
         }
-        fn mprotect(&self, _address: u64, _length: usize, _prot: crate::backend::Prot) -> Result<i32, crate::memory::MemoryError> {
+        fn mprotect(
+            &self,
+            _address: u64,
+            _length: usize,
+            _prot: crate::backend::Prot,
+        ) -> Result<i32, crate::memory::MemoryError> {
             Ok(0)
         }
         fn munmap(&self, _start: u64, _length: usize) -> Result<i32, crate::memory::MemoryError> {
@@ -222,20 +238,32 @@ mod tests {
         ) -> Result<crate::alloc::MemoryBlock, crate::memory::MemoryError> {
             unimplemented!()
         }
-        fn allocate_stack(&self, _size: usize) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
+        fn allocate_stack(
+            &self,
+            _size: usize,
+        ) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
             unimplemented!()
         }
-        fn write_stack_string(&self, _value: &str) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
+        fn write_stack_string(
+            &self,
+            _value: &str,
+        ) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
             unimplemented!()
         }
-        fn write_stack_bytes(&self, _data: &[u8]) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
+        fn write_stack_bytes(
+            &self,
+            _data: &[u8],
+        ) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
             unimplemented!()
         }
         fn allocate_thread_index(&self) -> Result<usize, crate::memory::MemoryError> {
             Ok(0)
         }
         fn free_thread_index(&self, _index: usize) {}
-        fn allocate_thread_stack(&self, _index: usize) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
+        fn allocate_thread_stack(
+            &self,
+            _index: usize,
+        ) -> Result<crate::pointer::Pointer, crate::memory::MemoryError> {
             unimplemented!()
         }
         fn get_stack_point(&self) -> u64 {

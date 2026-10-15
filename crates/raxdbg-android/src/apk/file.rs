@@ -49,12 +49,12 @@ impl ApkFile {
             if name == "AndroidManifest.xml" {
                 manifest_bytes = Some(buf.clone());
             }
-            if let Some(stripped) = name.strip_prefix("META-INF/") {
-                if let Some(ext) = Path::new(stripped).extension().and_then(|s| s.to_str()) {
-                    let ext = ext.to_ascii_uppercase();
-                    if matches!(ext.as_str(), "RSA" | "DSA" | "EC") {
-                        signature_paths.push(name.clone());
-                    }
+            if let Some(stripped) = name.strip_prefix("META-INF/")
+                && let Some(ext) = Path::new(stripped).extension().and_then(|s| s.to_str())
+            {
+                let ext = ext.to_ascii_uppercase();
+                if matches!(ext.as_str(), "RSA" | "DSA" | "EC") {
+                    signature_paths.push(name.clone());
                 }
             }
             entries.insert(name, buf);
@@ -85,12 +85,11 @@ impl ApkFile {
     fn signature_entries(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         for (name, bytes) in &self.entries {
-            if let Some(stripped) = name.strip_prefix("META-INF/") {
-                if let Some(ext) = Path::new(stripped).extension().and_then(|s| s.to_str()) {
-                    if matches!(ext.to_ascii_uppercase().as_str(), "RSA" | "DSA" | "EC") {
-                        out.push(bytes.clone());
-                    }
-                }
+            if let Some(stripped) = name.strip_prefix("META-INF/")
+                && let Some(ext) = Path::new(stripped).extension().and_then(|s| s.to_str())
+                && matches!(ext.to_ascii_uppercase().as_str(), "RSA" | "DSA" | "EC")
+            {
+                out.push(bytes.clone());
             }
         }
         out

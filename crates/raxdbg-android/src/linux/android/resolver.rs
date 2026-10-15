@@ -5,13 +5,13 @@
 //! out of its own jar resources, raxdbg reads the same tree from `libs/` on
 //! disk (`tools/fetch-libs.ps1` populates it).
 
-use std::rc::Rc;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
+use raxdbg_core::file::IOConstants;
 use raxdbg_core::file::driver::{create_driver_file, is_null_path};
 use raxdbg_core::file::linux_fs::LinuxFileSystem;
 use raxdbg_core::file::{FileIO, FileResult, IOResolver};
-use raxdbg_core::file::IOConstants;
 
 use crate::android_file::{ElfLibraryFile, LibraryFile, LibraryResolver};
 
@@ -142,18 +142,16 @@ impl AndroidResolver {
             return None;
         }
         if path.is_dir() {
-            return Some(Box::new(
-                raxdbg_core::file::linux_fs::DirectoryFileIO::new(
-                    oflags,
-                    guest_path.to_string(),
-                    path.to_path_buf(),
-                ),
-            ));
+            return Some(Box::new(raxdbg_core::file::linux_fs::DirectoryFileIO::new(
+                oflags,
+                guest_path.to_string(),
+                path.to_path_buf(),
+            )));
         }
-        if is_null_path(guest_path) || guest_path.starts_with("/dev/") {
-            if let Some(io) = create_driver_file(guest_path, None, None) {
-                return Some(io);
-            }
+        if (is_null_path(guest_path) || guest_path.starts_with("/dev/"))
+            && let Some(io) = create_driver_file(guest_path, None, None)
+        {
+            return Some(io);
         }
         ElfLibraryFile::open(path).ok().map(|file| {
             Box::new(raxdbg_core::file::byte_array::ByteArrayFileIO::new(
@@ -174,10 +172,10 @@ impl LibraryResolver for AndroidResolver {
         // A file the caller put next to the root directory wins, so a test or
         // an application can override a bundled library.
         let override_path = self.root_dir.join(name);
-        if override_path.is_file() {
-            if let Ok(file) = ElfLibraryFile::open(override_path) {
-                return Some(Box::new(file));
-            }
+        if override_path.is_file()
+            && let Ok(file) = ElfLibraryFile::open(override_path)
+        {
+            return Some(Box::new(file));
         }
 
         let path = self.library_resource(name);
@@ -207,11 +205,7 @@ impl IOResolver for AndroidResolver {
             if !file.exists() {
                 let _ = std::fs::File::create(&file);
             }
-            return match raxdbg_core::file::driver::HostFileIO::open_path(
-                oflags,
-                pathname,
-                &file,
-            ) {
+            return match raxdbg_core::file::driver::HostFileIO::open_path(oflags, pathname, &file) {
                 Ok(io) => FileResult::Success(Box::new(io)),
                 Err(_) => FileResult::NotFound,
             };
@@ -279,10 +273,10 @@ pub fn default_libs_dir() -> Option<PathBuf> {
         .parent()
         .and_then(Path::parent)
         .map(|root| root.join("libs"));
-    if let Some(path) = workspace {
-        if path.is_dir() {
-            return Some(path);
-        }
+    if let Some(path) = workspace
+        && path.is_dir()
+    {
+        return Some(path);
     }
     if let Ok(exe) = std::env::current_exe() {
         let path = exe.parent()?.join("libs");
@@ -300,29 +294,41 @@ mod tests {
     #[test]
     fn library_resource_names_replace_plus_with_p() {
         let resolver = AndroidResolver::with_libs_dir(23, true, "libs");
-        assert!(resolver
-            .library_resource("libc.so")
-            .ends_with("android/sdk23/lib64/libc.so"));
-        assert!(resolver
-            .library_resource("libc++_shared.so")
-            .ends_with("android/sdk23/lib64/libcpp_shared.so"));
-        assert!(resolver
-            .library_resource("libstdc++.so")
-            .ends_with("android/sdk23/lib64/libstdcpp.so"));
+        assert!(
+            resolver
+                .library_resource("libc.so")
+                .ends_with("android/sdk23/lib64/libc.so")
+        );
+        assert!(
+            resolver
+                .library_resource("libc++_shared.so")
+                .ends_with("android/sdk23/lib64/libcpp_shared.so")
+        );
+        assert!(
+            resolver
+                .library_resource("libstdc++.so")
+                .ends_with("android/sdk23/lib64/libstdcpp.so")
+        );
         let resolver = AndroidResolver::with_libs_dir(19, false, "libs");
-        assert!(resolver
-            .library_resource("libc.so")
-            .ends_with("android/sdk19/lib/libc.so"));
+        assert!(
+            resolver
+                .library_resource("libc.so")
+                .ends_with("android/sdk19/lib/libc.so")
+        );
     }
 
     #[test]
     fn resources_are_looked_up_under_the_sdk_tree() {
         let resolver = AndroidResolver::with_libs_dir(23, true, "libs");
-        assert!(resolver
-            .resource("/system/usr/share/zoneinfo/tzdata")
-            .ends_with("android/sdk23/system/usr/share/zoneinfo/tzdata"));
-        assert!(resolver
-            .resource("/dev/__properties__")
-            .ends_with("android/sdk23/dev/__properties__"));
+        assert!(
+            resolver
+                .resource("/system/usr/share/zoneinfo/tzdata")
+                .ends_with("android/sdk23/system/usr/share/zoneinfo/tzdata")
+        );
+        assert!(
+            resolver
+                .resource("/dev/__properties__")
+                .ends_with("android/sdk23/dev/__properties__")
+        );
     }
 }

@@ -360,7 +360,8 @@ impl MemShared {
         }
         let mut hooks = std::mem::take(&mut *self.read.lock());
         if hooks.iter().any(|e| e.range.contains(addr)) {
-            let mut ctx = MemHookCtx::new(self.pc.load(Ordering::Relaxed), self, self.control.flag());
+            let mut ctx =
+                MemHookCtx::new(self.pc.load(Ordering::Relaxed), self, self.control.flag());
             for entry in &mut hooks {
                 if entry.range.contains(addr) {
                     entry.cb.hook(&mut ctx, addr, size);
@@ -378,7 +379,8 @@ impl MemShared {
         }
         let mut hooks = std::mem::take(&mut *self.write.lock());
         if hooks.iter().any(|e| e.range.contains(addr)) {
-            let mut ctx = MemHookCtx::new(self.pc.load(Ordering::Relaxed), self, self.control.flag());
+            let mut ctx =
+                MemHookCtx::new(self.pc.load(Ordering::Relaxed), self, self.control.flag());
             for entry in &mut hooks {
                 if entry.range.contains(addr) {
                     entry.cb.hook(&mut ctx, addr, size, value);

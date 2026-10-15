@@ -68,7 +68,9 @@ impl RaxArm64Cpu {
     /// state (rax's `A64UserCpu::clone_thread` field list).
     pub fn clone_thread(&self) -> Self {
         let mut child = RaxArm64Cpu::new(self.cpu.config().clone(), Arc::clone(&self.shared));
-        child.cpu.set_counter_frequency(self.cpu.counter_frequency());
+        child
+            .cpu
+            .set_counter_frequency(self.cpu.counter_frequency());
         child.cpu.set_cpacr_el1(self.cpu.cpacr_el1());
         for r in 0..31 {
             child.cpu.set_x(r, self.cpu.get_x(r));
@@ -193,10 +195,9 @@ impl RaxArm64Cpu {
             Err(ArmError::InvalidExceptionLevel(_)) => {
                 Some(self.undefined(pc, "EL1 system register or instruction at EL0".into()))
             }
-            Err(ArmError::Unimplemented(what)) => Some(self.undefined(
-                pc,
-                format!("not implemented by the emulator: {what}"),
-            )),
+            Err(ArmError::Unimplemented(what)) => {
+                Some(self.undefined(pc, format!("not implemented by the emulator: {what}")))
+            }
             Err(other) => Some(A64Exit::Internal(format!("{other} at {pc:#x}"))),
         }
     }
@@ -319,21 +320,30 @@ impl RaxArm64Cpu {
             other => return Err(BackendError::UnsupportedRegister(other)),
         };
         if index > 31 {
-            return Err(BackendError::RegisterOutOfRange { reg: index, max: 31 });
+            return Err(BackendError::RegisterOutOfRange {
+                reg: index,
+                max: 31,
+            });
         }
         Ok((index, mask))
     }
 
     fn x(&self, index: u8) -> Result<u64, BackendError> {
         if index > 30 {
-            return Err(BackendError::RegisterOutOfRange { reg: index, max: 30 });
+            return Err(BackendError::RegisterOutOfRange {
+                reg: index,
+                max: 30,
+            });
         }
         Ok(self.core().get_x(index))
     }
 
     fn set_x(&mut self, index: u8, value: u64) -> Result<(), BackendError> {
         if index > 30 {
-            return Err(BackendError::RegisterOutOfRange { reg: index, max: 30 });
+            return Err(BackendError::RegisterOutOfRange {
+                reg: index,
+                max: 30,
+            });
         }
         self.core_mut().set_x(index, value);
         Ok(())
@@ -341,7 +351,10 @@ impl RaxArm64Cpu {
 
     fn set_w(&mut self, index: u8, value: u32) -> Result<(), BackendError> {
         if index > 30 {
-            return Err(BackendError::RegisterOutOfRange { reg: index, max: 30 });
+            return Err(BackendError::RegisterOutOfRange {
+                reg: index,
+                max: 30,
+            });
         }
         self.core_mut().set_w(index, value);
         Ok(())

@@ -15,10 +15,10 @@ pub mod vm;
 pub use args::format_jni_args;
 pub use hash::{Hashable, Hasher};
 pub use object::{
-    mangle_for_jni, normalize_class_name, DvmClass, DvmField, DvmMethod, DvmObject,
-    InstanceObject, IntArrayObject, NumberObject, StringObject,
+    DvmClass, DvmField, DvmMethod, DvmObject, InstanceObject, IntArrayObject, NumberObject,
+    StringObject, mangle_for_jni, normalize_class_name,
 };
 pub use vm::{
-    Jni, JniError, JniFunc, NoJni, Vm, JAVA_VM_TABLE_LAST, JNI_ABORT, JNI_ERR, JNI_OK,
-    JNI_TABLE_LAST, JNI_VERSION_1_6, JNI_VERSION_1_8,
+    JAVA_VM_TABLE_LAST, JNI_ABORT, JNI_ERR, JNI_OK, JNI_TABLE_LAST, JNI_VERSION_1_6,
+    JNI_VERSION_1_8, Jni, JniError, JniFunc, NoJni, Vm,
 };

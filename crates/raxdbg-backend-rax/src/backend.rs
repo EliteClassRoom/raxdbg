@@ -444,7 +444,9 @@ impl Backend for RaxBackend {
 
     fn hook_add_code(&mut self, cb: Box<dyn CodeHook>, begin: u64, end: u64) -> HookId {
         let id = self.hooks.alloc_id();
-        self.hooks.cpu().add_code(id, cb, HookRange::new(begin, end));
+        self.hooks
+            .cpu()
+            .add_code(id, cb, HookRange::new(begin, end));
         id
     }
 

@@ -26,13 +26,13 @@ use std::rc::Rc;
 use gdbstub::common::Signal;
 use gdbstub::stub::run_blocking::{BlockingEventLoop, Event, WaitForStopReasonError};
 use gdbstub::stub::{DisconnectReason, GdbStub, SingleThreadStopReason};
+use gdbstub::target::ext::base::BaseOps;
+use gdbstub::target::ext::base::single_register_access::SingleRegisterAccess;
+use gdbstub::target::ext::base::single_register_access::SingleRegisterAccessOps;
 use gdbstub::target::ext::base::singlethread::{
     SingleThreadBase, SingleThreadResume, SingleThreadResumeOps, SingleThreadSingleStep,
     SingleThreadSingleStepOps,
 };
-use gdbstub::target::ext::base::single_register_access::SingleRegisterAccess;
-use gdbstub::target::ext::base::single_register_access::SingleRegisterAccessOps;
-use gdbstub::target::ext::base::BaseOps;
 use gdbstub::target::ext::breakpoints::{
     Breakpoints, BreakpointsOps, SwBreakpoint, SwBreakpointOps,
 };
@@ -133,14 +133,13 @@ fn serve(
             Ok(())
         }
         Err(error) if error.is_connection_error() => {
-            let (io, kind) = error
-                .into_connection_error()
-                .expect("a connection error");
+            let (io, kind) = error.into_connection_error().expect("a connection error");
             Err(format!("GDB server: {kind:?} failed: {io}"))
         }
-        Err(error) if error.is_target_error() => {
-            Err(format!("GDB server: {}", error.into_target_error().expect("a target error")))
-        }
+        Err(error) if error.is_target_error() => Err(format!(
+            "GDB server: {}",
+            error.into_target_error().expect("a target error")
+        )),
         Err(error) => Err(format!("GDB server: {error}")),
     }
 }
@@ -209,7 +208,9 @@ struct TargetState {
 
 impl TargetState {
     fn new(emulator: Rc<AndroidEmulator>, call: PreparedFunctionCall, trap: u64) -> Self {
-        let breaker = Rc::new(RefCell::new(BreakerImpl::new(Rc::clone(emulator.backend()))));
+        let breaker = Rc::new(RefCell::new(BreakerImpl::new(Rc::clone(
+            emulator.backend(),
+        ))));
         TargetState {
             emulator,
             breaker,
@@ -224,12 +225,12 @@ impl TargetState {
         self.emulator.backend().clone()
     }
 
-/// Runs the guest and answers why it stopped.
-///
-/// Every reason the run loop can end is classified here, because the
-/// protocol has no way to say "it stopped, and I do not know why" — GDB
-/// shows the reply verbatim. The address type is the target's, so ARM32's
-/// `u32` and ARM64's `u64` both come out of the same classification.
+    /// Runs the guest and answers why it stopped.
+    ///
+    /// Every reason the run loop can end is classified here, because the
+    /// protocol has no way to say "it stopped, and I do not know why" — GDB
+    /// shows the reply verbatim. The address type is the target's, so ARM32's
+    /// `u32` and ARM64's `u64` both come out of the same classification.
     fn run<U>(&mut self) -> Result<SingleThreadStopReason<U>, RunError> {
         let mode = std::mem::replace(&mut self.mode, RunMode::Continue);
         let count = u64::from(mode == RunMode::Step);
@@ -239,9 +240,7 @@ impl TargetState {
             .reg_read(RegId::Pc)
             .map_err(RunError::Backend)?;
         let backend = self.backend();
-        let outcome = backend
-            .borrow_mut()
-            .emu_start(pc, self.trap, 0, count)?;
+        let outcome = backend.borrow_mut().emu_start(pc, self.trap, 0, count)?;
         let pc = backend
             .borrow()
             .reg_read(RegId::Pc)
@@ -291,7 +290,9 @@ impl TargetState {
         let Some(breakpoint) = self.breakpoints.remove(&key) else {
             return false;
         };
-        self.breaker.borrow_mut().remove_break_point(breakpoint.address());
+        self.breaker
+            .borrow_mut()
+            .remove_break_point(breakpoint.address());
         true
     }
 
@@ -437,10 +438,7 @@ impl SingleThreadBase for Target64 {
         // The stack pointer goes through the memory facade, and that reaches
         // the backend itself, so it must happen before this borrow — the cell
         // would already be taken otherwise.
-        self.state
-            .emulator
-            .memory()
-            .set_stack_point(regs.sp);
+        self.state.emulator.memory().set_stack_point(regs.sp);
         let backend = self.state.backend();
         let mut backend = backend.borrow_mut();
         for (index, value) in regs.x.iter().enumerate() {
@@ -480,9 +478,11 @@ impl SingleThreadResume for Target64 {
         if signal.is_some() {
             // Delivering a signal to the guest means injecting it into the
             // instruction stream, which this backend does not model.
-            return Err(RunError::Backend(raxdbg_core::backend::BackendError::Other(
-                "continuing with a signal is not supported".into(),
-            )));
+            return Err(RunError::Backend(
+                raxdbg_core::backend::BackendError::Other(
+                    "continuing with a signal is not supported".into(),
+                ),
+            ));
         }
         self.state.mode = RunMode::Continue;
         Ok(())
@@ -497,9 +497,11 @@ impl SingleThreadResume for Target64 {
 impl SingleThreadSingleStep for Target64 {
     fn step(&mut self, signal: Option<Signal>) -> Result<(), RunError> {
         if signal.is_some() {
-            return Err(RunError::Backend(raxdbg_core::backend::BackendError::Other(
-                "stepping with a signal is not supported".into(),
-            )));
+            return Err(RunError::Backend(
+                raxdbg_core::backend::BackendError::Other(
+                    "stepping with a signal is not supported".into(),
+                ),
+            ));
         }
         self.state.mode = RunMode::Step;
         Ok(())
@@ -542,20 +544,17 @@ impl SingleRegisterAccess<()> for Target64 {
     ) -> TargetResult<usize, Self> {
         use gdbstub_arch::aarch64::reg::id::AArch64RegId;
         let value = match reg_id {
-            AArch64RegId::X(index) => {
-                reg(self.state.backend().borrow().reg_read(RegId::X(index)))?
-            }
+            AArch64RegId::X(index) => reg(self.state.backend().borrow().reg_read(RegId::X(index)))?,
             AArch64RegId::Sp => reg(self.state.backend().borrow().reg_read(RegId::Sp))?,
             AArch64RegId::Pc => reg(self.state.backend().borrow().reg_read(RegId::Pc))?,
             AArch64RegId::Pstate => {
                 cpsr_to_gdb(reg(self.state.backend().borrow().reg_read(RegId::Nzcv))?) as u64
             }
-            AArch64RegId::V(index) => u128::from_le_bytes(reg(
-                self.state
-                    .backend()
-                    .borrow()
-                    .reg_read_vector(RegId::Q(index)),
-            )?) as u64,
+            AArch64RegId::V(index) => u128::from_le_bytes(reg(self
+                .state
+                .backend()
+                .borrow()
+                .reg_read_vector(RegId::Q(index)))?) as u64,
             AArch64RegId::FPSR => u64::from(reg(self.state.backend().borrow().fpsr_read())?),
             AArch64RegId::FPCR => u64::from(reg(self.state.backend().borrow().fpcr_read())?),
             // System registers are advertised by the target description but
@@ -580,37 +579,32 @@ impl SingleRegisterAccess<()> for Target64 {
         let value = u64::from_le_bytes(word);
         let backend = self.state.backend();
         match reg_id {
-            AArch64RegId::X(index) => {
-                reg(backend.borrow_mut().reg_write(RegId::X(index), value))
-            }
+            AArch64RegId::X(index) => reg(backend.borrow_mut().reg_write(RegId::X(index), value)),
             AArch64RegId::Sp => {
                 self.state.emulator.memory().set_stack_point(value);
                 Ok(())
             }
             AArch64RegId::Pc => reg(backend.borrow_mut().reg_write(RegId::Pc, value)),
-            AArch64RegId::Pstate => reg(
-                backend
-                    .borrow_mut()
-                    .reg_write(RegId::Nzcv, cpsr_from_gdb(value as u32)),
-            ),
+            AArch64RegId::Pstate => reg(backend
+                .borrow_mut()
+                .reg_write(RegId::Nzcv, cpsr_from_gdb(value as u32))),
             AArch64RegId::V(index) => {
                 let mut bytes = [0u8; 16];
                 let width = val.len().min(16);
                 bytes[..width].copy_from_slice(&val[..width]);
-                reg(backend.borrow_mut().reg_write_vector(RegId::Q(index), bytes))
+                reg(backend
+                    .borrow_mut()
+                    .reg_write_vector(RegId::Q(index), bytes))
             }
             AArch64RegId::FPSR => reg(backend.borrow_mut().fpsr_write(value as u32)),
             AArch64RegId::FPCR => reg(backend.borrow_mut().fpcr_write(value as u32)),
-            _ => return Err(TargetError::NonFatal),
+            _ => Err(TargetError::NonFatal),
         }
     }
 }
 
 impl SingleThreadBase for Target32 {
-    fn read_registers(
-        &mut self,
-        regs: &mut gdbstub_arch::arm::reg::ArmCoreRegs,
-    ) -> ArmResult<()> {
+    fn read_registers(&mut self, regs: &mut gdbstub_arch::arm::reg::ArmCoreRegs) -> ArmResult<()> {
         let backend = self.state.backend();
         let backend = backend.borrow();
         for (index, slot) in regs.r.iter_mut().enumerate() {
@@ -623,10 +617,7 @@ impl SingleThreadBase for Target32 {
         Ok(())
     }
 
-    fn write_registers(
-        &mut self,
-        regs: &gdbstub_arch::arm::reg::ArmCoreRegs,
-    ) -> ArmResult<()> {
+    fn write_registers(&mut self, regs: &gdbstub_arch::arm::reg::ArmCoreRegs) -> ArmResult<()> {
         // The stack pointer goes through the memory facade, and that reaches
         // the backend itself, so it must happen before this borrow — the cell
         // would already be taken otherwise.
@@ -669,9 +660,11 @@ impl SingleThreadBase for Target32 {
 impl SingleThreadResume for Target32 {
     fn resume(&mut self, signal: Option<Signal>) -> Result<(), RunError> {
         if signal.is_some() {
-            return Err(RunError::Backend(raxdbg_core::backend::BackendError::Other(
-                "continuing with a signal is not supported".into(),
-            )));
+            return Err(RunError::Backend(
+                raxdbg_core::backend::BackendError::Other(
+                    "continuing with a signal is not supported".into(),
+                ),
+            ));
         }
         self.state.mode = RunMode::Continue;
         Ok(())
@@ -686,9 +679,11 @@ impl SingleThreadResume for Target32 {
 impl SingleThreadSingleStep for Target32 {
     fn step(&mut self, signal: Option<Signal>) -> Result<(), RunError> {
         if signal.is_some() {
-            return Err(RunError::Backend(raxdbg_core::backend::BackendError::Other(
-                "stepping with a signal is not supported".into(),
-            )));
+            return Err(RunError::Backend(
+                raxdbg_core::backend::BackendError::Other(
+                    "stepping with a signal is not supported".into(),
+                ),
+            ));
         }
         self.state.mode = RunMode::Step;
         Ok(())
@@ -768,9 +763,7 @@ impl SingleRegisterAccess<()> for Target32 {
         let value = u64::from(u32::from_le_bytes(word));
         let backend = self.state.backend();
         match reg_id {
-            ArmCoreRegId::Gpr(index) => {
-                reg(backend.borrow_mut().reg_write(RegId::R(index), value))
-            }
+            ArmCoreRegId::Gpr(index) => reg(backend.borrow_mut().reg_write(RegId::R(index), value)),
             ArmCoreRegId::Sp => {
                 self.state.emulator.memory().set_stack_point(value);
                 Ok(())
@@ -795,8 +788,7 @@ impl BlockingEventLoop for Arm64EventLoop {
     fn wait_for_stop_reason(
         target: &mut Self::Target,
         _conn: &mut Self::Connection,
-    ) -> Result<Event<Self::StopReason>, WaitForStopReasonError<RunError, std::io::Error>>
-    {
+    ) -> Result<Event<Self::StopReason>, WaitForStopReasonError<RunError, std::io::Error>> {
         // There is no second thread to interrupt: the run below owns the
         // backend until it returns, and the connection is read again only
         // once the guest has stopped.
@@ -807,9 +799,7 @@ impl BlockingEventLoop for Arm64EventLoop {
             .map_err(WaitForStopReasonError::Target)
     }
 
-    fn on_interrupt(
-        _target: &mut Self::Target,
-    ) -> Result<Option<Self::StopReason>, RunError> {
+    fn on_interrupt(_target: &mut Self::Target) -> Result<Option<Self::StopReason>, RunError> {
         // An interrupt that arrives while the guest is stopped is answered
         // here; one that arrives mid-run is read at the next loop boundary,
         // when `wait_for_stop_reason` has returned.
@@ -828,8 +818,7 @@ impl BlockingEventLoop for Arm32EventLoop {
     fn wait_for_stop_reason(
         target: &mut Self::Target,
         _conn: &mut Self::Connection,
-    ) -> Result<Event<Self::StopReason>, WaitForStopReasonError<RunError, std::io::Error>>
-    {
+    ) -> Result<Event<Self::StopReason>, WaitForStopReasonError<RunError, std::io::Error>> {
         target
             .state
             .run()
@@ -837,9 +826,7 @@ impl BlockingEventLoop for Arm32EventLoop {
             .map_err(WaitForStopReasonError::Target)
     }
 
-    fn on_interrupt(
-        _target: &mut Self::Target,
-    ) -> Result<Option<Self::StopReason>, RunError> {
+    fn on_interrupt(_target: &mut Self::Target) -> Result<Option<Self::StopReason>, RunError> {
         Ok(Some(SingleThreadStopReason::Signal(Signal::SIGINT)))
     }
 }
@@ -875,7 +862,10 @@ mod tests {
     ///
     /// Returns the emulator, its `LR` trap page and the prepared call, so a
     /// test can build whichever target it is about.
-    fn prepared_call(is_64bit: bool, abi: &str) -> (Rc<AndroidEmulator>, u64, PreparedFunctionCall) {
+    fn prepared_call(
+        is_64bit: bool,
+        abi: &str,
+    ) -> (Rc<AndroidEmulator>, u64, PreparedFunctionCall) {
         let emulator = if is_64bit {
             AndroidEmulatorBuilder::for_64bit()
         } else {
@@ -931,7 +921,10 @@ mod tests {
     fn arm64_registers_round_trip_through_the_gdb_layout() {
         let mut target = arm64_target();
         let backend = target.state.backend();
-        backend.borrow_mut().reg_write(RegId::X(7), 0x1122_3344_5566_7788).unwrap();
+        backend
+            .borrow_mut()
+            .reg_write(RegId::X(7), 0x1122_3344_5566_7788)
+            .unwrap();
         backend.borrow_mut().reg_write(RegId::Nzcv, 0b0101).unwrap();
         backend
             .borrow_mut()
@@ -957,7 +950,10 @@ mod tests {
         regs.fpcr = 0x2;
         ok(target.write_registers(&regs));
         let backend = target.state.backend();
-        assert_eq!(backend.borrow().reg_read(RegId::X(7)).unwrap(), 0xdead_beef_0000_0001);
+        assert_eq!(
+            backend.borrow().reg_read(RegId::X(7)).unwrap(),
+            0xdead_beef_0000_0001
+        );
         assert_eq!(backend.borrow().reg_read(RegId::Nzcv).unwrap(), 0b0011);
         assert_eq!(
             u128::from_le_bytes(backend.borrow().reg_read_vector(RegId::Q(3)).unwrap()),
@@ -995,8 +991,14 @@ mod tests {
     fn arm32_registers_round_trip_through_the_gdb_layout() {
         let mut target = arm32_target();
         let backend = target.state.backend();
-        backend.borrow_mut().reg_write(RegId::R(3), 0x1122_3344).unwrap();
-        backend.borrow_mut().reg_write(RegId::Cpsr, 0x0000_0010).unwrap();
+        backend
+            .borrow_mut()
+            .reg_write(RegId::R(3), 0x1122_3344)
+            .unwrap();
+        backend
+            .borrow_mut()
+            .reg_write(RegId::Cpsr, 0x0000_0010)
+            .unwrap();
 
         let mut regs = gdbstub_arch::arm::reg::ArmCoreRegs::default();
         ok(target.read_registers(&mut regs));
@@ -1006,7 +1008,12 @@ mod tests {
         regs.r[4] = 0x5566_7788;
         ok(target.write_registers(&regs));
         assert_eq!(
-            target.state.backend().borrow().reg_read(RegId::R(4)).unwrap(),
+            target
+                .state
+                .backend()
+                .borrow()
+                .reg_read(RegId::R(4))
+                .unwrap(),
             0x5566_7788
         );
     }
@@ -1017,13 +1024,8 @@ mod tests {
         // the register the way the architecture does, so the write has to land
         // through the backend rather than around it.
         let mut target = arm32_target();
-        let even = target
-            .state
-            .backend()
-            .borrow()
-            .reg_read(RegId::Pc)
-            .unwrap();
-let mut regs = gdbstub_arch::arm::reg::ArmCoreRegs::default();
+        let even = target.state.backend().borrow().reg_read(RegId::Pc).unwrap();
+        let mut regs = gdbstub_arch::arm::reg::ArmCoreRegs::default();
         ok(target.read_registers(&mut regs));
         // GDB sets both: the PC's bit 0 says "this is Thumb", and the CPSR's
         // T bit is the state the CPU actually runs in. The PC write derives
@@ -1042,7 +1044,7 @@ let mut regs = gdbstub_arch::arm::reg::ArmCoreRegs::default();
     }
 
     #[test]
-    fn an_unreachable_address_is_eFAULT_and_writes_nothing() {
+    fn an_unreachable_address_is_e_fault_and_writes_nothing() {
         let target = arm64_target();
         // Address 1 is below every mapping the loader makes, so the read must
         // fail rather than answer zeroes for memory the guest cannot reach.
@@ -1052,7 +1054,8 @@ let mut regs = gdbstub_arch::arm::reg::ArmCoreRegs::default();
             Err(TargetError::Errno(EFAULT))
         ));
         let mut buffer = [0u8; 8];
-        target.state
+        target
+            .state
             .read_memory(target.state.trap, &mut buffer)
             .ok()
             .expect("the trap page is mapped");
@@ -1067,12 +1070,7 @@ let mut regs = gdbstub_arch::arm::reg::ArmCoreRegs::default();
 
         // A mapped write does land, which is the case the refusal above has to
         // be told apart from.
-        let mapped = target
-            .state
-            .backend()
-            .borrow()
-            .reg_read(RegId::Sp)
-            .unwrap();
+        let mapped = target.state.backend().borrow().reg_read(RegId::Sp).unwrap();
         let mut before = [0u8; 4];
         ok(target.state.read_memory(mapped - 4, &mut before));
         ok(target.state.write_memory(mapped - 4, &[0xbb; 4]));

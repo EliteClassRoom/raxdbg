@@ -77,7 +77,8 @@ impl CodeHistory {
         if self.entries.len() == self.capacity {
             self.entries.pop_front();
         }
-        self.entries.push_back(HistoryEntry::new(pc, registers, size));
+        self.entries
+            .push_back(HistoryEntry::new(pc, registers, size));
     }
 
     /// Clears the buffer.

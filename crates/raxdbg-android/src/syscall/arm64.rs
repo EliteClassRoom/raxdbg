@@ -13,9 +13,8 @@
 //! thread-state slice lives here because the table is where most of those
 //! fields are touched.
 
-
 use raxdbg_core::backend::Prot;
-use raxdbg_core::errno::{EACCES, EBADF, EAGAIN, EINVAL};
+use raxdbg_core::errno::{EACCES, EAGAIN, EBADF, EINVAL};
 use raxdbg_core::file::structs::RLimit64;
 use raxdbg_core::memory::{Memory, MemoryError};
 
@@ -436,7 +435,12 @@ impl<'a> Arm64SyscallTable<'a> {
     }
 
     fn renameat(&self) -> i32 {
-        let _ = (self.arg_u64(0), self.arg_u64(1), self.arg_u64(2), self.arg_u64(3));
+        let _ = (
+            self.arg_u64(0),
+            self.arg_u64(1),
+            self.arg_u64(2),
+            self.arg_u64(3),
+        );
         self.handler.memory().set_errno(0);
         0
     }
@@ -550,7 +554,12 @@ impl<'a> Arm64SyscallTable<'a> {
     fn ppoll(&self) -> i32 {
         // Tests don't drive `ppoll`; return 0 so the syscall thread stays
         // parked without burning a budget.
-        let _ = (self.arg_u64(0), self.arg_u64(1), self.arg_u64(2), self.arg_u64(3));
+        let _ = (
+            self.arg_u64(0),
+            self.arg_u64(1),
+            self.arg_u64(2),
+            self.arg_u64(3),
+        );
         self.handler.memory().set_errno(0);
         0
     }
@@ -723,7 +732,9 @@ impl<'a> Arm64SyscallTable<'a> {
     fn gettimeofday(&self) -> i32 {
         use std::time::{SystemTime, UNIX_EPOCH};
         let tv = self.arg_u64(0);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let secs = now.as_secs() as i64;
         let usecs = now.subsec_micros() as i64;
         let memory: &dyn Memory = &**self.handler.memory();
@@ -773,7 +784,12 @@ impl<'a> Arm64SyscallTable<'a> {
     }
 
     fn socketpair(&self) -> i32 {
-        let _ = (self.arg_u64(0), self.arg_u64(1), self.arg_u64(2), self.arg_u64(3));
+        let _ = (
+            self.arg_u64(0),
+            self.arg_u64(1),
+            self.arg_u64(2),
+            self.arg_u64(3),
+        );
         self.handler.memory().set_errno(EACCES);
         -1
     }
@@ -785,31 +801,58 @@ impl<'a> Arm64SyscallTable<'a> {
     }
 
     fn accept4(&self) -> i32 {
-        let _ = (self.arg_u64(0), self.arg_u64(1), self.arg_u64(2), self.arg_u64(3));
+        let _ = (
+            self.arg_u64(0),
+            self.arg_u64(1),
+            self.arg_u64(2),
+            self.arg_u64(3),
+        );
         self.handler.memory().set_errno(EBADF);
         -1
     }
 
     fn sendto(&self) -> i32 {
-        let _ = (self.arg_u64(0), self.arg_u64(1), self.arg_u64(2), self.arg_u64(3));
+        let _ = (
+            self.arg_u64(0),
+            self.arg_u64(1),
+            self.arg_u64(2),
+            self.arg_u64(3),
+        );
         self.handler.memory().set_errno(EBADF);
         -1
     }
 
     fn recvfrom(&self) -> i32 {
-        let _ = (self.arg_u64(0), self.arg_u64(1), self.arg_u64(2), self.arg_u64(3));
+        let _ = (
+            self.arg_u64(0),
+            self.arg_u64(1),
+            self.arg_u64(2),
+            self.arg_u64(3),
+        );
         self.handler.memory().set_errno(EBADF);
         -1
     }
 
     fn setsockopt(&self) -> i32 {
-        let _ = (self.arg_u64(0), self.arg_u64(1), self.arg_u64(2), self.arg_u64(3), self.arg_u64(4));
+        let _ = (
+            self.arg_u64(0),
+            self.arg_u64(1),
+            self.arg_u64(2),
+            self.arg_u64(3),
+            self.arg_u64(4),
+        );
         self.handler.memory().set_errno(EBADF);
         -1
     }
 
     fn getsockopt(&self) -> i32 {
-        let _ = (self.arg_u64(0), self.arg_u64(1), self.arg_u64(2), self.arg_u64(3), self.arg_u64(4));
+        let _ = (
+            self.arg_u64(0),
+            self.arg_u64(1),
+            self.arg_u64(2),
+            self.arg_u64(3),
+            self.arg_u64(4),
+        );
         self.handler.memory().set_errno(EBADF);
         -1
     }
@@ -952,11 +995,7 @@ impl<'a> Arm64SyscallTable<'a> {
                 let ret = io.fstat(&mut stat);
                 if ret == 0 {
                     if stat
-                        .write_to(
-                            &**self.handler.memory(),
-                            statbuf,
-                            self.handler.is_64bit(),
-                        )
+                        .write_to(&**self.handler.memory(), statbuf, self.handler.is_64bit())
                         .is_err()
                     {
                         self.handler.memory().set_errno(EACCES);

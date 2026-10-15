@@ -29,7 +29,7 @@ use raxdbg_core::backend::{Backend, GuestMemory, Prot};
 use raxdbg_core::hook::HookListener;
 use raxdbg_core::memory::Memory;
 use raxdbg_core::reg::RegId;
-use raxdbg_core::svc::{SvcMemory, SVC_BASE};
+use raxdbg_core::svc::{SVC_BASE, SvcMemory};
 
 /// A backend plus the borrow-free handle to its address space that the loader
 /// needs (plan P2.6).
@@ -152,8 +152,13 @@ fn system_property_get_writes_value_and_returns_length() {
     )
     .expect("hook");
 
-    let stub_address =
-        HookListener::hook(&hook, svc_memory.as_ref(), Some("libc.so"), "__system_property_get", 0);
+    let stub_address = HookListener::hook(
+        &hook,
+        svc_memory.as_ref(),
+        Some("libc.so"),
+        "__system_property_get",
+        0,
+    );
     assert!(stub_address >= SVC_BASE);
 
     let key = "ro.build.version.sdk";
@@ -174,8 +179,12 @@ fn system_property_get_writes_value_and_returns_length() {
         .expect("value buffer")
         .peer();
 
-    with_backend(&loader, |backend| { backend.reg_write(RegId::X(0), key_ptr).expect("set x0") });
-    with_backend(&loader, |backend| { backend.reg_write(RegId::X(1), value_ptr).expect("set x1") });
+    with_backend(&loader, |backend| {
+        backend.reg_write(RegId::X(0), key_ptr).expect("set x0")
+    });
+    with_backend(&loader, |backend| {
+        backend.reg_write(RegId::X(1), value_ptr).expect("set x1")
+    });
 
     let number = hook.stubs().get.number;
     let mut svc = svc_memory.take_svc(number).expect("get stub registered");
@@ -183,7 +192,11 @@ fn system_property_get_writes_value_and_returns_length() {
     assert_eq!(length, 2, "ro.build.version.sdk = 23 (two bytes)");
 
     let mut buf = vec![0u8; length + 1];
-    with_backend(&loader, |backend| { backend.mem_read_into(value_ptr, &mut buf).expect("read value") });
+    with_backend(&loader, |backend| {
+        backend
+            .mem_read_into(value_ptr, &mut buf)
+            .expect("read value")
+    });
     let value = std::str::from_utf8(&buf[..length]).expect("utf-8 value");
     assert_eq!(value, "23");
 
@@ -218,8 +231,15 @@ fn system_property_get_reads_keys_only_in_bundled_properties() {
         provider.clone(),
     )
     .expect("hook");
-    let stub_address =
-        HookListener::hook(&hook, svc_memory.as_ref(), Some("libc.so"), "__system_property_get", 0);
+    // The listener answers with the stub address; the call is driven through the
+    // number the hook publishes, not through this address.
+    let _stub_address = HookListener::hook(
+        &hook,
+        svc_memory.as_ref(),
+        Some("libc.so"),
+        "__system_property_get",
+        0,
+    );
 
     let key = "ro.hardware";
     let key_ptr = loader
@@ -237,15 +257,23 @@ fn system_property_get_reads_keys_only_in_bundled_properties() {
         .expect("value buffer")
         .peer();
 
-    with_backend(&loader, |backend| { backend.reg_write(RegId::X(0), key_ptr).expect("x0") });
-    with_backend(&loader, |backend| { backend.reg_write(RegId::X(1), value_ptr).expect("x1") });
+    with_backend(&loader, |backend| {
+        backend.reg_write(RegId::X(0), key_ptr).expect("x0")
+    });
+    with_backend(&loader, |backend| {
+        backend.reg_write(RegId::X(1), value_ptr).expect("x1")
+    });
 
     let number = hook.stubs().get.number;
     let mut svc = svc_memory.take_svc(number).expect("get stub registered");
     let length = with_backend(&loader, |backend| svc.handle(backend).expect("handle")) as usize;
     assert!(length > 0, "ro.hardware has a non-empty value");
     let mut buf = vec![0u8; length + 1];
-    with_backend(&loader, |backend| { backend.mem_read_into(value_ptr, &mut buf).expect("read value") });
+    with_backend(&loader, |backend| {
+        backend
+            .mem_read_into(value_ptr, &mut buf)
+            .expect("read value")
+    });
     let value = std::str::from_utf8(&buf[..length]).expect("utf-8 value");
     assert_eq!(value, "bullhead");
 
@@ -267,7 +295,10 @@ fn armld64_registers_libdl_symbols_and_dlsym_resolves_a_real_export() {
 
     let dlerror_addr =
         HookListener::hook(&arm_ld, svc_memory.as_ref(), Some("libdl.so"), "dlerror", 0);
-    assert!(dlerror_addr >= SVC_BASE, "dlerror stub lives in the SVC page");
+    assert!(
+        dlerror_addr >= SVC_BASE,
+        "dlerror stub lives in the SVC page"
+    );
     let dlerror_number = arm_ld.stubs.dlerror.number;
     let number = dlerror_number;
     let mut svc = svc_memory
@@ -280,13 +311,12 @@ fn armld64_registers_libdl_symbols_and_dlsym_resolves_a_real_export() {
     );
     svc_memory.put_svc(number, svc);
 
-    let dlsym_addr =
+    // As above: the substitution is checked through the published number.
+    let _dlsym_addr =
         HookListener::hook(&arm_ld, svc_memory.as_ref(), Some("libdl.so"), "dlsym", 0);
     let dlsym_number = arm_ld.stubs.dlsym.number;
     let number = dlsym_number;
-    let mut svc = svc_memory
-        .take_svc(number)
-        .expect("dlsym stub");
+    let mut svc = svc_memory.take_svc(number).expect("dlsym stub");
 
     let name = "malloc";
     let name_ptr = loader
@@ -299,10 +329,17 @@ fn armld64_registers_libdl_symbols_and_dlsym_resolves_a_real_export() {
         .write_bytes(name_ptr, name.as_bytes())
         .expect("write name");
 
-    with_backend(&loader, |backend| { backend.reg_write(RegId::X(0), 0).expect("x0 = RTLD_DEFAULT") });
-    with_backend(&loader, |backend| { backend.reg_write(RegId::X(1), name_ptr).expect("x1 = name") });
+    with_backend(&loader, |backend| {
+        backend
+            .reg_write(RegId::X(0), 0)
+            .expect("x0 = RTLD_DEFAULT")
+    });
+    with_backend(&loader, |backend| {
+        backend.reg_write(RegId::X(1), name_ptr).expect("x1 = name")
+    });
 
-    let symbol_address = with_backend(&loader, |backend| svc.handle(backend).expect("handle")) as u64;
+    let symbol_address =
+        with_backend(&loader, |backend| svc.handle(backend).expect("handle")) as u64;
     assert_ne!(
         symbol_address, 0,
         "dlsym should resolve `malloc` from the loaded libc.so"

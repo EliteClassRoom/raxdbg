@@ -151,7 +151,11 @@ pub trait Memory {
     /// Allocates `length` bytes. `runtime` selects the mmap-backed block
     /// (freed with `munmap`) over the guest libc's `malloc` (freed with
     /// `free`), as unidbg's `Memory.malloc` documents.
-    fn malloc(&self, length: usize, runtime: bool) -> Result<crate::alloc::MemoryBlock, MemoryError>;
+    fn malloc(
+        &self,
+        length: usize,
+        runtime: bool,
+    ) -> Result<crate::alloc::MemoryBlock, MemoryError>;
 
     /// Reserves `size` bytes below the stack pointer.
     fn allocate_stack(&self, size: usize) -> Result<Pointer, MemoryError>;

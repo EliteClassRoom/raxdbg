@@ -65,7 +65,10 @@ fn murmur3(value: &str) -> i32 {
         k = k.rotate_left(15);
         k = k.wrapping_mul(C2);
         hash ^= k;
-        hash = hash.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
+        hash = hash
+            .rotate_left(13)
+            .wrapping_mul(5)
+            .wrapping_add(0xe654_6b64);
     }
     let tail = data.len() % 4;
     if tail > 0 {
@@ -99,12 +102,7 @@ fn xxhash32(value: &str) -> i32 {
     let mut hash: u32;
     let mut cursor = 0usize;
     if data.len() >= 16 {
-        let mut accumulators = [
-            P1.wrapping_add(P2),
-            P2,
-            0u32,
-            0u32.wrapping_sub(P1),
-        ];
+        let mut accumulators = [P1.wrapping_add(P2), P2, 0u32, 0u32.wrapping_sub(P1)];
         for (index, chunk) in data.chunks_exact(16).enumerate() {
             accumulators[index % 4] = round(
                 accumulators[index % 4],

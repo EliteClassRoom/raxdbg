@@ -1,8 +1,7 @@
 //! Android system-property hook and default property table.
 //!
-//! Port of unidbg:
+//! Port of unidbg @7f5da98e:
 //! - `unidbg-android/src/main/java/com/github/unidbg/linux/android/{SystemPropertyHook,SystemPropertyProvider}.java`
-//! @7f5da98e.
 //!
 //! Bionic looks up `ro.*` values through `__system_property_get` (and a few
 //! sibling symbols in `libc.so`). We install a [`HookListener`] on `libc.so`
@@ -11,7 +10,7 @@
 //! out of the guest's registers, looks it up in a [`SystemPropertyProvider`],
 //! and writes the value into the guest buffer.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -27,13 +26,6 @@ use raxdbg_core::svc::{Svc, SvcKind, SvcMemory};
 /// Port of unidbg: `SystemPropertyHook.PROP_VALUE_MAX` and bionic's
 /// `<sys/system_properties.h>`.
 pub const PROP_VALUE_MAX: usize = 92;
-
-/// The first SVC number the SVC page hands out for an arm64 stub. The
-/// run loop reserves `0`, `0xffff` (`SVC_MAX`), and `0xfffe` (`SVC_MAX - 1`)
-/// — the first usable number for an arm64 guest is therefore `1`.
-const ARM64_FIRST_SVC: i32 = 1;
-/// The first SVC number for an ARM-state AArch32 stub.
-const ARM_FIRST_SVC: i32 = 0x100;
 
 /// A stub's guest address paired with its SVC number, the way the run loop
 /// dispatches a stub call.
@@ -56,40 +48,35 @@ pub struct PropertyStubs {
     pub find: StubAddress,
 }
 
-/// A side-table that pairs each SVC number the hook listener allocates with
-/// the [`Svc`] handler that should run when the guest calls into the stub.
+/// The table a hook listener installs its stubs into.
 ///
-/// unidbg's `SvcMemory` keeps the same table internally and the run loop
-/// looks it up by number; here we keep our own copy because we allocate the
-/// stubs by hand instead of through `SvcMemory::register_svc`, so we can
-/// also expose the number alongside the guest address to test fixtures.
+/// unidbg's `SvcMemory` keeps the `(svc_number, Svc)` pairs internally and the
+/// run loop looks them up by number; raxdbg keeps a copy here so a caller can
+/// reach the same side-table (see [`SystemPropertyHook::dispatch`]). The stub
+/// words themselves and their numbers both come from the `SvcMemory` — see
+/// [`StubDispatch::install`].
 #[derive(Default)]
 pub struct StubDispatch {
     /// `(svc_number, Svc)` pairs.
     pub handlers: RefCell<BTreeMap<i32, Box<dyn Svc>>>,
-    /// A simple counter that hands out the next free arm64 SVC number.
-    arm64_next: Cell<i32>,
-    /// A simple counter that hands out the next free ARM-state SVC number.
-    arm_next: Cell<i32>,
 }
 
 impl StubDispatch {
-    /// Creates an empty dispatch table seeded at the first usable numbers.
+    /// Creates an empty dispatch table.
     pub fn new() -> Self {
         Self {
             handlers: RefCell::new(BTreeMap::new()),
-            arm64_next: Cell::new(ARM64_FIRST_SVC),
-            arm_next: Cell::new(ARM_FIRST_SVC),
         }
     }
 
-    /// Allocates a stub word (`svc #N` + `ret`) for `kind`, writes it
-    /// through `memory` at the address returned by `svc_memory.allocate`,
-    /// records the handler, and returns the (address, number) pair.
+    /// Installs `svc` as an SVC stub and returns its `(address, number)` pair.
     ///
-    /// This mirrors `SvcMemory::register_svc` but, instead of bumping the
-    /// `SvcMemory`'s own number counters, we hand out numbers from this
-    /// table so callers can recover them.
+    /// The stub word (`svc #N` + `ret`) is written through `memory` at the
+    /// address the `SvcMemory` allocated, and the handler is recorded in the
+    /// `SvcMemory`'s own table under `number` — that is the table the run loop
+    /// dispatches through, so a stub numbered anywhere else would never be
+    /// reached. This table only carries the pair back to the caller, which
+    /// needs the number to publish the symbol address.
     pub fn install(
         &self,
         svc_memory: &SvcMemory,
@@ -137,7 +124,11 @@ impl SystemPropertyHook {
         pointer_size: usize,
         provider: Rc<RefCell<SystemPropertyProvider>>,
     ) -> Result<Self, RegisterError> {
-        let kind = if is_64bit { SvcKind::Arm64 } else { SvcKind::Arm };
+        let kind = if is_64bit {
+            SvcKind::Arm64
+        } else {
+            SvcKind::Arm
+        };
         let get_stub: Box<dyn Svc> = Box::new(GetHandler {
             kind,
             pointer_size,
@@ -240,7 +231,7 @@ impl Svc for GetHandler {
         let length = match provider.get_property(&name) {
             Some(value) => {
                 write_guest_c_string(backend, value_ptr, &value)?;
-                value.as_bytes().len()
+                value.len()
             }
             None => 0,
         };
@@ -276,10 +267,10 @@ impl Svc for ReadHandler {
         let length = match provider.get_property(&key) {
             Some(value) => {
                 write_guest_c_string(backend, value_ptr, &value)?;
-                let len = value.as_bytes().len() as u32;
+                let len = value.len() as u32;
                 let serial = (len << 24) | 0x01;
                 backend.mem_write(pi, &serial.to_le_bytes())?;
-                value.as_bytes().len()
+                value.len()
             }
             None => 0,
         };

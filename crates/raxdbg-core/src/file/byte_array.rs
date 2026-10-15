@@ -10,8 +10,8 @@ use std::any::Any;
 
 use crate::backend::Prot;
 use crate::errno::EINVAL;
-use crate::file::structs::{IOConstants, Stat};
 use crate::file::FileIO;
+use crate::file::structs::{IOConstants, Stat};
 use crate::memory::Memory;
 
 /// An in-memory `Vec<u8>` file, exactly the shape unidbg's `ByteArrayFileIO` takes.
@@ -55,13 +55,7 @@ impl FileIO for ByteArrayFileIO {
         -EINVAL
     }
 
-    fn pread(
-        &mut self,
-        memory: &dyn Memory,
-        buffer: u64,
-        count: usize,
-        offset: u64,
-    ) -> i32 {
+    fn pread(&mut self, memory: &dyn Memory, buffer: u64, count: usize, offset: u64) -> i32 {
         // unidbg's `ByteArrayFileIO.pread` saves and restores `pos` so a
         // concurrent `read` does not move the cursor.
         let saved = self.pos;
@@ -163,4 +157,3 @@ impl FileIO for ByteArrayFileIO {
         self
     }
 }
-

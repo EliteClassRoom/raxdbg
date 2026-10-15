@@ -233,7 +233,20 @@ mod tests {
 
     #[test]
     fn signed_leb128_round_trips() {
-        for value in [0i64, 1, -1, 63, 64, -64, -65, 127, 128, 1000, -1000, i32::MIN as i64] {
+        for value in [
+            0i64,
+            1,
+            -1,
+            63,
+            64,
+            -64,
+            -65,
+            127,
+            128,
+            1000,
+            -1000,
+            i32::MIN as i64,
+        ] {
             let encoded = sleb(value);
             let mut reader = Reader::new(&encoded, 64);
             assert_eq!(reader.sleb128().unwrap(), value, "value {value}");
@@ -346,7 +359,10 @@ mod tests {
         data.extend(sleb(0));
         assert!(matches!(
             decode(&data, false, 32),
-            Err(PackedError::GroupOverrun { size: 99, remaining: 1 })
+            Err(PackedError::GroupOverrun {
+                size: 99,
+                remaining: 1
+            })
         ));
     }
 
@@ -397,11 +413,23 @@ mod real_library {
         let bytes = std::fs::read(&path).expect("read libcpp");
         let elf = goblin::elf::Elf::parse(&bytes).expect("parse libcpp");
         let dynamic = elf.dynamic.as_ref().expect("dynamic");
-        let tag = |want: u64| dynamic.dyns.iter().find(|e| e.d_tag == want).map(|e| e.d_val);
+        let tag = |want: u64| {
+            dynamic
+                .dyns
+                .iter()
+                .find(|e| e.d_tag == want)
+                .map(|e| e.d_val)
+        };
         let (offset, size) = if rela {
-            (tag(0x6000_0011).expect("DT_ANDROID_RELA"), tag(0x6000_0012).expect("DT_ANDROID_RELASZ"))
+            (
+                tag(0x6000_0011).expect("DT_ANDROID_RELA"),
+                tag(0x6000_0012).expect("DT_ANDROID_RELASZ"),
+            )
         } else {
-            (tag(0x6000_000f).expect("DT_ANDROID_REL"), tag(0x6000_0010).expect("DT_ANDROID_RELSZ"))
+            (
+                tag(0x6000_000f).expect("DT_ANDROID_REL"),
+                tag(0x6000_0010).expect("DT_ANDROID_RELSZ"),
+            )
         };
         let file_offset = elf
             .program_headers
@@ -414,7 +442,11 @@ mod real_library {
         assert!(has_magic(table), "the table starts with APS2");
         let bits = if rela { 64 } else { 32 };
         let relocations = decode(&table[4..], rela, bits).expect("decode");
-        (tag(goblin::elf::dynamic::DT_INIT_ARRAY).expect("DT_INIT_ARRAY"), offset, relocations)
+        (
+            tag(goblin::elf::dynamic::DT_INIT_ARRAY).expect("DT_INIT_ARRAY"),
+            offset,
+            relocations,
+        )
     }
 
     #[test]
@@ -424,7 +456,9 @@ mod real_library {
             let entry = relocations
                 .iter()
                 .find(|relocation| relocation.r_offset == init_array)
-                .unwrap_or_else(|| panic!("no relocation for the init_array entry at {init_array:#x}"));
+                .unwrap_or_else(|| {
+                    panic!("no relocation for the init_array entry at {init_array:#x}")
+                });
             let relative = if rela { 1027 } else { 23 };
             assert_eq!(entry.r_type, relative, "the entry is a relative relocation");
             let addend = if rela {
@@ -454,10 +488,15 @@ mod real_library {
                 if rela {
                     i64::from_le_bytes(bytes[off as usize..off as usize + 8].try_into().unwrap())
                 } else {
-                    i64::from(i32::from_le_bytes(bytes[off as usize..off as usize + 4].try_into().unwrap()))
+                    i64::from(i32::from_le_bytes(
+                        bytes[off as usize..off as usize + 4].try_into().unwrap(),
+                    ))
                 }
             };
-            assert_ne!(addend, 0, "the initialiser's link-time address is in the table");
+            assert_ne!(
+                addend, 0,
+                "the initialiser's link-time address is in the table"
+            );
             // It must be code: the executable segment, not a data one.
             assert!(
                 addend < 0x90000,

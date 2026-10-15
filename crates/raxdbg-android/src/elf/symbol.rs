@@ -173,7 +173,14 @@ mod tests {
 
     #[test]
     fn weak_resolutions_use_the_offset_as_the_value() {
-        let symbol = ModuleSymbol::new("a.so", WEAK_BASE, None, 0x1000, Some("libc.so".into()), 0x77);
+        let symbol = ModuleSymbol::new(
+            "a.so",
+            WEAK_BASE,
+            None,
+            0x1000,
+            Some("libc.so".into()),
+            0x77,
+        );
         assert_eq!(symbol.value(), 0x77);
     }
 

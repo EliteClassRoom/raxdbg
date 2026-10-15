@@ -1,9 +1,8 @@
 //! `libdl` trampolines for arm64 (`ArmLD64`) and arm32 (`ArmLD`).
 //!
-//! Port of unidbg:
+//! Port of unidbg @7f5da98e:
 //! - `unidbg-android/src/main/java/com/github/unidbg/linux/android/ArmLD64.java`
 //! - `unidbg-android/src/main/java/com/github/unidbg/linux/android/ArmLD.java`
-//! @7f5da98e.
 //!
 //! Each of these is a [`HookListener`] the loader registers on `libdl.so`. It
 //! owns the per-process `dlerror` buffer and allocates SVC stubs for
@@ -12,7 +11,6 @@
 //! `android_get_application_target_sdk_version` (arm32 only). The stubs
 //! dispatch to the [`AndroidElfLoader`] the loader owns.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use raxdbg_core::backend::{Backend, RunError};
@@ -30,13 +28,8 @@ use crate::elf::loader::AndroidElfLoader;
 /// `unidbg-android/src/main/java/com/github/unidbg/linux/android/ArmLD64.java`
 /// @7f5da98e.
 pub struct ArmLd64 {
-    /// The guest's `dlerror` buffer.
-    error: u64,
     /// The pre-allocated stubs.
     pub stubs: ArmLdStubs,
-    /// The dispatch table (shared with the test) that owns the per-number
-    /// handlers. The run loop never reads this; only the test does.
-    dispatch: Rc<super::system_property::StubDispatch>,
 }
 
 /// The set of `libdl` SVC stub addresses and numbers.
@@ -68,12 +61,15 @@ impl ArmLd64 {
         dispatch: Rc<super::system_property::StubDispatch>,
         loader: Rc<AndroidElfLoader>,
     ) -> Result<Self, RegisterError> {
-        let stubs = register_stubs(svc_memory, memory, &dispatch, &loader, SvcKind::Arm64, false)?;
-        Ok(Self {
-            error: stubs.error,
-            stubs: stubs.stubs,
-            dispatch,
-        })
+        let stubs = register_stubs(
+            svc_memory,
+            memory,
+            &dispatch,
+            &loader,
+            SvcKind::Arm64,
+            false,
+        )?;
+        Ok(Self { stubs })
     }
 }
 
@@ -106,10 +102,7 @@ impl HookListener for ArmLd64 {
 /// `unidbg-android/src/main/java/com/github/unidbg/linux/android/ArmLD.java`
 /// @7f5da98e.
 pub struct ArmLd {
-    error: u64,
     pub stubs: ArmLdStubs,
-    #[allow(dead_code)]
-    dispatch: Rc<super::system_property::StubDispatch>,
 }
 
 impl ArmLd {
@@ -121,11 +114,7 @@ impl ArmLd {
         loader: Rc<AndroidElfLoader>,
     ) -> Result<Self, RegisterError> {
         let stubs = register_stubs(svc_memory, memory, &dispatch, &loader, SvcKind::Arm, true)?;
-        Ok(Self {
-            error: stubs.error,
-            stubs: stubs.stubs,
-            dispatch,
-        })
+        Ok(Self { stubs })
     }
 }
 
@@ -154,12 +143,6 @@ impl HookListener for ArmLd {
     }
 }
 
-/// What `register_stubs` returns: the `dlerror` buffer plus every stub.
-struct Allocated {
-    error: u64,
-    stubs: ArmLdStubs,
-}
-
 /// Allocates the `dlerror` buffer and one stub per `libdl` symbol.
 fn register_stubs(
     svc_memory: &SvcMemory,
@@ -168,7 +151,7 @@ fn register_stubs(
     loader: &Rc<AndroidElfLoader>,
     kind: SvcKind,
     with_arm_extras: bool,
-) -> Result<Allocated, RegisterError> {
+) -> Result<ArmLdStubs, RegisterError> {
     let error = svc_memory
         .allocate(0x80, "Dlfcn.error")
         .map_err(RegisterError)?;
@@ -187,11 +170,7 @@ fn register_stubs(
         memory,
         Box::new(DlClose::new(kind, pointer_size, Rc::clone(loader))),
     )?;
-    let dlerror = dispatch.install(
-        svc_memory,
-        memory,
-        Box::new(DlErrorStub::new(kind, error)),
-    )?;
+    let dlerror = dispatch.install(svc_memory, memory, Box::new(DlErrorStub::new(kind, error)))?;
     let dladdr = dispatch.install(
         svc_memory,
         memory,
@@ -229,18 +208,15 @@ fn register_stubs(
         StubAddress::default()
     };
 
-    Ok(Allocated {
-        error,
-        stubs: ArmLdStubs {
-            dlopen,
-            dlclose,
-            dlerror,
-            dladdr,
-            dlsym,
-            dl_iterate_phdr,
-            dl_unwind_find_exidx,
-            android_sdk_version,
-        },
+    Ok(ArmLdStubs {
+        dlopen,
+        dlclose,
+        dlerror,
+        dladdr,
+        dlsym,
+        dl_iterate_phdr,
+        dl_unwind_find_exidx,
+        android_sdk_version,
     })
 }
 
@@ -387,10 +363,9 @@ impl Svc for DlAddr {
                 backend.reg_read(RegId::R(1))?,
             )
         };
-        let module = match self.loader.find_module_by_address(addr) {
-            Some(m) => m,
-            None => return Ok(0),
-        };
+        if self.loader.find_module_by_address(addr).is_none() {
+            return Ok(0);
+        }
         let pointer_width = pointer_size as u64;
         let _ = info_ptr;
         let _ = pointer_width;

@@ -13,10 +13,10 @@
 
 pub mod auxv;
 pub mod init;
-pub mod names;
-pub mod packed;
 pub mod loader;
 pub mod module;
+pub mod names;
+pub mod packed;
 pub mod symbol;
 
 pub use auxv::MainProgram;

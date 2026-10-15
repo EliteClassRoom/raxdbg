@@ -124,8 +124,11 @@ impl Unwinder {
     }
 
     /// The register holding the frame pointer.
+    ///
+    /// Port of unidbg's `SimpleARM64Unwinder` (`x29`) and `SimpleARMUnwinder`
+    /// (`r11`): both are `RegId::Fp`, which resolves per ABI.
     fn frame_pointer_register(&self) -> RegId {
-        if self.is_64bit { RegId::Fp } else { RegId::Fp }
+        RegId::Fp
     }
 
     /// The register holding the program counter.

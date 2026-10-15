@@ -56,10 +56,12 @@ mod tests {
         let text = disassembler.disassemble(0, &mov, false).expect("decode");
         assert!(text.contains("x0"), "{text}");
         let ret = 0xd65f_03c0u32.to_le_bytes();
-        assert!(disassembler
-            .disassemble(0, &ret, false)
-            .expect("decode")
-            .contains("ret"));
+        assert!(
+            disassembler
+                .disassemble(0, &ret, false)
+                .expect("decode")
+                .contains("ret")
+        );
     }
 
     #[test]

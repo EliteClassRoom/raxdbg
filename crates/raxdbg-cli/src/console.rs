@@ -11,20 +11,21 @@ use std::rc::Rc;
 
 use raxdbg_android::debug::ArmDisassembler;
 use raxdbg_android::emulator::AndroidEmulator;
-use raxdbg_core::backend::{Backend, RunOutcome};
-use raxdbg_core::debug::{BreakCallback, BreakControl, Breaker, BreakerImpl, BreakPoint, Disassembler};
+use raxdbg_core::backend::RunOutcome;
+use raxdbg_core::debug::{
+    BreakCallback, BreakControl, BreakPoint, Breaker, BreakerImpl, Disassembler,
+};
 use raxdbg_core::memory::Memory;
 use raxdbg_core::reg::RegId;
 use raxdbg_core::unwind::Unwinder;
 
-use crate::options::{Options, Call};
-use crate::{ModuleSymbols, boot, read_line, register_names, prompt};
+use crate::options::{Call, Options};
+use crate::{ModuleSymbols, boot, prompt, read_line, register_names};
 
 /// A console session over `input`/`output`.
 pub struct Console {
     emulator: Rc<AndroidEmulator>,
     breaker: Rc<RefCell<BreakerImpl>>,
-    history: raxdbg_core::debug::CodeHistory,
     breakpoints: Vec<BreakPoint>,
     stop: Rc<std::cell::Cell<bool>>,
 }
@@ -32,18 +33,23 @@ pub struct Console {
 impl Console {
     /// Attaches to a booted emulator.
     pub fn attach(emulator: Rc<AndroidEmulator>) -> Self {
-        let breaker = Rc::new(RefCell::new(BreakerImpl::new(Rc::clone(emulator.backend()))));
+        let breaker = Rc::new(RefCell::new(BreakerImpl::new(Rc::clone(
+            emulator.backend(),
+        ))));
         Console {
             emulator,
             breaker,
-            history: raxdbg_core::debug::CodeHistory::new(64),
             breakpoints: Vec::new(),
             stop: Rc::new(std::cell::Cell::new(false)),
         }
     }
 
     /// Runs the command loop until `q` or end of input.
-    pub fn run(&mut self, input: &mut impl BufRead, output: &mut impl Write) -> std::io::Result<()> {
+    pub fn run(
+        &mut self,
+        input: &mut impl BufRead,
+        output: &mut impl Write,
+    ) -> std::io::Result<()> {
         writeln!(
             output,
             "raxdbg console — `help` for commands, `q` to quit. The guest has not started."
@@ -85,17 +91,17 @@ impl Console {
 
     fn continue_run(&mut self, output: &mut impl Write) -> std::io::Result<()> {
         let pc = self.pc();
-        let outcome = self
-            .emulator
-            .backend()
-            .borrow_mut()
-            .emu_start(pc, 0, 0, 0);
+        let outcome = self.emulator.backend().borrow_mut().emu_start(pc, 0, 0, 0);
         self.report_outcome(outcome, output)
     }
 
     fn step(&mut self, output: &mut impl Write, count: u64) -> std::io::Result<()> {
         let pc = self.pc();
-        let outcome = self.emulator.backend().borrow_mut().emu_start(pc, 0, 0, count);
+        let outcome = self
+            .emulator
+            .backend()
+            .borrow_mut()
+            .emu_start(pc, 0, 0, count);
         self.report_outcome(outcome, output)
     }
 
@@ -128,7 +134,11 @@ impl Console {
             .breaker
             .borrow_mut()
             .add_break_point(address, Some(callback));
-        writeln!(output, "breakpoint {} at {address:#x}", breakpoint.address())?;
+        writeln!(
+            output,
+            "breakpoint {} at {address:#x}",
+            breakpoint.address()
+        )?;
         self.breakpoints.push(breakpoint);
         Ok(())
     }
@@ -139,7 +149,11 @@ impl Console {
                 output,
                 "{index}: {:#x}{}",
                 breakpoint.address(),
-                if breakpoint.temporary() { " (temporary)" } else { "" }
+                if breakpoint.temporary() {
+                    " (temporary)"
+                } else {
+                    ""
+                }
             )?;
         }
         Ok(())
@@ -151,7 +165,9 @@ impl Console {
         };
         match self.breakpoints.get(index) {
             Some(breakpoint) => {
-                self.breaker.borrow_mut().remove_break_point(breakpoint.address());
+                self.breaker
+                    .borrow_mut()
+                    .remove_break_point(breakpoint.address());
                 writeln!(output, "removed breakpoint {index}")
             }
             None => writeln!(output, "no breakpoint {index}"),
@@ -181,7 +197,12 @@ impl Console {
             Ok(()) => {
                 for (index, chunk) in buffer.chunks(16).enumerate() {
                     let hex: Vec<String> = chunk.iter().map(|byte| format!("{byte:02x}")).collect();
-                    writeln!(output, "{:#018x}: {}", address + (index * 16) as u64, hex.join(" "))?;
+                    writeln!(
+                        output,
+                        "{:#018x}: {}",
+                        address + (index * 16) as u64,
+                        hex.join(" ")
+                    )?;
                 }
                 Ok(())
             }
@@ -320,11 +341,6 @@ impl Console {
             .dlsym(0, text)
             .map(|symbol| symbol.address)
     }
-
-    /// The code history the session recorded.
-    pub fn history(&self) -> &raxdbg_core::debug::CodeHistory {
-        &self.history
-    }
 }
 
 const HELP: &str = "\
@@ -347,7 +363,11 @@ q                quit";
 /// Runs a scripted or interactive console session for `debug <lib.so>`.
 pub fn debug_session(options: &Options, library: &str) -> Result<(), String> {
     let (emulator, _) = boot(options, library)?;
-    if let Some(call) = options.call.as_ref().filter(|call| !call.signature.is_empty()) {
+    if let Some(call) = options
+        .call
+        .as_ref()
+        .filter(|call| !call.signature.is_empty())
+    {
         preload_call(&emulator, call)?;
     }
     let mut console = Console::attach(emulator);
@@ -363,38 +383,16 @@ pub fn debug_session(options: &Options, library: &str) -> Result<(), String> {
 /// Resolves the `--call` target up front, so a typo is reported before the
 /// console takes over the terminal.
 fn preload_call(_emulator: &Rc<AndroidEmulator>, call: &Call) -> Result<(), String> {
-    if call.signature.contains('(') && call.signature.contains(')') && !call.signature.ends_with("()V") {
+    if call.signature.contains('(')
+        && call.signature.contains(')')
+        && !call.signature.ends_with("()V")
+    {
         return Err(format!(
             "the JNI signature {} needs the dvm runtime, which is not ported yet",
             call.signature
         ));
     }
     Ok(())
-}
-
-/// A console session for tests: the same object, driven from a byte slice.
-pub fn scripted_session(
-    emulator: Rc<AndroidEmulator>,
-    script: &[u8],
-) -> std::io::Result<(String, Console)> {
-    let mut console = Console::attach(emulator);
-    let mut input = std::io::BufReader::new(script);
-    let mut output = Vec::new();
-    console.run(&mut input, &mut output)?;
-    Ok((String::from_utf8_lossy(&output).into_owned(), console))
-}
-
-/// Silences the unused-import warning for `Backend`, which the console uses
-/// only through trait methods on the boxed backend.
-#[allow(dead_code)]
-fn _backend_is_used(backend: &dyn Backend) -> usize {
-    backend.page_size()
-}
-
-/// Keeps the `RefCell` import honest for the same reason.
-#[allow(dead_code)]
-fn _cell_type() -> Rc<RefCell<dyn Backend>> {
-    unreachable!("only here to name the type")
 }
 
 fn parse_address(text: &str) -> Option<u64> {

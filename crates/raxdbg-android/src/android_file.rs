@@ -77,7 +77,9 @@ impl LibraryFile for ElfLibraryFile {
     fn resolve_library(&self, name: &str) -> Option<Box<dyn LibraryFile>> {
         let sibling = self.path.parent()?.join(name);
         if sibling.is_file() {
-            ElfLibraryFile::open(sibling).ok().map(|file| Box::new(file) as Box<dyn LibraryFile>)
+            ElfLibraryFile::open(sibling)
+                .ok()
+                .map(|file| Box::new(file) as Box<dyn LibraryFile>)
         } else {
             None
         }
@@ -132,7 +134,9 @@ impl LibraryFile for ElfLibraryRawFile {
         let parent = self.parent.as_ref()?;
         let sibling = parent.join(name);
         if sibling.is_file() {
-            ElfLibraryFile::open(sibling).ok().map(|file| Box::new(file) as Box<dyn LibraryFile>)
+            ElfLibraryFile::open(sibling)
+                .ok()
+                .map(|file| Box::new(file) as Box<dyn LibraryFile>)
         } else {
             None
         }

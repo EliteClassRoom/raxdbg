@@ -16,7 +16,6 @@
 //! `PT_LOAD` covering the base plus a `PT_PHDR` locating the table.
 
 use raxdbg_core::memory::{Memory, MemoryError, PAGE_SIZE};
-use raxdbg_core::pointer::Pointer;
 
 /// The auxv type tags raxdbg writes, from Linux's `elf.h`.
 ///
@@ -132,7 +131,7 @@ impl MainProgram {
         // header, rounded up to a page: the whole thing is one `PT_LOAD`.
         let phent: u64 = if is_64bit { 56 } else { 32 };
         let phnum: u64 = 2;
-        let size = (64 + phent * phnum).next_multiple_of(PAGE_SIZE as u64);
+        let size = (64 + phent * phnum).next_multiple_of(PAGE_SIZE);
 
         let base = memory.mmap2(
             MAIN_PROGRAM_BASE,
@@ -223,9 +222,9 @@ impl MainProgram {
             load.write_u64(8, 0)?; // p_offset
             load.write_u64(16, 0)?; // p_vaddr
             load.write_u64(24, 0)?; // p_paddr
-            load.write_u64(32, PAGE_SIZE as u64)?; // p_filesz
-            load.write_u64(40, PAGE_SIZE as u64)?; // p_memsz
-            load.write_u64(48, PAGE_SIZE as u64)?; // p_align
+            load.write_u64(32, PAGE_SIZE)?; // p_filesz
+            load.write_u64(40, PAGE_SIZE)?; // p_memsz
+            load.write_u64(48, PAGE_SIZE)?; // p_align
 
             // PT_PHDR tells a guest where the header table lives inside the
             // image, which is what `dl_phdr_info` reads to fill its
@@ -312,7 +311,7 @@ impl MainProgram {
             (tag::PHDR, self.phdr),
             (tag::PHENT, self.phent),
             (tag::PHNUM, self.phnum),
-            (tag::PAGESZ, PAGE_SIZE as u64),
+            (tag::PAGESZ, PAGE_SIZE),
             (tag::BASE, self.base),
             (tag::FLAGS, self.flags()),
             (tag::ENTRY, self.entry),
@@ -337,5 +336,5 @@ impl MainProgram {
 /// path consult. A loader without a main program still has to publish both,
 /// or the guest faults on its first instruction after `__libc_init`.
 pub fn baseline_entries(random: u64) -> Vec<(u64, u64)> {
-    vec![(tag::PAGESZ, PAGE_SIZE as u64), (tag::RANDOM, random)]
+    vec![(tag::PAGESZ, PAGE_SIZE), (tag::RANDOM, random)]
 }

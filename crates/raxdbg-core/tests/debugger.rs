@@ -7,8 +7,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use raxdbg_core::backend::{
     Backend, BackendError, BlockHook, CodeHook, ContextId, EventMemHook, GuestMemoryAccess, HookId,
@@ -98,10 +98,7 @@ impl TestBackend {
             return;
         };
         rec.callback.hook(self, address, size);
-        let was_deleted = self
-            .pending_deletions
-            .borrow()
-            .contains(&hook_id);
+        let was_deleted = self.pending_deletions.borrow().contains(&hook_id);
         self.pending_deletions.borrow_mut().clear();
         if !was_deleted {
             self.code_hooks.insert(hook_id, rec);
@@ -239,7 +236,7 @@ impl Backend for TestBackend {
     }
 
     fn mem_map(&mut self, addr: u64, size: u64, _perms: Prot) -> Result<(), BackendError> {
-        if addr % PAGE_SIZE != 0 || size == 0 {
+        if !addr.is_multiple_of(PAGE_SIZE) || size == 0 {
             return Err(BackendError::Map {
                 addr,
                 size,
@@ -360,11 +357,16 @@ impl Backend for TestBackend {
 // BreakPoint / BreakerImpl
 // ---------------------------------------------------------------------------
 
-fn harness() -> (
+/// The three handles a [`harness`] test drives: the backend as the trait
+/// object the core API takes, the concrete test backend behind it, and the
+/// breaker built on top of it.
+type Harness = (
     Rc<RefCell<dyn Backend>>,
     Rc<RefCell<TestBackend>>,
     Rc<RefCell<BreakerImpl>>,
-) {
+);
+
+fn harness() -> Harness {
     let backend = Rc::new(RefCell::new(TestBackend::new()));
     let backend_dyn: Rc<RefCell<dyn Backend>> = backend.clone();
     let breaker = Rc::new(RefCell::new(BreakerImpl::new(backend_dyn.clone())));
@@ -407,7 +409,10 @@ fn temporary_breakpoint_removes_itself_on_first_hit() {
 
     backend.borrow_mut().fire_code(hook_id, 0x2000, 4);
     assert_eq!(backend.borrow().emu_stop_count, 1);
-    assert!(backend.borrow().code_hooks.is_empty(), "temporary hook removed");
+    assert!(
+        backend.borrow().code_hooks.is_empty(),
+        "temporary hook removed"
+    );
     assert!(bp.temporary(), "handle still reports the temporary flag");
 }
 
@@ -415,9 +420,7 @@ fn temporary_breakpoint_removes_itself_on_first_hit() {
 fn breakpoint_callback_can_skip_the_hit() {
     let (_backend_dyn, backend, breaker) = harness();
     let callback: Box<dyn FnMut(u64) -> BreakControl> = Box::new(|_| BreakControl::Continue);
-    let _bp = breaker
-        .borrow_mut()
-        .add_break_point(0x3000, Some(callback));
+    let _bp = breaker.borrow_mut().add_break_point(0x3000, Some(callback));
 
     let hook_id = *backend.borrow().code_hooks.keys().next().unwrap();
     backend.borrow_mut().fire_code(hook_id, 0x3000, 4);
@@ -480,16 +483,18 @@ fn single_step_zero_clears_a_pending_step() {
 fn fast_debug_skips_the_callback_and_always_stops() {
     let (_backend_dyn, backend, breaker) = harness();
     let callback: Box<dyn FnMut(u64) -> BreakControl> = Box::new(|_| BreakControl::Continue);
-    let bp = breaker
-        .borrow_mut()
-        .add_break_point(0x5000, Some(callback));
+    let bp = breaker.borrow_mut().add_break_point(0x5000, Some(callback));
     bp.set_temporary(true);
 
     breaker.borrow_mut().set_fast_debug(true);
 
     let hook_id = *backend.borrow().code_hooks.keys().next().unwrap();
     backend.borrow_mut().fire_code(hook_id, 0x5000, 4);
-    assert_eq!(backend.borrow().emu_stop_count, 1, "fast-debug forces a stop");
+    assert_eq!(
+        backend.borrow().emu_stop_count,
+        1,
+        "fast-debug forces a stop"
+    );
     assert!(backend.borrow().code_hooks.is_empty());
     assert!(breaker.borrow().fast_debug());
 }
@@ -572,7 +577,10 @@ fn trace_code_stop_trace_clears_entries() {
     let (backend_dyn, backend, _breaker) = harness();
     let trace = Rc::new(TraceCode::new(Rc::new(NoopDisassembler)));
     let hook_id = trace.attach(&backend_dyn, 0, u64::MAX);
-    backend.borrow_mut().mem_map(0x6000, 0x1000, Prot::READ).unwrap();
+    backend
+        .borrow_mut()
+        .mem_map(0x6000, 0x1000, Prot::READ)
+        .unwrap();
     backend.borrow_mut().pc = 0x6000;
     backend.borrow_mut().fire_code(hook_id, 0x6000, 4);
     backend.borrow_mut().fire_code(hook_id, 0x6004, 4);
@@ -586,7 +594,10 @@ fn trace_code_works_with_the_noop_disassembler() {
     let (backend_dyn, backend, _breaker) = harness();
     let trace = Rc::new(TraceCode::new(Rc::new(NoopDisassembler)));
     let hook_id = trace.attach(&backend_dyn, 0, u64::MAX);
-    backend.borrow_mut().mem_map(0x8000, 0x1000, Prot::READ).unwrap();
+    backend
+        .borrow_mut()
+        .mem_map(0x8000, 0x1000, Prot::READ)
+        .unwrap();
     backend.borrow_mut().pc = 0x8000;
     backend.borrow_mut().fire_code(hook_id, 0x8000, 4);
     let entries = trace.entries();
@@ -602,7 +613,10 @@ fn trace_code_writes_lines_through_the_redirect() {
     trace.set_redirect(redirect);
 
     let hook_id = trace.attach(&backend_dyn, 0, u64::MAX);
-    backend.borrow_mut().mem_map(0x7000, 0x1000, Prot::READ).unwrap();
+    backend
+        .borrow_mut()
+        .mem_map(0x7000, 0x1000, Prot::READ)
+        .unwrap();
     backend.borrow_mut().pc = 0x7000;
     backend.borrow_mut().fire_code(hook_id, 0x7000, 4);
     backend.borrow_mut().fire_code(hook_id, 0x7004, 4);
@@ -622,7 +636,10 @@ fn trace_memory_collects_a_stores_value() {
     let trace = Rc::new(TraceMemory::new(true));
     let (read_id, write_id) = trace.attach(&backend_dyn, 0, u64::MAX);
 
-    backend.borrow_mut().mem_map(0x9000, 0x1000, Prot::READ).unwrap();
+    backend
+        .borrow_mut()
+        .mem_map(0x9000, 0x1000, Prot::READ)
+        .unwrap();
     backend.borrow_mut().pc = 0x1234;
 
     backend
@@ -641,9 +658,7 @@ fn trace_memory_collects_a_stores_value() {
         }
     );
 
-    backend
-        .borrow_mut()
-        .fire_read(read_id, 0x1238, 0x9000, 4);
+    backend.borrow_mut().fire_read(read_id, 0x1238, 0x9000, 4);
     let reads = trace.reads();
     assert_eq!(reads.len(), 1);
     assert_eq!(reads[0].pc, 0x1238);
@@ -657,7 +672,10 @@ fn trace_memory_stop_trace_clears_entries() {
     let (backend_dyn, backend, _breaker) = harness();
     let trace = Rc::new(TraceMemory::new(true));
     let (_r, w) = trace.attach(&backend_dyn, 0, u64::MAX);
-    backend.borrow_mut().mem_map(0xb000, 0x1000, Prot::READ).unwrap();
+    backend
+        .borrow_mut()
+        .mem_map(0xb000, 0x1000, Prot::READ)
+        .unwrap();
     backend.borrow_mut().fire_write(w, 0, 0xb000, 4, 1);
     backend.borrow_mut().fire_write(w, 0, 0xb004, 4, 2);
     assert_eq!(trace.writes().len(), 2);
@@ -678,7 +696,10 @@ fn a_streaming_code_trace_streams_without_collecting() {
     trace.set_collect(false);
 
     let hook_id = trace.attach(&backend_dyn, 0, u64::MAX);
-    backend.borrow_mut().mem_map(0x7000, 0x1000, Prot::READ).unwrap();
+    backend
+        .borrow_mut()
+        .mem_map(0x7000, 0x1000, Prot::READ)
+        .unwrap();
     backend.borrow_mut().pc = 0x7000;
     backend.borrow_mut().fire_code(hook_id, 0x7000, 4);
     backend.borrow_mut().fire_code(hook_id, 0x7004, 4);
@@ -699,7 +720,10 @@ fn a_streaming_memory_trace_streams_without_collecting() {
     trace.set_collect(false);
 
     let (read_id, _write_id) = trace.attach(&backend_dyn, 0, u64::MAX);
-    backend.borrow_mut().mem_map(0x9000, 0x1000, Prot::READ).unwrap();
+    backend
+        .borrow_mut()
+        .mem_map(0x9000, 0x1000, Prot::READ)
+        .unwrap();
     backend.borrow_mut().fire_read(read_id, 0x1238, 0x9000, 4);
 
     assert!(trace.reads().is_empty());
@@ -978,4 +1002,3 @@ fn a_thumb_blx_register_reports_the_call() {
     );
     assert_eq!(harness.hook.count(), 1);
 }
-

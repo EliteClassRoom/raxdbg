@@ -182,9 +182,9 @@ impl Module {
         if offset == 0 {
             return None;
         }
-        let position = self.by_address.partition_point(|index| {
-            self.symbols[*index].value <= offset
-        });
+        let position = self
+            .by_address
+            .partition_point(|index| self.symbols[*index].value <= offset);
         let best = position.checked_sub(1).map(|index| self.by_address[index]);
         // A module with no entry point sits at `entry_point == 0`, so the
         // synthetic "start" symbol would land exactly on its base and hide
@@ -225,9 +225,7 @@ impl Module {
             .iter()
             .filter(|(_, entry)| **entry <= address)
             .max_by_key(|(name, entry)| (**entry, (*name).clone()))
-            .map(|(name, entry)| {
-                Symbol::new(name.clone(), *entry, 0, Some(self.name.clone()))
-            })
+            .map(|(name, entry)| Symbol::new(name.clone(), *entry, 0, Some(self.name.clone())))
     }
 
     /// Every defined symbol this module exports.
@@ -344,7 +342,9 @@ mod tests {
             ),
         );
 
-        let symbol = module.relocation_symbol(0x2000).expect("the slot names printf");
+        let symbol = module
+            .relocation_symbol(0x2000)
+            .expect("the slot names printf");
         assert_eq!(symbol.name, "printf");
         assert_eq!(symbol.module.as_deref(), Some("libc.so"));
         // The address is the slot, not the callee: only the name and the

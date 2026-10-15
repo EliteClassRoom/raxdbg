@@ -105,11 +105,7 @@ pub trait Breaker {
     ///
     /// `callback == None` means "always stop, no user hook", matching
     /// unidbg's `addBreakPoint(long)` without a callback.
-    fn add_break_point(
-        &mut self,
-        address: u64,
-        callback: Option<BreakCallback>,
-    ) -> BreakPoint;
+    fn add_break_point(&mut self, address: u64, callback: Option<BreakCallback>) -> BreakPoint;
 
     /// Removes a breakpoint previously installed at `address` (thumb-stripped).
     /// Returns `true` if a hook was actually removed.
@@ -250,11 +246,7 @@ impl crate::backend::CodeHook for SingleStepHook {
 }
 
 impl Breaker for BreakerImpl {
-    fn add_break_point(
-        &mut self,
-        address: u64,
-        callback: Option<BreakCallback>,
-    ) -> BreakPoint {
+    fn add_break_point(&mut self, address: u64, callback: Option<BreakCallback>) -> BreakPoint {
         let thumb = (address & 1) != 0;
         let aligned = address & !1;
 

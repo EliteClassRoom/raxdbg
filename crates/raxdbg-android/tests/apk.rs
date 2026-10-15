@@ -13,11 +13,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zip::write::SimpleFileOptions;
 use zip::CompressionMethod;
+use zip::write::SimpleFileOptions;
 // `Apk` is in scope for trait method dispatch through `Box<dyn Apk>`.
 #[allow(unused_imports)]
-use raxdbg_android::apk::{open, Apk, ApkError};
+use raxdbg_android::apk::{Apk, ApkError, open};
 // ---------------------------------------------------------------------------
 // Synthetic AXML builders (round-trippable through the real parser)
 // ---------------------------------------------------------------------------
@@ -110,11 +110,7 @@ fn build_start_tag(name_idx: u32, attrs: &[(u32, u32, u32)]) -> Vec<u8> {
     out
 }
 
-fn build_synthetic_axml(
-    package: &str,
-    version_code: i64,
-    version_name: &str,
-) -> Vec<u8> {
+fn build_synthetic_axml(package: &str, version_code: i64, version_name: &str) -> Vec<u8> {
     // Pool layout:
     //     0 = ""            1 = "manifest"           2 = "package"
     //     3 = package str   4 = "versionCode"        5 = version_code str
@@ -167,7 +163,8 @@ fn write_synthetic_apk(path: &Path, manifest_axml: &[u8]) {
     let mut zip = zip::ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
 
-    zip.start_file("AndroidManifest.xml", opts).expect("start manifest");
+    zip.start_file("AndroidManifest.xml", opts)
+        .expect("start manifest");
     zip.write_all(manifest_axml).expect("write manifest");
 
     let libso = b"\x7fELF placeholder for libjnitest.so\x00";
@@ -180,11 +177,13 @@ fn write_synthetic_apk(path: &Path, manifest_axml: &[u8]) {
     zip.write_all(asset).expect("write asset");
 
     let cert = b"\x30\x82\x01\x00this-is-not-a-real-cert\x00";
-    zip.start_file("META-INF/CERT.RSA", opts).expect("start sig");
+    zip.start_file("META-INF/CERT.RSA", opts)
+        .expect("start sig");
     zip.write_all(cert).expect("write sig");
 
     // Add a sibling EC entry to make sure get_signatures pulls multiple.
-    zip.start_file("META-INF/IGNORED.TXT", opts).expect("start ignored");
+    zip.start_file("META-INF/IGNORED.TXT", opts)
+        .expect("start ignored");
     zip.write_all(b"not a signature").expect("write ignored");
     zip.start_file("META-INF/CERT.EC", opts).expect("start ec");
     zip.write_all(b"\x30\xec-cert\x00").expect("write ec");
@@ -298,7 +297,11 @@ fn apk_dir_text_manifest() {
     )
     .unwrap();
     fs::write(dir.join("assets/bar.bin"), b"text-dir-asset").unwrap();
-    fs::write(dir.join("META-INF/CERT.DSA"), b"\x30\x82\xd0\x01\x00\x00cert").unwrap();
+    fs::write(
+        dir.join("META-INF/CERT.DSA"),
+        b"\x30\x82\xd0\x01\x00\x00cert",
+    )
+    .unwrap();
 
     let apk = open(&dir).expect("open dir");
     assert_eq!(apk.package_name(), "com.raxdbg.textdir");

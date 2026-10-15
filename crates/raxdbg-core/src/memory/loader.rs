@@ -86,7 +86,10 @@ impl std::fmt::Debug for Loader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Loader")
             .field("pointer_size", &self.pointer_size)
-            .field("mmap_base", &format_args!("{:#x}", self.mmap_base_address.get()))
+            .field(
+                "mmap_base",
+                &format_args!("{:#x}", self.mmap_base_address.get()),
+            )
             .field("brk", &format_args!("{:#x}", self.brk.get()))
             .field("sp", &format_args!("{:#x}", self.sp.get()))
             .field("regions", &self.memory_map.borrow().len())
@@ -300,7 +303,7 @@ impl Loader {
             return Ok(ret);
         }
         if fd > 0 {
-            if start % self.page_size != 0 {
+            if !start.is_multiple_of(self.page_size) {
                 return Ok(MAP_FAILED);
             }
             let end = start + length as u64;
@@ -348,7 +351,11 @@ impl Loader {
             if start + aligned < segment.end() {
                 memory_map.insert(
                     start + aligned,
-                    MemoryMap::new(start + aligned, segment.end() - start - aligned, segment.prot),
+                    MemoryMap::new(
+                        start + aligned,
+                        segment.end() - start - aligned,
+                        segment.prot,
+                    ),
                 );
             }
             memory_map.insert(
@@ -399,7 +406,7 @@ impl Loader {
         length: usize,
         prot: Prot,
     ) -> Result<i32, MemoryError> {
-        if address % self.page_size != 0 {
+        if !address.is_multiple_of(self.page_size) {
             self.set_errno(crate::errno::EINVAL);
             return Ok(-1);
         }
@@ -425,7 +432,10 @@ impl Loader {
             if address <= map.base && prot_end >= map_end {
                 memory_map.insert(map.base, MemoryMap::new(map.base, map.size, prot));
             } else if address <= map.base {
-                memory_map.insert(map.base, MemoryMap::new(map.base, prot_end - map.base, prot));
+                memory_map.insert(
+                    map.base,
+                    MemoryMap::new(map.base, prot_end - map.base, prot),
+                );
                 memory_map.insert(
                     prot_end,
                     MemoryMap::new(prot_end, map_end - prot_end, map.prot),
@@ -459,7 +469,7 @@ impl Loader {
             self.brk.set(HEAP_BASE);
             return Ok(HEAP_BASE);
         }
-        if address % self.page_size != 0 {
+        if !address.is_multiple_of(self.page_size) {
             return Err(MemoryError::Message(format!(
                 "brk address {address:#x} is not page-aligned"
             )));
@@ -527,7 +537,6 @@ impl Loader {
             pointer,
         })
     }
-
 }
 
 impl Memory for Loader {

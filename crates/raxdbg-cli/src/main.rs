@@ -18,7 +18,6 @@ use raxdbg_core::backend::{Backend, RunError};
 use raxdbg_core::debug::{
     FunctionCall, FunctionCallListener, TraceCode, TraceFunctionCall, TraceMemory,
 };
-use raxdbg_core::memory::Memory;
 use raxdbg_core::reg::RegId;
 use raxdbg_core::unwind::{NoSymbols, SymbolResolver, Unwinder};
 
@@ -210,7 +209,10 @@ fn run_jni_on_load(
             return outcome;
         }
         let slots: Vec<String> = missing.iter().map(|slot| slot.to_string()).collect();
-        format!("{outcome}\n  JNI functions this port lacks: slot {}", slots.join(", "))
+        format!(
+            "{outcome}\n  JNI functions this port lacks: slot {}",
+            slots.join(", ")
+        )
     };
     // Pick the module by what it actually exports rather than by guessing
     // from the file name: the loader records a library under its SONAME,
@@ -238,26 +240,31 @@ fn run_jni_on_load(
     // the time the JVM calls in. `Vm::call_jni_on_load` would run them too, but
     // its own marker is a log line, and this stream is the one a reader has.
     if let Err(error) = emulator.loader().call_constructors(&module) {
-        return Some(report(format!("{}: {error}", display_name(&emulator.loader(), &module))));
+        return Some(report(format!(
+            "{}: {error}",
+            display_name(emulator.loader(), &module)
+        )));
     }
     if let Some(symbol) = emulator.loader().find_symbol(&module, "JNI_OnLoad") {
         sink.line(&format!("[{module}] JNI_OnLoad 0x{:x}", symbol.address));
     }
     match Vm::call_jni_on_load(emulator, &vm, &module) {
         Ok(version) => {
-            let shown = display_name(&emulator.loader(), &module);
-            Some(report(format!("{shown} returned 0x{version:x} (JNI version)")))
+            let shown = display_name(emulator.loader(), &module);
+            Some(report(format!(
+                "{shown} returned 0x{version:x} (JNI version)"
+            )))
         }
-        Err(error) => Some(report(format!("{}: {error}", display_name(&emulator.loader(), &module)))),
+        Err(error) => Some(report(format!(
+            "{}: {error}",
+            display_name(emulator.loader(), &module)
+        ))),
     }
 }
 
 /// Boots an emulator for `library`, loads it, and returns the emulator with
 /// the name the library was loaded under.
-fn boot(
-    options: &Options,
-    library: &str,
-) -> Result<(Rc<AndroidEmulator>, String), String> {
+fn boot(options: &Options, library: &str) -> Result<(Rc<AndroidEmulator>, String), String> {
     let emulator = boot_traced(options, library)?;
     let name = load_into(&emulator, library)?;
     Ok((emulator, name))
@@ -407,7 +414,10 @@ fn info(options: &Options, library: &str) -> Result<(), String> {
         }
         let unresolved = loader.unresolved_relocations(&module.name);
         if !unresolved.is_empty() {
-            println!("  unresolved relocations ({}): {unresolved:?}", unresolved.len());
+            println!(
+                "  unresolved relocations ({}): {unresolved:?}",
+                unresolved.len()
+            );
         }
     }
     Ok(())
@@ -441,7 +451,10 @@ fn execute(options: &Options, library: &str) -> Result<(), String> {
             // end of a run, not a failure, and reporting it as an error
             // would say the emulation broke when it worked.
             let outcome = match emulator.call_function(address, &options.call_arguments) {
-                Ok(value) => Some(format!("{name}() = 0x{value:x} ({value})", name = call.name)),
+                Ok(value) => Some(format!(
+                    "{name}() = 0x{value:x} ({value})",
+                    name = call.name
+                )),
                 Err(EmulatorError::Run(RunError::StopEmulator)) => {
                     Some(format!("{}() called exit()", call.name))
                 }
@@ -464,7 +477,7 @@ fn execute(options: &Options, library: &str) -> Result<(), String> {
                 .set_init_function_listener(Rc::new(PhaseLog { out: sink.clone() }));
             // The trace is installed before the call, so the constructors,
             // `JNI_OnLoad` and everything it reaches are inside it.
-            let trace = Trace::attach(options, &emulator, &module_name, Some(sink.clone()))?;
+            let trace = Trace::attach(options, &emulator, module_name, Some(sink.clone()))?;
             let outcome = run_jni_on_load(&emulator, library, &sink);
             if let Some(trace) = trace {
                 trace.report();
@@ -524,9 +537,10 @@ fn resolve_callable(emulator: &Rc<AndroidEmulator>, call: &options::Call) -> Res
 /// Where a trace's lines go: `--out <file>`, or the terminal.
 fn trace_writer(options: &Options) -> Result<Box<dyn Write + Send>, String> {
     match &options.out {
-        Some(path) => Ok(Box::new(BufWriter::new(File::create(path).map_err(
-            |error| format!("cannot write {}: {error}", path.display()),
-        )?))),
+        Some(path) => Ok(Box::new(BufWriter::new(
+            File::create(path)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?,
+        ))),
         None => Ok(Box::new(std::io::stdout())),
     }
 }
@@ -539,13 +553,17 @@ struct Trace {
 }
 
 enum TraceHook {
-    Code { hook: TraceCode },
+    Code {
+        hook: TraceCode,
+    },
     Memory {
         hook: TraceMemory,
         reads: bool,
         writes: bool,
     },
-    Functions { hook: TraceFunctionCall },
+    Functions {
+        hook: TraceFunctionCall,
+    },
 }
 
 impl Trace {
@@ -616,15 +634,17 @@ impl Trace {
     }
 
     fn report(&self) {
-        let streamed = self.redirect.as_ref().map(|path| path.display().to_string());
+        let streamed = self
+            .redirect
+            .as_ref()
+            .map(|path| path.display().to_string());
         match &self.hook {
             TraceHook::Code { hook } => {
                 hook.flush();
                 match &streamed {
-                    Some(path) => println!(
-                        "-- {} instructions (written to {path}) --",
-                        hook.count()
-                    ),
+                    Some(path) => {
+                        println!("-- {} instructions (written to {path}) --", hook.count())
+                    }
                     None => {
                         let entries = hook.entries();
                         println!("-- {} instructions --", entries.len());
@@ -695,9 +715,11 @@ impl TraceSink {
     /// The sink a run's `--out` names, else the terminal.
     fn new(options: &Options) -> Result<Self, String> {
         let out: Box<dyn Write> = match &options.out {
-            Some(path) => Box::new(BufWriter::new(File::create(path).map_err(
-                |error| format!("cannot write {}: {error}", path.display()),
-            )?)),
+            Some(path) => {
+                Box::new(BufWriter::new(File::create(path).map_err(|error| {
+                    format!("cannot write {}: {error}", path.display())
+                })?))
+            }
             None => Box::new(std::io::stdout()),
         };
         Ok(TraceSink(Rc::new(RefCell::new(out))))
@@ -768,10 +790,11 @@ fn at(loader: &raxdbg_android::elf::AndroidElfLoader, address: u64) -> String {
     // span is page-aligned around its exports and can cover it -- so an SVC
     // address is checked before the module table, or every JNI call would be
     // attributed to whichever stub module happens to sit next to it.
-    if let Some(svc) = loader.svc_memory() {
-        if address >= svc.base() && address < svc.base() + svc.size() {
-            return "-".to_string();
-        }
+    if let Some(svc) = loader.svc_memory()
+        && address >= svc.base()
+        && address < svc.base() + svc.size()
+    {
+        return "-".to_string();
     }
     match loader.find_module_by_address(address) {
         Some(info) => format!(
@@ -816,12 +839,12 @@ fn stub_name(label: &str) -> &str {
 fn name_caller(loader: &raxdbg_android::elf::AndroidElfLoader, address: u64) -> String {
     // A branch inside a host service has no ELF symbol either, but the stub
     // page still knows which service it is in.
-    if let Some(svc) = loader.svc_memory() {
-        if let Some(region) = svc.find_region(address) {
-            let name = stub_name(&region.label);
-            if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-                return format!("{name}+0x{:x}", address.wrapping_sub(region.begin));
-            }
+    if let Some(svc) = loader.svc_memory()
+        && let Some(region) = svc.find_region(address)
+    {
+        let name = stub_name(&region.label);
+        if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+            return format!("{name}+0x{:x}", address.wrapping_sub(region.begin));
         }
     }
     // A branch the symbol table does not name is a branch in a stripped
@@ -859,32 +882,30 @@ fn name_callee(
     // the label is the function's real name: `GetJavaVM`, `AAsset_close`.
     // This comes before the module lookup because a stub can fall inside a
     // virtual module's page-aligned span and be misattributed to it.
-    if let Some(svc) = loader.svc_memory() {
-        if let Some(region) = svc.find_region(address) {
-            // `JNIEnv!FindClass` / `JavaVM!GetEnv`: the table a stub belongs to
-            // is what tells the two apart, since both have the same shape.
-            let name = stub_name(&region.label);
-            if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-                return name.to_string();
-            }
+    if let Some(svc) = loader.svc_memory()
+        && let Some(region) = svc.find_region(address)
+    {
+        // `JNIEnv!FindClass` / `JavaVM!GetEnv`: the table a stub belongs to
+        // is what tells the two apart, since both have the same shape.
+        let name = stub_name(&region.label);
+        if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+            return name.to_string();
         }
     }
-    if let Some(symbol) = loader.find_closest_symbol(address) {
-        if symbol.address == address {
-            if let Some(module) = &symbol.module {
-                return format!("{}!{}", display_name(loader, module), symbol.name);
-            }
-        }
+    if let Some(symbol) = loader.find_closest_symbol(address)
+        && symbol.address == address
+        && let Some(module) = &symbol.module
+    {
+        return format!("{}!{}", display_name(loader, module), symbol.name);
     }
-    if is_64bit {
-        if let Some(slot) = plt_got_slot(backend, address) {
-            if let Some(symbol) = loader.relocation_symbol(slot) {
-                return match &symbol.module {
-                    Some(module) => format!("{}!{}", display_name(loader, module), symbol.name),
-                    None => symbol.name,
-                };
-            }
-        }
+    if is_64bit
+        && let Some(slot) = plt_got_slot(backend, address)
+        && let Some(symbol) = loader.relocation_symbol(slot)
+    {
+        return match &symbol.module {
+            Some(module) => format!("{}!{}", display_name(loader, module), symbol.name),
+            None => symbol.name,
+        };
     }
     // Nothing named it: the address column already carries the RVA, so say
     // only that there is no name here rather than repeating the offset.
@@ -901,7 +922,8 @@ fn plt_got_slot(backend: &mut dyn Backend, address: u64) -> Option<u64> {
     if bytes.len() != 16 {
         return None;
     }
-    let word = |index: usize| u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+    let word =
+        |index: usize| u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
     let adrp = word(0);
     let ldr = word(1);
     let br = word(3);
@@ -930,15 +952,6 @@ fn sign_extend(value: u32, bits: u32) -> u64 {
 fn report_leaks(emulator: &Rc<AndroidEmulator>, tracker: &Rc<MemoryTracker>) {
     let allocations = tracker.allocations();
     println!("-- {} live allocation(s) --", allocations.len());
-    let unwinder = Unwinder::new(
-        Rc::clone(emulator.backend()),
-        emulator.memory().clone(),
-        emulator.is_64bit(),
-        Rc::new(ModuleSymbols {
-            loader: Rc::clone(emulator.loader()),
-        }),
-        emulator.trap_address(),
-    );
     for record in allocations {
         println!(
             "0x{:x} size 0x{:x} prot {}",
@@ -1013,7 +1026,10 @@ impl SymbolResolver for ModuleSymbols {
 /// The register names the console prints, in the order unidbg's `show_regs` does.
 pub fn register_names(is_64bit: bool) -> Vec<RegId> {
     if is_64bit {
-        (0..31).map(RegId::X).chain([RegId::Sp, RegId::Pc]).collect()
+        (0..31)
+            .map(RegId::X)
+            .chain([RegId::Sp, RegId::Pc])
+            .collect()
     } else {
         (0..13)
             .map(RegId::R)

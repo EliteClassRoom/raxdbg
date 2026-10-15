@@ -15,8 +15,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use raxdbg_core::backend::{Backend, RunError};
-use raxdbg_core::memory::{Memory, MemoryError};
 use raxdbg_core::memory::loader::Loader;
+use raxdbg_core::memory::{Memory, MemoryError};
 use raxdbg_core::svc::{Svc, SvcKind, SvcMemory};
 use raxdbg_core::thread::ThreadDispatcher;
 
@@ -117,17 +117,17 @@ impl ThreadRuntime {
 
     /// The thread-stack indices this runtime has taken out.
     pub fn allocated_indices(&self) -> Vec<usize> {
-        self.allocated.borrow().iter().map(|(index, _)| *index).collect()
+        self.allocated
+            .borrow()
+            .iter()
+            .map(|(index, _)| *index)
+            .collect()
     }
 
     /// The guest's pointer size, which is how far apart the entry code's two
     /// operands sit on a thread's stack.
     pub fn word_size(&self) -> u64 {
-        if self.is_64bit {
-            8
-        } else {
-            4
-        }
+        if self.is_64bit { 8 } else { 4 }
     }
 
     /// A dispatcher whose tasks return through this runtime's exit stub, with
@@ -183,20 +183,14 @@ impl ThreadRuntime {
                 raxdbg_core::reg::RegId::C13C0_3
             };
             let pointer = emulator.backend().borrow().reg_read(register).unwrap_or(0);
-            if pointer == 0 {
-                block
-            } else {
-                pointer
-            }
+            if pointer == 0 { block } else { pointer }
         };
         // A fresh node links after the head: `next` is whatever followed it,
         // `prev` is the head, and the head's `next` is this node.
         let following = memory.pointer(head).read_pointer(0).unwrap_or(0);
         pointer.write_pointer(0, following)?;
         pointer.write_pointer(word, head)?;
-        memory
-            .pointer(block + word * 2)
-            .write_u32(0, tid as u32)?;
+        memory.pointer(block + word * 2).write_u32(0, tid as u32)?;
         memory.pointer(head).write_pointer(0, block)?;
         if following != 0 {
             memory.pointer(following).write_pointer(word, block)?;

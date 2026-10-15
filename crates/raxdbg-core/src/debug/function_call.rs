@@ -91,7 +91,9 @@ impl TraceFunctionCall {
         let hook = TraceFunctionCallHook {
             inner: self.inner.clone(),
         };
-        backend.borrow_mut().hook_add_code(Box::new(hook), begin, end)
+        backend
+            .borrow_mut()
+            .hook_add_code(Box::new(hook), begin, end)
     }
 }
 
@@ -185,11 +187,20 @@ fn decode_arm(backend: &mut dyn Backend, address: u64) -> Option<u64> {
     let word = read_word32(backend, address)?;
     if word & 0x0F00_0000 == 0x0B00_0000 {
         // BL: imm24, scaled by 4, relative to `address + 8`.
-        Some(address.wrapping_add(8).wrapping_add(sign_extend(word & 0x00FF_FFFF, 24) << 2))
+        Some(
+            address
+                .wrapping_add(8)
+                .wrapping_add(sign_extend(word & 0x00FF_FFFF, 24) << 2),
+        )
     } else if word & 0xFE00_0000 == 0xFA00_0000 {
         // BLX (immediate): imm24H:imm24L, scaled by 2, halfword-aligned.
         let imm: u32 = ((word & 0x00FF_FFFF) << 1) | ((word >> 24) & 1);
-        Some(address.wrapping_add(8).wrapping_add(sign_extend(imm, 25) << 1) & !1)
+        Some(
+            address
+                .wrapping_add(8)
+                .wrapping_add(sign_extend(imm, 25) << 1)
+                & !1,
+        )
     } else if word & 0x0FFF_FFF0 == 0x012F_FF30 {
         // BLX Rm: the target is in Rm (bits 3:0), whose low bit selects the
         // state. unidbg's `ARM_BL_REG_MASK = ~0xf000000f`.
@@ -215,12 +226,20 @@ fn decode_thumb(backend: &mut dyn Backend, address: u64) -> Option<u64> {
             let i2 = !(j2 ^ s) & 1;
             let imm10 = u32::from(h1 & 0x3FF);
             return Some(if (h2 >> 12) & 1 == 1 {
-                let imm32 = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (u32::from(h2 & 0x7FF) << 1);
+                let imm32 = (s << 24)
+                    | (i1 << 23)
+                    | (i2 << 22)
+                    | (imm10 << 12)
+                    | (u32::from(h2 & 0x7FF) << 1);
                 address.wrapping_add(4).wrapping_add(sign_extend(imm32, 25))
             } else {
                 // BLX (T2) targets a word-aligned address, so the halfword
                 // offset is dropped and the base is aligned down.
-                let imm32 = (s << 24) | (i1 << 23) | (i2 << 22) | (imm10 << 12) | (u32::from(h2 & 0x7FE) << 1);
+                let imm32 = (s << 24)
+                    | (i1 << 23)
+                    | (i2 << 22)
+                    | (imm10 << 12)
+                    | (u32::from(h2 & 0x7FE) << 1);
                 (address.wrapping_add(4) & !3).wrapping_add(sign_extend(imm32, 25))
             });
         }

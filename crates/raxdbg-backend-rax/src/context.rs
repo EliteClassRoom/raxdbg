@@ -132,6 +132,11 @@ impl Arm32Context {
 }
 
 /// A saved CPU context.
+// The snapshots are held inline: `CpuContext::save` runs on every context save
+// (thread switch, breakpoint hit) and `restore` on every resume, so a boxed
+// variant would allocate on each of those. The memory a box would save is
+// smaller than the copies this enum already makes on save.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CpuContext {
     /// An AArch64 EL0 snapshot.

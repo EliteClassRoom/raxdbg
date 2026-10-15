@@ -120,7 +120,8 @@ impl Arm64Memory for RaxMemory {
             .space()
             .write(addr, data)
             .map_err(|fault| to_arm64_error(fault, data.len()))?;
-        self.shared.dispatch_write(addr, data.len(), stored_value(data));
+        self.shared
+            .dispatch_write(addr, data.len(), stored_value(data));
         Ok(())
     }
 
@@ -217,7 +218,8 @@ impl RaxArm32Memory {
             .space()
             .write(addr64, data)
             .map_err(|fault| self.failed(fault))?;
-        self.shared.dispatch_write(addr64, data.len(), stored_value(data));
+        self.shared
+            .dispatch_write(addr64, data.len(), stored_value(data));
         Ok(())
     }
 }

@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use raxdbg_android::android_file::ElfLibraryFile;
 use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder};
-use raxdbg_core::backend::{Backend, Prot};
+use raxdbg_core::backend::Prot;
 use raxdbg_core::reg::RegId;
 
 fn workspace_path(relative: &str) -> std::path::PathBuf {
@@ -102,9 +102,7 @@ fn the_guest_reads_the_thread_pointer_through_cp15() {
         .expect("write TPIDRURO");
     // `mrc p15, 0, r0, c13, c0, 3` then `bx lr`.
     let code = [0xee1d_0f70u32, 0xe12f_ff1e];
-    let address = emulator
-        .memory()
-        .allocate_map_address(0x1000, 0x1000);
+    let address = emulator.memory().allocate_map_address(0x1000, 0x1000);
     {
         let mut backend = emulator.backend().borrow_mut();
         backend
@@ -129,12 +127,18 @@ fn the_arm32_fixture_loads_and_its_symbols_resolve() {
     load_fixture(&emulator, "libctest.so");
     for symbol in ["hello", "pid", "counter", "tls_diff", "clock_now"] {
         assert!(
-            emulator.loader().find_symbol("libctest.so", symbol).is_some(),
+            emulator
+                .loader()
+                .find_symbol("libctest.so", symbol)
+                .is_some(),
             "{symbol} is exported"
         );
     }
     assert!(
-        emulator.loader().unresolved_relocations("libctest.so").is_empty(),
+        emulator
+            .loader()
+            .unresolved_relocations("libctest.so")
+            .is_empty(),
         "unresolved: {:?}",
         emulator.loader().unresolved_relocations("libctest.so")
     );
@@ -170,9 +174,7 @@ fn an_arm32_syscall_reaches_the_handler_through_r7() {
     // `mov r7, #20` (getpid) ; `svc #0` ; `bx lr` — the syscall number comes
     // from r7, not x8, and the result must land in r0.
     let code = [0xe3a0_7014u32, 0xef00_0000, 0xe12f_ff1e];
-    let address = emulator
-        .memory()
-        .allocate_map_address(0x1000, 0x1000);
+    let address = emulator.memory().allocate_map_address(0x1000, 0x1000);
     {
         let mut backend = emulator.backend().borrow_mut();
         backend
@@ -195,8 +197,13 @@ fn an_arm32_malloc_round_trip_through_bionic() {
         .loader()
         .find_symbol("libc.so", "malloc")
         .expect("malloc");
-    let free = emulator.loader().find_symbol("libc.so", "free").expect("free");
-    let block = emulator.call_function(malloc.address, &[1024]).expect("malloc");
+    let free = emulator
+        .loader()
+        .find_symbol("libc.so", "free")
+        .expect("free");
+    let block = emulator
+        .call_function(malloc.address, &[1024])
+        .expect("malloc");
     assert_ne!(block, 0, "malloc returned a pointer");
     emulator
         .call_function(free.address, &[block])
@@ -225,11 +232,25 @@ fn the_kuser_calls_answer_and_set_tls_moves_the_thread_pointer() {
     // and the guest has to be in the state its instructions are written in.
     let page = emulator
         .memory()
-        .mmap2_impl(0, 0x1000, raxdbg_core::backend::Prot::from_bits(0x3), 0x22, -1, 0)
+        .mmap2_impl(
+            0,
+            0x1000,
+            raxdbg_core::backend::Prot::from_bits(0x3),
+            0x22,
+            -1,
+            0,
+        )
         .expect("page");
     let code = emulator
         .memory()
-        .mmap2_impl(0, 0x1000, raxdbg_core::backend::Prot::from_bits(0x5), 0x22, -1, 0)
+        .mmap2_impl(
+            0,
+            0x1000,
+            raxdbg_core::backend::Prot::from_bits(0x5),
+            0x22,
+            -1,
+            0,
+        )
         .expect("code page");
 
     // The thread pointer is loaded from memory rather than built with an
@@ -250,7 +271,7 @@ fn the_kuser_calls_answer_and_set_tls_moves_the_thread_pointer() {
     emulator
         .memory()
         .pointer(code + 4)
-        .write_u32(0, 0xef00_0000 | 0x00f0_005) // svc #0xf0005
+        .write_u32(0, 0xef00_0000 | 0x000f_0005) // svc #0xf0005
         .expect("svc");
     emulator
         .memory()

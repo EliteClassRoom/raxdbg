@@ -8,7 +8,6 @@
 use std::rc::Rc;
 
 use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder};
-use raxdbg_core::backend::Backend;
 use raxdbg_core::memory::Memory;
 use raxdbg_core::reg::RegId;
 
@@ -75,9 +74,14 @@ fn malloc_and_free_work_through_the_guest_libc() {
         .loader()
         .find_symbol("libc.so", "malloc")
         .expect("malloc");
-    let free = emulator.loader().find_symbol("libc.so", "free").expect("free");
+    let free = emulator
+        .loader()
+        .find_symbol("libc.so", "free")
+        .expect("free");
 
-    let block = emulator.call_function(malloc.address, &[1024]).expect("malloc(1024)");
+    let block = emulator
+        .call_function(malloc.address, &[1024])
+        .expect("malloc(1024)");
     assert_ne!(block, 0, "malloc returned a pointer");
     let region = emulator.memory().region_at(block);
     assert!(
@@ -97,7 +101,9 @@ fn malloc_and_free_work_through_the_guest_libc() {
 
     // bionic's `free` returns void, so x0 afterwards is whatever the last
     // call left there; what matters is that the call completes.
-    emulator.call_function(free.address, &[block]).expect("free");
+    emulator
+        .call_function(free.address, &[block])
+        .expect("free");
 }
 
 #[test]
@@ -123,12 +129,18 @@ fn printf_writes_into_the_captured_stdout() {
         .find_symbol("libc.so", "printf")
         .expect("printf");
 
-    let format = emulator.memory().write_stack_string("hello %d\n").expect("format");
+    let format = emulator
+        .memory()
+        .write_stack_string("hello %d\n")
+        .expect("format");
     let result = emulator
         .call_function(printf.address, &[format.peer(), 42])
         .expect("printf");
 
-    assert_eq!(result, 9, "printf returns the byte count it wrote (\"hello 42\\n\")");
+    assert_eq!(
+        result, 9,
+        "printf returns the byte count it wrote (\"hello 42\\n\")"
+    );
     assert_eq!(emulator.stdout().contents(), "hello 42\n");
 }
 
@@ -139,9 +151,14 @@ fn string_and_memory_functions_answer() {
         .loader()
         .find_symbol("libc.so", "strlen")
         .expect("strlen");
-    let text = emulator.memory().write_stack_string("raxdbg").expect("text");
+    let text = emulator
+        .memory()
+        .write_stack_string("raxdbg")
+        .expect("text");
     assert_eq!(
-        emulator.call_function(strlen.address, &[text.peer()]).expect("strlen"),
+        emulator
+            .call_function(strlen.address, &[text.peer()])
+            .expect("strlen"),
         6
     );
 
@@ -149,7 +166,10 @@ fn string_and_memory_functions_answer() {
         .loader()
         .find_symbol("libc.so", "memcpy")
         .expect("memcpy");
-    let source = emulator.memory().write_stack_string("copy me").expect("source");
+    let source = emulator
+        .memory()
+        .write_stack_string("copy me")
+        .expect("source");
     let destination = emulator.memory().allocate_stack(16).expect("destination");
     let result = emulator
         .call_function(memcpy.address, &[destination.peer(), source.peer(), 8])
@@ -230,7 +250,10 @@ fn dlopen_and_dlsym_reach_libm() {
     let dlopen = emulator.loader().dlsym(0, "dlopen").expect("dlopen");
     let dlsym = emulator.loader().dlsym(0, "dlsym").expect("dlsym");
 
-    let name = emulator.memory().write_stack_string("libm.so").expect("name");
+    let name = emulator
+        .memory()
+        .write_stack_string("libm.so")
+        .expect("name");
     let handle = emulator
         .call_function(dlopen.address, &[name.peer(), 2])
         .expect("dlopen(libm.so)");
@@ -314,11 +337,7 @@ fn the_auxv_describes_a_real_main_program() {
         (auxv_tag::PHENT, "AT_PHENT"),
         (auxv_tag::PHNUM, "AT_PHNUM"),
     ] {
-        assert_ne!(
-            guest_getauxval(&emulator, tag),
-            0,
-            "{name} is in the auxv"
-        );
+        assert_ne!(guest_getauxval(&emulator, tag), 0, "{name} is in the auxv");
     }
 
     assert_eq!(
@@ -355,11 +374,7 @@ fn the_auxv_describes_a_real_main_program() {
         entry >= base && entry < base + raxdbg_core::memory::PAGE_SIZE,
         "AT_ENTRY {entry:#x} is inside the image at {base:#x}"
     );
-    assert_eq!(
-        phdr,
-        base + 64,
-        "AT_PHDR follows the 64-byte ELF header"
-    );
+    assert_eq!(phdr, base + 64, "AT_PHDR follows the 64-byte ELF header");
 }
 
 #[test]
@@ -385,13 +400,21 @@ fn the_auxv_image_is_a_relocatable_pie() {
     // the walk started from.
     let load = emulator.memory().pointer(base + phoff);
     assert_eq!(load.read_u32(0).expect("p_type"), 1, "PT_LOAD");
-    assert_eq!(load.read_u64(16).expect("p_vaddr"), 0, "p_vaddr is relative");
+    assert_eq!(
+        load.read_u64(16).expect("p_vaddr"),
+        0,
+        "p_vaddr is relative"
+    );
 
     // The second is `PT_PHDR`, which is what a guest uses to find the table
     // inside the image without trusting `AT_PHDR`.
     let phdr_entry = emulator.memory().pointer(base + phoff + 56);
     assert_eq!(phdr_entry.read_u32(0).expect("p_type"), 6, "PT_PHDR");
-    assert_eq!(phdr_entry.read_u64(16).expect("p_vaddr"), 64, "PT_PHDR vaddr");
+    assert_eq!(
+        phdr_entry.read_u64(16).expect("p_vaddr"),
+        64,
+        "PT_PHDR vaddr"
+    );
 }
 
 #[test]
@@ -420,7 +443,10 @@ fn dlopen_and_dlsym_reach_the_linkers_private_symbols() {
         "__dl__Z9do_dlopenPKciPK17android_dlextinfoPKv",
         "__dl__Z8__dlopenPKciPKv",
     ] {
-        let name = emulator.memory().write_stack_string(symbol).expect("symbol");
+        let name = emulator
+            .memory()
+            .write_stack_string(symbol)
+            .expect("symbol");
         let address = emulator
             .call_function(dlsym.address, &[handle, name.peer()])
             .expect("dlsym");

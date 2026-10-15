@@ -29,9 +29,8 @@ impl ApkDir {
             });
         }
         let manifest_path = path.join("AndroidManifest.xml");
-        let manifest_bytes = std::fs::read(&manifest_path).map_err(|_| {
-            ApkError::Axml(axml::AxmlError::MissingManifest)
-        })?;
+        let manifest_bytes = std::fs::read(&manifest_path)
+            .map_err(|_| ApkError::Axml(axml::AxmlError::MissingManifest))?;
         let meta = if is_binary_axml(&manifest_bytes) {
             axml::parse_manifest(&manifest_bytes)?
         } else {
@@ -140,11 +139,9 @@ fn parse_text_manifest(bytes: &[u8]) -> Result<ManifestMeta, ApkError> {
         match name {
             "package" => package = Some(value.to_string()),
             "android:versionCode" => {
-                version_code = Some(
-                    value
-                        .parse::<i64>()
-                        .map_err(|_| ApkError::Axml(axml::AxmlError::BadVersionCode(value.to_string())))?,
-                );
+                version_code = Some(value.parse::<i64>().map_err(|_| {
+                    ApkError::Axml(axml::AxmlError::BadVersionCode(value.to_string()))
+                })?);
             }
             "android:versionName" => version_name = Some(value.to_string()),
             _ => {}
@@ -190,12 +187,11 @@ fn collect_signatures_recursive(dir: &Path, out: &mut Vec<Vec<u8>>) {
         };
         if file_type.is_dir() {
             collect_signatures_recursive(&path, out);
-        } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            if matches!(ext.to_ascii_uppercase().as_str(), "RSA" | "DSA" | "EC") {
-                if let Ok(bytes) = std::fs::read(&path) {
-                    out.push(bytes);
-                }
-            }
+        } else if let Some(ext) = path.extension().and_then(|s| s.to_str())
+            && matches!(ext.to_ascii_uppercase().as_str(), "RSA" | "DSA" | "EC")
+            && let Ok(bytes) = std::fs::read(&path)
+        {
+            out.push(bytes);
         }
     }
 }

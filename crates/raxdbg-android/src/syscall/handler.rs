@@ -1,14 +1,13 @@
 //! The base Linux syscall handler: fd table, resolver chain, the file-descriptor
 //! half of the POSIX API.
 //!
-//! Port of unidbg:
+//! Port of unidbg @7f5da98e:
 //!
 //! * `unidbg-api/src/main/java/com/github/unidbg/unix/UnixSyscallHandler.java`
 //! * `unidbg-api/src/main/java/com/github/unidbg/spi/SyscallHandler.java`
 //! * `unidbg-api/src/main/java/com/github/unidbg/unix/IO.java`
 //! * `unidbg-android/src/main/java/com/github/unidbg/linux/AndroidSyscallHandler.java`
 //!   (the Android additions)
-//! @7f5da98e.
 //!
 //! The Linux syscall layer is shared by every ABI: the arm64 [`super::arm64`]
 //! and (later) arm32 tables both call into this struct for the parts that
@@ -37,10 +36,10 @@ use parking_lot::{Mutex, RwLock};
 use raxdbg_core::backend::Prot;
 use raxdbg_core::errno::{EACCES, EBADF, EFAULT, EINVAL, ENOENT};
 use raxdbg_core::file::linux_fs::LinuxFileSystem;
-use raxdbg_core::thread::Waiters;
 use raxdbg_core::file::structs::{IOConstants, Stat};
 use raxdbg_core::file::{FileIO, FileResult, FileSystem, IOResolver};
-use raxdbg_core::memory::{Memory, MemoryError, MAP_ANONYMOUS, MAP_FAILED};
+use raxdbg_core::memory::{MAP_ANONYMOUS, MAP_FAILED, Memory, MemoryError};
+use raxdbg_core::thread::Waiters;
 
 /// A shared byte sink the captured `stdout`/`stderr` descriptors write into.
 ///
@@ -332,10 +331,7 @@ impl UnixSyscallHandler {
         // `parking_lot::RwLockWriteGuard` doesn't expose `drain` (it's
         // not on the guard type); swap the map out, iterate the
         // replacement, drop it, and we're done.
-        let drained: BTreeMap<i32, Box<dyn FileIO>> = std::mem::replace(
-            &mut *self.fd_map.write(),
-            BTreeMap::new(),
-        );
+        let drained: BTreeMap<i32, Box<dyn FileIO>> = std::mem::take(&mut *self.fd_map.write());
         for (_, mut io) in drained {
             io.close();
         }
@@ -552,11 +548,13 @@ impl UnixSyscallHandler {
         };
         let mut stat = Stat::default();
         let ret = io.fstat(&mut stat);
-        if ret == 0 {
-            if stat.write_to(&*self.memory, statbuf, self.is_64bit).is_err() {
-                self.memory.set_errno(EFAULT);
-                return -1;
-            }
+        if ret == 0
+            && stat
+                .write_to(&*self.memory, statbuf, self.is_64bit)
+                .is_err()
+        {
+            self.memory.set_errno(EFAULT);
+            return -1;
         }
         ret
     }
@@ -569,12 +567,11 @@ impl UnixSyscallHandler {
     pub fn readlink(&self, path: &str, buf: u64, buf_size: usize) -> i32 {
         let mut path = path.to_string();
         // Mirror unidbg's `FD_PATTERN` handling for `/proc/self/fd/N`.
-        if let Some(rest) = path.strip_prefix("/proc/self/fd/") {
-            if let Ok(fd) = rest.parse::<i32>() {
-                if let Some(io) = self.fd_map.read().get(&fd) {
-                    path = io.get_path().to_string();
-                }
-            }
+        if let Some(rest) = path.strip_prefix("/proc/self/fd/")
+            && let Ok(fd) = rest.parse::<i32>()
+            && let Some(io) = self.fd_map.read().get(&fd)
+        {
+            path = io.get_path().to_string();
         }
         let bytes = path.as_bytes();
         let len = bytes.len().min(buf_size.saturating_sub(1));
@@ -646,7 +643,9 @@ impl UnixSyscallHandler {
     pub fn clock_gettime(&self, clk_id: i32, tp: u64) -> i32 {
         let (secs, nanos) = match clk_id & 0x7 {
             CLOCK_REALTIME => {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
                 (now.as_secs() as i64, now.subsec_nanos() as i64)
             }
             _ => {
@@ -726,7 +725,9 @@ impl UnixSyscallHandler {
                     self.set_file_system(Box::new(fs));
                 }
             }
-            None => self.set_file_system(Box::new(raxdbg_core::file::linux_fs::LinuxFileSystem::ephemeral())),
+            None => self.set_file_system(Box::new(
+                raxdbg_core::file::linux_fs::LinuxFileSystem::ephemeral(),
+            )),
         }
     }
 }

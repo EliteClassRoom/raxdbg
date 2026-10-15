@@ -73,7 +73,10 @@ pub fn space_of(backend: &RaxBackend) -> AddressSpace {
 
 /// An AArch64 adapter over `space` with the configuration the backend uses.
 pub fn rax_arm64_adapter(space: &AddressSpace) -> RaxArm64Cpu {
-    RaxArm64Cpu::new(AArch64Config::v8_2(), Arc::new(MemShared::new(space.clone())))
+    RaxArm64Cpu::new(
+        AArch64Config::v8_2(),
+        Arc::new(MemShared::new(space.clone())),
+    )
 }
 
 /// An AArch32 adapter over `space`.

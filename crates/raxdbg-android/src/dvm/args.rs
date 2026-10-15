@@ -67,9 +67,8 @@ fn format_env_call(
     let reference = |backend: &mut dyn Backend, register: u8| {
         format!("ref={:#x}", arg(backend, register) as u32 as i32)
     };
-    let string = |backend: &mut dyn Backend, register: u8| {
-        format_string(memory, arg(backend, register))
-    };
+    let string =
+        |backend: &mut dyn Backend, register: u8| format_string(memory, arg(backend, register));
     let word = |backend: &mut dyn Backend, register: u8| format!("{:#x}", arg(backend, register));
 
     Some(match function {
@@ -113,14 +112,22 @@ fn format_env_call(
 
         // `NewObject(JNIEnv*, jclass, jmethodID, ...)`
         JniFunc::NewObject => {
-            format!("env, {}, mid={}", reference(backend, 1), reference(backend, 2))
+            format!(
+                "env, {}, mid={}",
+                reference(backend, 1),
+                reference(backend, 2)
+            )
         }
 
         // `CallIntMethod` and its static twin: env, object-or-class, method,
         // then `jvalue*` varargs the trace cannot type without a signature
         // table the VM does not keep.
         JniFunc::CallIntMethod | JniFunc::CallStaticIntMethod => {
-            format!("env, {}, mid={}", reference(backend, 1), reference(backend, 2))
+            format!(
+                "env, {}, mid={}",
+                reference(backend, 1),
+                reference(backend, 2)
+            )
         }
 
         JniFunc::GetArrayLength => reference(backend, 1),
@@ -137,7 +144,11 @@ fn format_env_call(
         // the method table is the payload here, so its size answers the
         // question the pointers would not.
         JniFunc::RegisterNatives => {
-            format!("env, {}, count={}", reference(backend, 1), arg(backend, 3) as i32)
+            format!(
+                "env, {}, count={}",
+                reference(backend, 1),
+                arg(backend, 3) as i32
+            )
         }
     })
 }
@@ -234,10 +245,7 @@ mod tests {
             split_label("JNIEnv!FindClass.306"),
             Some(("JNIEnv", "FindClass"))
         );
-        assert_eq!(
-            split_label("JavaVM!GetEnv.530"),
-            Some(("JavaVM", "GetEnv"))
-        );
+        assert_eq!(split_label("JavaVM!GetEnv.530"), Some(("JavaVM", "GetEnv")));
     }
 
     /// A label naming no JNI function this port implements has no arguments to

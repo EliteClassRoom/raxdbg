@@ -97,7 +97,7 @@ impl Waiters {
     /// [`crate::backend::RunError::ThreadSwitch`] comes back — that is how the
     /// thread that parked becomes the thread that resumes.
     pub fn claim_unclaimed(&self, task: usize) -> Option<usize> {
-        let mut waiters = self.waiters.borrow_mut();
+        let waiters = self.waiters.borrow_mut();
         let waiter = waiters
             .iter()
             .rev()
@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(waiters.waiters.borrow()[0].task(), Some(7));
         assert!(!waiters.has_unclaimed(), "it is claimed now");
         assert_eq!(waiters.claim_unclaimed(8), None, "there is only one");
-        assert!(waiters.is_woken(id) == false);
+        assert!(!waiters.is_woken(id));
     }
 
     #[test]

@@ -22,10 +22,16 @@ fn the_documented_snippet_works() {
         // Before the load: the initialisers' own syscalls are part of the record.
         let trace = emulator.syscall().borrow_mut().set_trace();
 
-        let file = raxdbg_android::android_file::ElfLibraryFile::open("fixtures/prebuilt/arm64-v8a/libctest.so")?;
+        let file = raxdbg_android::android_file::ElfLibraryFile::open(
+            "fixtures/prebuilt/arm64-v8a/libctest.so",
+        )?;
         emulator.load(Box::new(file), false)?;
 
-        let address = emulator.loader().dlsym(0, "hello").map(|s| s.address).unwrap_or(0);
+        let address = emulator
+            .loader()
+            .dlsym(0, "hello")
+            .map(|s| s.address)
+            .unwrap_or(0);
         let _result = emulator.call_function(address, &[])?;
 
         // One pass, after the run, to name the module behind each `pc`.
@@ -45,9 +51,15 @@ fn the_documented_snippet_works() {
         }
         let findings = trace.protection().findings;
         for finding in &findings {
-            let _ = format!("{:?} {}: {}", finding.severity, finding.kind, finding.evidence);
+            let _ = format!(
+                "{:?} {}: {}",
+                finding.severity, finding.kind, finding.evidence
+            );
         }
-        assert!(seen > 0, "the documented snippet must see the load's syscalls");
+        assert!(
+            seen > 0,
+            "the documented snippet must see the load's syscalls"
+        );
         Ok(())
     };
     run().expect("the documented snippet runs");

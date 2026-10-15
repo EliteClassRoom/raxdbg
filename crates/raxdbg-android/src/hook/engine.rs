@@ -23,8 +23,8 @@ use std::rc::Rc;
 
 use raxdbg_core::backend::Backend;
 
-use crate::emulator::AndroidEmulator;
 use crate::elf::loader::AndroidElfLoader;
+use crate::emulator::AndroidEmulator;
 
 /// Which bundled engine a caller wants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

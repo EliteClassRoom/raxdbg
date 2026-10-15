@@ -30,15 +30,22 @@ fn fixture(name: &str) -> Option<String> {
 }
 
 /// Loads `library` with a trace running from before the load.
-fn traced(library: &str) -> (Rc<raxdbg_android::emulator::AndroidEmulator>, Rc<RefCell<raxdbg_android::syscall::SyscallTrace>>) {
+fn traced(
+    library: &str,
+) -> (
+    Rc<raxdbg_android::emulator::AndroidEmulator>,
+    Rc<RefCell<raxdbg_android::syscall::SyscallTrace>>,
+) {
     let emulator = AndroidEmulatorBuilder::for_64bit()
         .sdk(23)
         .build()
         .expect("the emulator builds");
     let trace = emulator.syscall().borrow_mut().set_trace();
-    let file = raxdbg_android::android_file::ElfLibraryFile::open(library)
-        .expect("the fixture opens");
-    emulator.load(Box::new(file), false).expect("the fixture loads");
+    let file =
+        raxdbg_android::android_file::ElfLibraryFile::open(library).expect("the fixture opens");
+    emulator
+        .load(Box::new(file), false)
+        .expect("the fixture loads");
     (emulator, trace)
 }
 
@@ -53,7 +60,7 @@ fn trace_covers_the_load_itself() {
     // A load maps the object and its dependencies; without a trace installed
     // before the load there would be nothing at all here.
     assert!(
-        trace.len() > 0,
+        !trace.is_empty(),
         "a trace installed before the load must record the load's syscalls"
     );
     // Every event has a result: the first syscall of a run is the trap that
@@ -109,7 +116,11 @@ fn a_run_without_a_trace_is_unaffected() {
     let file = raxdbg_android::android_file::ElfLibraryFile::open(&library).expect("opens");
     plain.load(Box::new(file), false).expect("loads");
 
-    let address = traced_emulator.loader().dlsym(0, "hello").expect("hello").address;
+    let address = traced_emulator
+        .loader()
+        .dlsym(0, "hello")
+        .expect("hello")
+        .address;
     let with_trace = traced_emulator
         .call_function(address, &[])
         .expect("the traced call returns");
@@ -128,8 +139,7 @@ fn a_protection_probe_is_reported_with_its_path() {
     // `openat` carries the path and the answer the guest gets is what the
     // report has to say. Driving it through the real library would tie the
     // test to whatever that library happens to probe today.
-    let mut events = Vec::new();
-    events.push(SyscallEventProbe::openat_probe("/proc/self/status", 3));
+    let events = vec![SyscallEventProbe::openat_probe("/proc/self/status", 3)];
     let report = raxdbg_android::syscall::ProtectionReport::from_events(&events, 8);
     assert_eq!(report.probe_paths, vec!["/proc/self/status".to_string()]);
     let finding = report

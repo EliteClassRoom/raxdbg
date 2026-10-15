@@ -144,6 +144,10 @@ impl InvocationContext {
     }
 }
 
+/// The post-call half of a [`ReplaceCallback`]: a closure the original's
+/// return stub hands the finished [`InvocationContext`] to.
+pub type PostCall = Box<dyn FnMut(&mut InvocationContext)>;
+
 /// The host side of a replacement.
 pub struct ReplaceCallback {
     /// Runs instead of the original. Its return value is the caller's, unless
@@ -152,7 +156,7 @@ pub struct ReplaceCallback {
     pub on_call: Box<dyn FnMut(&mut InvocationContext) -> i64>,
     /// Runs after the original returned, with the original's result in
     /// [`InvocationContext::get_ret`]. `Some` enables the post-call path.
-    pub post_call: Option<Box<dyn FnMut(&mut InvocationContext)>>,
+    pub post_call: Option<PostCall>,
 }
 
 impl std::fmt::Debug for ReplaceCallback {
@@ -204,10 +208,7 @@ impl ReplaceHook {
         address: u64,
         callback: ReplaceCallback,
     ) -> Result<Self, HookError> {
-        let svc = emulator
-            .loader()
-            .svc_memory()
-            .ok_or(HookError::NoSvcPage)?;
+        let svc = emulator.loader().svc_memory().ok_or(HookError::NoSvcPage)?;
         if emulator.loader().find_module_by_address(address).is_none() {
             return Err(HookError::NotInModule { address });
         }
@@ -333,7 +334,7 @@ impl CodeHook for Redirect {
         let sp = backend.reg_read(RegId::Sp).unwrap_or(0);
         let lr = backend.reg_read(RegId::Lr).unwrap_or(0);
         {
-            let mut state = self.state.borrow_mut();
+            let state = self.state.borrow_mut();
             let mut context = state.context.borrow_mut();
             context.args = args.clone();
             context.ret = 0;

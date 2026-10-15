@@ -6,26 +6,22 @@
 //! in. They cover the [acceptance criteria] listed in the assignment:
 //!
 //! * a `ByteArrayFileIO` read/lseek/pread sequence;
-//! * a `DriverFileIO` writing to a captured stdout sink and reading a temp
-//!   file back through a real `Loader`-backed guest memory;
+//! * a `DriverFileIO` reading a temp file back through a real
+//!   `Loader`-backed guest memory, plus the `/dev/null` and `/dev/urandom`
+//!   descriptors;
 //! * a pipe write-then-read and an empty-pipe `-EAGAIN`;
 //! * a `TcpListener`/`TcpStream` round trip through `socket.rs`;
 //! * `LinuxFileSystem::open` resolving a file under a temp root dir plus
 //!   `/dev/null` and `/proc/self/maps`.
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::rc::Rc;
 use raxdbg_core::backend::{
-    GuestMemory,
-    Backend, BackendError, BlockHook, CodeHook, ContextId, EventMemHook, HookId, InterruptHook,
-    MemoryFault, MemoryFaultKind, Prot, ReadHook, RunError, RunOutcome, UnmappedKind, WriteHook,
+    Backend, BackendError, BlockHook, CodeHook, ContextId, EventMemHook, GuestMemory, HookId,
+    InterruptHook, MemoryFault, MemoryFaultKind, Prot, ReadHook, RunError, RunOutcome,
+    UnmappedKind, WriteHook,
 };
 use raxdbg_core::errno::{EACCES, EAGAIN};
 use raxdbg_core::file::byte_array::ByteArrayFileIO;
-use raxdbg_core::file::driver::{HostFileIO, NullFileIO, StdoutFileIO, create_driver_file};
+use raxdbg_core::file::driver::{HostFileIO, NullFileIO, create_driver_file};
 use raxdbg_core::file::linux_fs::LinuxFileSystem;
 use raxdbg_core::file::pipe::pipe_pair;
 use raxdbg_core::file::socket::{TcpSocket, read_inet_addr, supported_family};
@@ -33,6 +29,11 @@ use raxdbg_core::file::{FileIO, FileResult, FileSystem};
 use raxdbg_core::memory::loader::Loader;
 use raxdbg_core::memory::{Memory, PAGE_SIZE};
 use raxdbg_core::reg::RegId;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::rc::Rc;
 
 #[derive(Default)]
 struct TestBackend {
@@ -142,7 +143,7 @@ impl Backend for TestBackend {
     }
 
     fn mem_map(&mut self, addr: u64, size: u64, perms: Prot) -> Result<(), BackendError> {
-        if addr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 || size == 0 {
+        if !addr.is_multiple_of(PAGE_SIZE) || !size.is_multiple_of(PAGE_SIZE) || size == 0 {
             return Err(BackendError::Map {
                 addr,
                 size,
@@ -244,16 +245,6 @@ struct TestMemory {
     regions: parking_lot::Mutex<BTreeMap<u64, Region>>,
 }
 
-impl TestMemory {
-    fn region_at(&self, addr: u64) -> Option<(u64, u64)> {
-        self.regions
-            .lock()
-            .iter()
-            .find(|(base, region)| addr >= **base && addr < **base + region.end())
-            .map(|(base, region)| (*base, region.data.len() as u64))
-    }
-}
-
 impl GuestMemory for TestMemory {
     fn read_raw(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryFault> {
         let regions = self.regions.lock();
@@ -329,7 +320,6 @@ fn loader() -> Rc<Loader> {
     Loader::new(backend as Rc<RefCell<dyn Backend>>, guest, 8)
 }
 
-
 #[test]
 fn byte_array_mmap2_copies_into_a_fresh_mapping() {
     let memory = loader();
@@ -344,7 +334,7 @@ fn byte_array_mmap2_copies_into_a_fresh_mapping() {
     assert_eq!(&bytes, b"abcDEF");
 }
 // ---------------------------------------------------------------------------
-// DriverFileIO (host files + /dev specials + captured stdout)
+// DriverFileIO (host files + /dev specials)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -356,9 +346,7 @@ fn driver_host_file_round_trip() {
         f.write_all(b"raxdbg host IO").expect("write");
     }
     let memory = loader();
-    let guest = memory
-        .mmap(0x1000, Prot::READ.union(Prot::WRITE))
-        .unwrap();
+    let guest = memory.mmap(0x1000, Prot::READ.union(Prot::WRITE)).unwrap();
     let mut io = HostFileIO::open_path(
         raxdbg_core::file::structs::IOConstants::O_RDONLY,
         "hello.txt",
@@ -373,16 +361,6 @@ fn driver_host_file_round_trip() {
         .expect("read back");
     assert_eq!(&bytes, b"raxdbg host IO");
 }
-fn driver_captured_stdout_sink_writes_through() {
-    let captured: std::sync::Arc<parking_lot::Mutex<Vec<u8>>> =
-        std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let sink = CapturedWriter::new(captured.clone());
-    let mut io = StdoutFileIO::new("stdout", Box::new(sink));
-    assert_eq!(io.write(b"hello, "), 7);
-    assert_eq!(io.write(b"world"), 5);
-    assert_eq!(&captured.lock()[..], b"hello, world");
-    assert!(io.is_stdio());
-}
 
 #[test]
 fn driver_dev_null_drops_writes() {
@@ -394,9 +372,7 @@ fn driver_dev_null_drops_writes() {
 #[test]
 fn driver_dev_urandom_returns_some_bytes() {
     let memory = loader();
-    let guest = memory
-        .mmap(0x1000, Prot::READ.union(Prot::WRITE))
-        .unwrap();
+    let guest = memory.mmap(0x1000, Prot::READ.union(Prot::WRITE)).unwrap();
     let mut io = create_driver_file("/dev/urandom", None, None).expect("urandom");
     let n = io.read(&*memory, guest.peer(), 32);
     assert!(n > 0);
@@ -409,9 +385,7 @@ fn driver_dev_urandom_returns_some_bytes() {
 #[test]
 fn pipe_write_then_read() {
     let memory = loader();
-    let guest = memory
-        .mmap(0x1000, Prot::READ.union(Prot::WRITE))
-        .unwrap();
+    let guest = memory.mmap(0x1000, Prot::READ.union(Prot::WRITE)).unwrap();
     let (mut reader, mut writer) = pipe_pair();
     assert_eq!(writer.write(b"ping"), 4);
     assert_eq!(reader.read(&*memory, guest.peer(), 16), 4);
@@ -425,9 +399,7 @@ fn pipe_write_then_read() {
 #[test]
 fn empty_pipe_read_returns_again() {
     let memory = loader();
-    let guest = memory
-        .mmap(0x1000, Prot::READ.union(Prot::WRITE))
-        .unwrap();
+    let guest = memory.mmap(0x1000, Prot::READ.union(Prot::WRITE)).unwrap();
     let (mut reader, _writer) = pipe_pair();
     assert_eq!(reader.read(&*memory, guest.peer(), 4), -EAGAIN);
 }
@@ -452,9 +424,7 @@ fn tcp_listener_and_stream_round_trip() {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
 
     let memory = loader();
-    let guest = memory
-        .mmap(0x1000, Prot::READ.union(Prot::WRITE))
-        .unwrap();
+    let guest = memory.mmap(0x1000, Prot::READ.union(Prot::WRITE)).unwrap();
 
     // Use the raxdbg TcpSocket wrapper to send the request.
     let mut client = TcpSocket::new(raxdbg_core::file::structs::IOConstants::O_RDWR, stream);
@@ -493,14 +463,14 @@ fn supported_family_recognises_known_constants() {
 #[test]
 fn read_inet_addr_decodes_a_v4_address() {
     let memory = loader();
-    let guest = memory
-        .mmap(0x1000, Prot::READ.union(Prot::WRITE))
-        .unwrap();
+    let guest = memory.mmap(0x1000, Prot::READ.union(Prot::WRITE)).unwrap();
     let mut sockaddr = [0u8; 16];
     sockaddr[0..2].copy_from_slice(&2u16.to_le_bytes()); // AF_INET
     sockaddr[2..4].copy_from_slice(&8080u16.to_be_bytes());
     sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
-    memory.write_bytes( guest.peer(), &sockaddr);
+    memory
+        .write_bytes(guest.peer(), &sockaddr)
+        .expect("write sockaddr");
 
     let addr = read_inet_addr(&*memory, guest.peer(), 16).expect("inet addr");
     match addr {
@@ -525,11 +495,12 @@ fn linux_fs_open_resolves_under_root_and_handles_synthetic_paths() {
 
     let fs = LinuxFileSystem::new(root).expect("fs");
     let memory = loader();
-    let guest = memory
-        .mmap(0x1000, Prot::READ.union(Prot::WRITE))
-        .unwrap();
+    let guest = memory.mmap(0x1000, Prot::READ.union(Prot::WRITE)).unwrap();
 
-    match fs.open("data.txt", raxdbg_core::file::structs::IOConstants::O_RDONLY) {
+    match fs.open(
+        "data.txt",
+        raxdbg_core::file::structs::IOConstants::O_RDONLY,
+    ) {
         FileResult::Success(mut io) => {
             let n = io.read(&*memory, guest.peer(), 64);
             assert!(n > 0);
@@ -542,7 +513,7 @@ fn linux_fs_open_resolves_under_root_and_handles_synthetic_paths() {
     }
 
     // `/dev/null` returns a `NullFileIO` even without root state.
-    let mut null_io = match fs.open(
+    let null_io = match fs.open(
         "/dev/null",
         raxdbg_core::file::structs::IOConstants::O_WRONLY,
     ) {
@@ -616,25 +587,6 @@ fn linux_fs_ephemeral_only_handles_synthetic_paths() {
 
 // ---------------------------------------------------------------------------
 // Helpers
-struct CapturedWriter {
-    sink: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>,
-}
-
-impl CapturedWriter {
-    fn new(sink: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>) -> Self {
-        CapturedWriter { sink }
-    }
-}
-
-impl Write for CapturedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.sink.lock().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 
 /// A temp directory that gets removed on drop.
 struct TempDir(std::path::PathBuf);

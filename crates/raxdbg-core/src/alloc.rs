@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use parking_lot::Mutex;
 
 use crate::backend::Prot;
-use crate::memory::{Memory, MemoryError, MMapListener};
+use crate::memory::{MMapListener, Memory, MemoryError};
 use crate::pointer::Pointer;
 
 /// Calls a guest function from host code.
@@ -283,7 +283,10 @@ impl MMapListener for ChainedTracker {
 fn host_frames(max: usize) -> Vec<String> {
     let mut frames = Vec::new();
     let mut skip = 0usize;
-    for line in std::backtrace::Backtrace::force_capture().to_string().lines() {
+    for line in std::backtrace::Backtrace::force_capture()
+        .to_string()
+        .lines()
+    {
         // The first lines are the "stack backtrace:" banner and this function.
         if skip < 2 {
             skip += 1;

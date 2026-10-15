@@ -14,7 +14,7 @@ use raxdbg_core::memory::Memory;
 /// yaxpeax's rule: a Thumb halfword in `11101`/`11110`/`11111` starts a 32-bit
 /// instruction.
 fn yaxpeax_size(halfword: u16) -> usize {
-    if matches!(halfword >> 11, 0b11101 | 0b11110 | 0b11111) {
+    if matches!(halfword >> 11, 0b11101..=0b11111) {
         4
     } else {
         2
@@ -59,7 +59,11 @@ fn the_two_decoders_agree_on_instruction_boundaries() {
     let mut disagreements = Vec::new();
     while offset + 4 <= bytes.len() {
         let half = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
-        let rax_size = if ThumbDecoder::is_32bit_instruction(half) { 4 } else { 2 };
+        let rax_size = if ThumbDecoder::is_32bit_instruction(half) {
+            4
+        } else {
+            2
+        };
         let yax_size = yaxpeax_size(half);
         if rax_size != yax_size {
             disagreements.push((start + offset as u64, half, rax_size, yax_size));

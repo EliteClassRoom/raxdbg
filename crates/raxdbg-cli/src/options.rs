@@ -230,7 +230,9 @@ impl Options {
                             .map_err(|_| "--sdk needs a number".to_string())?,
                     );
                 }
-                "--libs-dir" => options.libs_dir = Some(PathBuf::from(next_value(&mut args, "--libs-dir")?)),
+                "--libs-dir" => {
+                    options.libs_dir = Some(PathBuf::from(next_value(&mut args, "--libs-dir")?))
+                }
                 "--root" => options.root = Some(PathBuf::from(next_value(&mut args, "--root")?)),
                 "--seed" => {
                     options.seed = next_value(&mut args, "--seed")?
@@ -326,7 +328,8 @@ pub fn parse_number(text: &str) -> Result<u64, String> {
     if let Some(hex) = text.strip_prefix("0x") {
         u64::from_str_radix(hex, 16).map_err(|_| format!("`{text}` is not a number"))
     } else {
-        text.parse().map_err(|_| format!("`{text}` is not a number"))
+        text.parse()
+            .map_err(|_| format!("`{text}` is not a number"))
     }
 }
 
@@ -382,7 +385,10 @@ mod tests {
     #[test]
     fn jni_args_is_off_by_default_and_parsed() {
         let options = parse(&["trace", "lib.so", "--functions"]).unwrap();
-        assert!(!options.jni_args, "arguments are opt-in, not noise by default");
+        assert!(
+            !options.jni_args,
+            "arguments are opt-in, not noise by default"
+        );
 
         let options = parse(&["trace", "lib.so", "--functions", "--jni-args"]).unwrap();
         assert!(options.jni_args);
@@ -400,8 +406,8 @@ mod tests {
         assert_eq!(options.call_arguments, vec![0x2a]);
     }
 
-#[test]
-fn an_unknown_option_is_rejected() {
+    #[test]
+    fn an_unknown_option_is_rejected() {
         assert!(parse(&["run", "lib.so", "--nope"]).is_err());
         assert!(parse(&["nope", "lib.so"]).is_err());
         assert!(parse(&["run"]).is_err());
@@ -409,15 +415,7 @@ fn an_unknown_option_is_rejected() {
 
     #[test]
     fn a_gdb_debug_session_takes_a_port_and_a_call() {
-        let options = parse(&[
-            "debug",
-            "lib.so",
-            "--gdb",
-            "23946",
-            "--call",
-            "hello()V",
-        ])
-        .unwrap();
+        let options = parse(&["debug", "lib.so", "--gdb", "23946", "--call", "hello()V"]).unwrap();
         assert_eq!(options.gdb_port, Some(23946));
         // Loopback unless asked otherwise: the protocol has no authentication.
         assert_eq!(options.gdb_bind, DEFAULT_GDB_BIND);
@@ -438,12 +436,11 @@ fn an_unknown_option_is_rejected() {
 
     #[test]
     fn a_gdb_session_needs_a_port_a_call_and_the_debug_command() {
-        let error = parse(&["debug", "lib.so", "--gdb", "nope", "--call", "hello()V"])
-            .unwrap_err();
+        let error = parse(&["debug", "lib.so", "--gdb", "nope", "--call", "hello()V"]).unwrap_err();
         assert!(error.contains("--gdb needs a port number"), "{error}");
 
-        let error = parse(&["debug", "lib.so", "--gdb", "99999", "--call", "hello()V"])
-            .unwrap_err();
+        let error =
+            parse(&["debug", "lib.so", "--gdb", "99999", "--call", "hello()V"]).unwrap_err();
         assert!(error.contains("--gdb needs a port number"), "{error}");
 
         let error = parse(&[
@@ -464,8 +461,7 @@ fn an_unknown_option_is_rejected() {
         let error = parse(&["debug", "lib.so", "--gdb", "23946"]).unwrap_err();
         assert!(error.contains("--gdb requires --call"), "{error}");
 
-        let error = parse(&["run", "lib.so", "--gdb", "23946", "--call", "hello()V"])
-            .unwrap_err();
+        let error = parse(&["run", "lib.so", "--gdb", "23946", "--call", "hello()V"]).unwrap_err();
         assert!(error.contains("--gdb requires debug"), "{error}");
 
         let error = parse(&["debug", "lib.so", "--gdb-bind", "0.0.0.0"]).unwrap_err();

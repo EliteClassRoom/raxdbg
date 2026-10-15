@@ -121,10 +121,7 @@ fn read_instruction_bytes(backend: &mut dyn Backend, address: u64, size: u32) ->
     if size == 0 {
         return Vec::new();
     }
-    match backend.mem_read(address, size) {
-        Ok(bytes) => bytes,
-        Err(_) => Vec::new(),
-    }
+    backend.mem_read(address, size).unwrap_or_default()
 }
 
 fn format_trace_line(pc: u64, size: u32, text: Option<&str>) -> String {
@@ -219,7 +216,9 @@ impl TraceCode {
         let hook = TraceCodeHook {
             inner: self.inner.clone(),
         };
-        backend.borrow_mut().hook_add_code(Box::new(hook), begin, end)
+        backend
+            .borrow_mut()
+            .hook_add_code(Box::new(hook), begin, end)
     }
 }
 
@@ -351,12 +350,7 @@ impl TraceMemory {
 
     /// Installs both hooks on `backend` over `[begin, end]`. Returns
     /// `(read_hook_id, write_hook_id)`.
-    pub fn attach(
-        &self,
-        backend: &Rc<RefCell<dyn Backend>>,
-        begin: u64,
-        end: u64,
-    ) -> (u64, u64) {
+    pub fn attach(&self, backend: &Rc<RefCell<dyn Backend>>, begin: u64, end: u64) -> (u64, u64) {
         let read_hook = TraceMemoryReadHook {
             inner: self.inner.clone(),
         };
@@ -462,16 +456,13 @@ impl AssemblyCodeDumper {
     pub fn entries(&self) -> Vec<TraceEntry> {
         self.inner.borrow().entries.clone()
     }
-    pub fn attach(
-        &self,
-        backend: &Rc<RefCell<dyn Backend>>,
-        begin: u64,
-        end: u64,
-    ) -> u64 {
+    pub fn attach(&self, backend: &Rc<RefCell<dyn Backend>>, begin: u64, end: u64) -> u64 {
         let hook = AssemblyCodeDumperHook {
             inner: self.inner.clone(),
         };
-        backend.borrow_mut().hook_add_code(Box::new(hook), begin, end)
+        backend
+            .borrow_mut()
+            .hook_add_code(Box::new(hook), begin, end)
     }
 }
 

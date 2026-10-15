@@ -40,7 +40,11 @@ fn run_calls_a_c_function_and_captures_its_stdout() {
         "hello()V",
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("hello 42"), "{stdout}");
 }
 
@@ -76,7 +80,11 @@ fn trace_prints_the_instructions_it_ran() {
         "ctest_malloc_ok()V",
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("instructions --"), "{stdout}");
     // `hello_value` returns a constant, so the trace must contain a `ret`.
     assert!(stdout.contains("ret"), "{stdout}");
@@ -92,7 +100,11 @@ fn trace_functions_logs_the_calls_the_library_makes() {
         "--functions",
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     // The branch is inside `hello`, and its target is a PLT stub, which only
     // the loader's relocation table can name. The count itself is left to the
     // core tests: a rebuilt fixture may reach `fflush` by a tail call.
@@ -119,7 +131,11 @@ fn trace_out_writes_the_instruction_log_to_a_file() {
         log.to_str().unwrap(),
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("instructions (written to"), "{stdout}");
     // With `--out` the instructions are streamed to the file, not the
     // terminal: only the summary line is left on stdout.
@@ -134,7 +150,10 @@ fn trace_out_writes_the_instruction_log_to_a_file() {
         .and_then(|rest| rest.split(' ').next())
         .and_then(|count| count.parse().ok())
         .unwrap_or_else(|| panic!("no instruction count in {stdout:?}"));
-    assert_eq!(lines, reported, "the file must hold one line per instruction");
+    assert_eq!(
+        lines, reported,
+        "the file must hold one line per instruction"
+    );
     std::fs::remove_file(&log).ok();
 }
 
@@ -153,11 +172,18 @@ fn trace_runs_jni_on_load_and_logs_the_calls_it_makes() {
         log.to_str().unwrap(),
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("calls (written to"), "{stdout}");
 
     let text = std::fs::read_to_string(&log).expect("the call log");
-    assert!(text.contains("\ncall "), "the log must name the calls:\n{text}");
+    assert!(
+        text.contains("\ncall "),
+        "the log must name the calls:\n{text}"
+    );
     // A host service on the SVC page belongs to no ELF, so the loader cannot
     // name it -- but the stub page labels every allocation, and that label is
     // the function's name. Without it these come out as bare offsets.
@@ -184,7 +210,10 @@ fn trace_runs_jni_on_load_and_logs_the_calls_it_makes() {
         .find("[libjnitest.so] JNI_OnLoad 0x")
         .expect("the log names the entry point");
     let first_call = text.find("\ncall ").expect("the log has calls");
-    assert!(marker < first_call, "the marker comes before the calls:\n{text}");
+    assert!(
+        marker < first_call,
+        "the marker comes before the calls:\n{text}"
+    );
     assert!(
         text.lines()
             .next()
@@ -208,7 +237,11 @@ fn leak_check_reports_the_live_mappings() {
         "--leak-check",
     ]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("live allocation(s)"), "{stdout}");
     let live = stdout
         .split("live allocation(s) --")
@@ -225,10 +258,7 @@ fn leak_check_reports_the_live_mappings() {
 fn a_scripted_console_session_breaks_and_inspects() {
     let script = "r\nwhere\nq\n";
     let output = Command::new(env!("CARGO_BIN_EXE_raxdbg"))
-        .args([
-            "debug",
-            fixture("libctest.so").to_str().unwrap(),
-        ])
+        .args(["debug", fixture("libctest.so").to_str().unwrap()])
         .current_dir(workspace_root())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -275,7 +305,11 @@ fn a_jni_signature_reports_the_missing_runtime() {
 fn syscalls_prints_a_summary_and_a_report() {
     let output = raxdbg(&["syscalls", fixture("libctest.so").to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     // The default is the report alone: a summary is what makes the command
     // usable on a library that makes thousands of calls.
     assert!(stdout.contains("-- protection --"), "{stdout}");
@@ -290,19 +324,33 @@ fn syscalls_prints_a_summary_and_a_report() {
 fn syscalls_v_prints_the_calls_that_carry_a_path() {
     let output = raxdbg(&["syscalls", fixture("libctest.so").to_str().unwrap(), "-v"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("-- syscalls --"), "{stdout}");
-    assert!(stdout.contains("openat"), "a path-carrying call is shown:\n{stdout}");
+    assert!(
+        stdout.contains("openat"),
+        "a path-carrying call is shown:\n{stdout}"
+    );
 }
 
 #[test]
 fn syscalls_vv_prints_every_call() {
     let output = raxdbg(&["syscalls", fixture("libctest.so").to_str().unwrap(), "-vv"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     // `brk` carries neither a path nor a buffer, so only the full trace
     // shows it: that is the difference `-vv` makes.
-    assert!(stdout.contains("brk@"), "the full trace shows every call:\n{stdout}");
+    assert!(
+        stdout.contains("brk@"),
+        "the full trace shows every call:\n{stdout}"
+    );
 }
 
 #[test]
@@ -331,7 +379,11 @@ fn syscalls_marks_the_initialiser_phases_before_jni_on_load() {
     let libc = workspace_root().join("libs/android/sdk23/lib64/libc.so");
     let output = raxdbg(&["syscalls", libc.to_str().unwrap(), "--jni-on-load"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let markers: Vec<&str> = stdout
         .lines()
@@ -377,11 +429,12 @@ impl RspClient {
     fn connect(port: u16) -> Option<Self> {
         // The server is a child process, so the listener may not be up yet.
         for _ in 0..200 {
-            if let Ok(stream) =
-                std::net::TcpStream::connect(("127.0.0.1", port))
-            {
+            if let Ok(stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-                return Some(RspClient { stream, buffered: Vec::new() });
+                return Some(RspClient {
+                    stream,
+                    buffered: Vec::new(),
+                });
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
@@ -466,7 +519,7 @@ fn free_port() -> u16 {
 #[test]
 fn a_gdb_client_drives_the_guest_through_the_remote_protocol() {
     let port = free_port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_raxdbg"))
+    let child = Command::new(env!("CARGO_BIN_EXE_raxdbg"))
         .args([
             "debug",
             fixture("libctest.so").to_str().unwrap(),
@@ -483,11 +536,16 @@ fn a_gdb_client_drives_the_guest_through_the_remote_protocol() {
 
     let mut client = RspClient::connect(port).expect("the server listens on the loopback");
     assert!(
-        client.packet("qSupported:multiprocess+").is_some_and(|r| r.contains("PacketSize=")),
+        client
+            .packet("qSupported:multiprocess+")
+            .is_some_and(|r| r.contains("PacketSize=")),
         "the server negotiates features"
     );
     let stop = client.packet("?").expect("the halt reason");
-    assert!(stop.starts_with('T') || stop.starts_with('S'), "stopped: {stop}");
+    assert!(
+        stop.starts_with('T') || stop.starts_with('S'),
+        "stopped: {stop}"
+    );
 
     // The guest is parked at the callee's first instruction, before it ran.
     let regs = client.packet("g").expect("the register file");
@@ -527,9 +585,18 @@ fn a_gdb_client_drives_the_guest_through_the_remote_protocol() {
     assert_eq!(client.packet("m1,4").as_deref(), Some("E0e"));
 
     // Breakpoints are accepted, and removing one that is gone is refused.
-    assert_eq!(client.packet(&format!("Z0,{pc:x},4")).as_deref(), Some("OK"));
-    assert_eq!(client.packet(&format!("z0,{pc:x},4")).as_deref(), Some("OK"));
-    assert_eq!(client.packet(&format!("z0,{pc:x},4")).as_deref(), Some("E16"));
+    assert_eq!(
+        client.packet(&format!("Z0,{pc:x},4")).as_deref(),
+        Some("OK")
+    );
+    assert_eq!(
+        client.packet(&format!("z0,{pc:x},4")).as_deref(),
+        Some("OK")
+    );
+    assert_eq!(
+        client.packet(&format!("z0,{pc:x},4")).as_deref(),
+        Some("E16")
+    );
 
     // Continuing runs the call to its return, and the session ends with the
     // exit reply a client reads as "the program finished".

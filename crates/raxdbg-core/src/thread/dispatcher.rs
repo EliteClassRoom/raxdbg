@@ -157,10 +157,10 @@ impl ThreadDispatcher {
     /// out of the ready queue until something wakes the waiter, which is what
     /// makes `pthread_join` and `pthread_cond_wait` block rather than spin.
     pub fn park_current(&mut self, waiter: usize) {
-        if let Some(id) = self.current {
-            if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
-                task.waiter = Some(waiter);
-            }
+        if let Some(id) = self.current
+            && let Some(task) = self.tasks.iter_mut().find(|task| task.id == id)
+        {
+            task.waiter = Some(waiter);
         }
         self.current = None;
     }
@@ -270,12 +270,11 @@ impl ThreadDispatcher {
     /// Port of unidbg: `ThreadContextSwitchException` handling — the current
     /// task goes back on the ready queue and the dispatcher moves on.
     pub fn yield_current(&mut self) {
-        if let Some(id) = self.current.take() {
-            if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
-                if task.state == TaskState::Running {
-                    self.ready.push_back(id);
-                }
-            }
+        if let Some(id) = self.current.take()
+            && let Some(task) = self.tasks.iter_mut().find(|task| task.id == id)
+            && task.state == TaskState::Running
+        {
+            self.ready.push_back(id);
         }
     }
 
@@ -346,10 +345,10 @@ impl ThreadDispatcher {
                 Ok(results) => finished.extend(results),
                 Err(_) => {
                     for task in &self.tasks {
-                        if let Some(result) = task.result() {
-                            if !finished.iter().any(|(id, _)| *id == task.id) {
-                                finished.push((task.id, result));
-                            }
+                        if let Some(result) = task.result()
+                            && !finished.iter().any(|(id, _)| *id == task.id)
+                        {
+                            finished.push((task.id, result));
                         }
                     }
                 }
@@ -391,10 +390,10 @@ impl ThreadDispatcher {
             .iter_mut()
             .find(|task| task.id == id)
             .and_then(|task| task.waiter.take());
-        if let Some(waiters) = self.waiters.as_ref() {
-            if let Some(waiter) = waiter {
-                waiters.remove(waiter);
-            }
+        if let Some(waiters) = self.waiters.as_ref()
+            && let Some(waiter) = waiter
+        {
+            waiters.remove(waiter);
         }
         if !self.ready.contains(&id) {
             self.ready.push_back(id);
@@ -453,10 +452,7 @@ impl ThreadDispatcher {
     /// Returns the results in the order the tasks finished.
     pub fn run(&mut self, backend: &mut dyn Backend) -> Result<Vec<(usize, u64)>, RunError> {
         let mut finished = Vec::new();
-        loop {
-            let Some(id) = self.ready.pop_front() else {
-                break;
-            };
+        while let Some(id) = self.ready.pop_front() {
             let (state, context, stack, function, args, waiter) = {
                 let task = self
                     .tasks
@@ -519,7 +515,11 @@ impl ThreadDispatcher {
                     // The syscall this task parked in owed its caller a value,
                     // and resuming happens *after* it, so the value goes in now.
                     if let Some(value) = self.resume_values.remove(&id) {
-                        let register = if self.is_64bit { RegId::X(0) } else { RegId::R(0) };
+                        let register = if self.is_64bit {
+                            RegId::X(0)
+                        } else {
+                            RegId::R(0)
+                        };
                         backend.reg_write(register, value)?;
                     }
                 }
@@ -530,12 +530,7 @@ impl ThreadDispatcher {
             // The task runs until it yields or finishes. Both arrive as a
             // `RunError`, which is what plan D5 replaced unidbg's exceptions
             // with.
-            let outcome = backend.emu_start(
-                backend.reg_read(RegId::Pc)?,
-                self.exit_stub,
-                0,
-                0,
-            );
+            let outcome = backend.emu_start(backend.reg_read(RegId::Pc)?, self.exit_stub, 0, 0);
             match outcome {
                 Ok(_) => {
                     // The run stopped at the exit stub without the stub raising,
@@ -571,10 +566,10 @@ impl ThreadDispatcher {
                     // how the thread that parked becomes the thread that
                     // resumes when something wakes it.
                     if let Some(waiters) = self.waiters.as_ref() {
-                        if let Some(waiter) = waiters.claim_unclaimed(id) {
-                            if let Some(task) = self.tasks.iter_mut().find(|task| task.id == id) {
-                                task.waiter = Some(waiter);
-                            }
+                        if let Some(waiter) = waiters.claim_unclaimed(id)
+                            && let Some(task) = self.tasks.iter_mut().find(|task| task.id == id)
+                        {
+                            task.waiter = Some(waiter);
                         }
                         // A `FUTEX_WAKE` marks waiters woken and then yields, so
                         // this is where the threads it woke go back on the ready

@@ -53,12 +53,12 @@ pub fn stub_name(label: &str) -> &str {
 pub fn name_caller(loader: &AndroidElfLoader, address: u64) -> String {
     // A branch inside a host service has no ELF symbol either, but the stub
     // page still knows which service it is in.
-    if let Some(svc) = loader.svc_memory() {
-        if let Some(region) = svc.find_region(address) {
-            let name = stub_name(&region.label);
-            if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-                return format!("{name}+0x{:x}", address.wrapping_sub(region.begin));
-            }
+    if let Some(svc) = loader.svc_memory()
+        && let Some(region) = svc.find_region(address)
+    {
+        let name = stub_name(&region.label);
+        if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+            return format!("{name}+0x{:x}", address.wrapping_sub(region.begin));
         }
     }
     // A branch the symbol table does not name is a branch in a stripped
@@ -96,32 +96,30 @@ pub fn name_callee(
     // the label is the function's real name: `GetJavaVM`, `AAsset_close`.
     // This comes before the module lookup because a stub can fall inside a
     // virtual module's page-aligned span and be misattributed to it.
-    if let Some(svc) = loader.svc_memory() {
-        if let Some(region) = svc.find_region(address) {
-            // `JNIEnv!FindClass` / `JavaVM!GetEnv`: the table a stub belongs to
-            // is what tells the two apart, since both have the same shape.
-            let name = stub_name(&region.label);
-            if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-                return name.to_string();
-            }
+    if let Some(svc) = loader.svc_memory()
+        && let Some(region) = svc.find_region(address)
+    {
+        // `JNIEnv!FindClass` / `JavaVM!GetEnv`: the table a stub belongs to
+        // is what tells the two apart, since both have the same shape.
+        let name = stub_name(&region.label);
+        if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+            return name.to_string();
         }
     }
-    if let Some(symbol) = loader.find_closest_symbol(address) {
-        if symbol.address == address {
-            if let Some(module) = &symbol.module {
-                return format!("{}!{}", display_name(loader, module), symbol.name);
-            }
-        }
+    if let Some(symbol) = loader.find_closest_symbol(address)
+        && symbol.address == address
+        && let Some(module) = &symbol.module
+    {
+        return format!("{}!{}", display_name(loader, module), symbol.name);
     }
-    if is_64bit {
-        if let Some(slot) = plt_got_slot(backend, address) {
-            if let Some(symbol) = loader.relocation_symbol(slot) {
-                return match &symbol.module {
-                    Some(module) => format!("{}!{}", display_name(loader, module), symbol.name),
-                    None => symbol.name,
-                };
-            }
-        }
+    if is_64bit
+        && let Some(slot) = plt_got_slot(backend, address)
+        && let Some(symbol) = loader.relocation_symbol(slot)
+    {
+        return match &symbol.module {
+            Some(module) => format!("{}!{}", display_name(loader, module), symbol.name),
+            None => symbol.name,
+        };
     }
     // Nothing named it: the address column already carries the RVA, so say
     // only that there is no name here rather than repeating the offset.
@@ -138,7 +136,8 @@ fn plt_got_slot(backend: &mut dyn Backend, address: u64) -> Option<u64> {
     if bytes.len() != 16 {
         return None;
     }
-    let word = |index: usize| u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+    let word =
+        |index: usize| u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
     let adrp = word(0);
     let ldr = word(1);
     let br = word(3);
@@ -173,7 +172,10 @@ mod tests {
         assert_eq!(stub_name("JavaVM!GetEnv.530"), "JavaVM!GetEnv");
         // A name that is itself dotted keeps everything: only digits are a
         // dispatch number.
-        assert_eq!(stub_name("JNIEnv!<unimplemented>"), "JNIEnv!<unimplemented>");
+        assert_eq!(
+            stub_name("JNIEnv!<unimplemented>"),
+            "JNIEnv!<unimplemented>"
+        );
         assert_eq!(stub_name("libc.so!printf"), "libc.so!printf");
     }
 

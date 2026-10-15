@@ -14,16 +14,16 @@
 
 use std::sync::Arc;
 
+use rax::error::MemoryAccessKind;
 use rax::isa::arm::aarch32::cpu::MemoryError as Arm32MemoryError;
 use rax::isa::arm::aarch32::instructions::ExclusiveMonitor;
 use rax::isa::arm::decoder::ThumbDecoder;
 use rax::isa::arm::{
-    Armv7Cpu, Decoder, ExceptionType, ExecResult, ExecutionState, Executor, Mnemonic, ProcessorMode,
-    Psr,
+    Armv7Cpu, Decoder, ExceptionType, ExecResult, ExecutionState, Executor, Mnemonic,
+    ProcessorMode, Psr,
 };
 use rax::user::cpu::arm::{A32Exit, COUNTER_HZ};
 use rax::user::cpu::{AccessFault, AccessFaultKind};
-use rax::error::MemoryAccessKind;
 use raxdbg_core::backend::BackendError;
 use raxdbg_core::reg::RegId;
 
@@ -387,14 +387,20 @@ impl RaxArm32Cpu {
 
     fn gpr(&self, index: u8) -> Result<u64, BackendError> {
         if index > 15 {
-            return Err(BackendError::RegisterOutOfRange { reg: index, max: 15 });
+            return Err(BackendError::RegisterOutOfRange {
+                reg: index,
+                max: 15,
+            });
         }
         Ok(u64::from(self.cpu.regs[index as usize]))
     }
 
     fn set_gpr(&mut self, index: u8, value: u32) -> Result<(), BackendError> {
         if index > 15 {
-            return Err(BackendError::RegisterOutOfRange { reg: index, max: 15 });
+            return Err(BackendError::RegisterOutOfRange {
+                reg: index,
+                max: 15,
+            });
         }
         self.cpu.regs[index as usize] = value;
         Ok(())
@@ -402,14 +408,20 @@ impl RaxArm32Cpu {
 
     fn dreg(&self, index: u8) -> Result<u64, BackendError> {
         if index > 15 {
-            return Err(BackendError::RegisterOutOfRange { reg: index, max: 15 });
+            return Err(BackendError::RegisterOutOfRange {
+                reg: index,
+                max: 15,
+            });
         }
         Ok(self.cpu.vfp.dregs[index as usize])
     }
 
     fn set_dreg(&mut self, index: u8, value: u64) -> Result<(), BackendError> {
         if index > 15 {
-            return Err(BackendError::RegisterOutOfRange { reg: index, max: 15 });
+            return Err(BackendError::RegisterOutOfRange {
+                reg: index,
+                max: 15,
+            });
         }
         self.cpu.vfp.dregs[index as usize] = value;
         Ok(())

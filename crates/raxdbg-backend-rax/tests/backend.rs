@@ -9,11 +9,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use common::{a32, a64, arm32_backend, arm64_backend, map_data, map_rw, new_space, CODE, DATA};
+use common::{CODE, DATA, a32, a64, arm32_backend, arm64_backend, map_data, map_rw, new_space};
 use raxdbg_backend_rax::RaxBackend;
 use raxdbg_core::backend::{
-    Backend, CodeHook, EventMemHook, InterruptHook, MemHookCtx, MemoryFaultKind, Prot, ReadHook,
-    RunError, RunOutcome, UnmappedKind, WriteHook, EXCP_SWI,
+    Backend, CodeHook, EXCP_SWI, EventMemHook, InterruptHook, MemHookCtx, MemoryFaultKind, Prot,
+    ReadHook, RunError, RunOutcome, UnmappedKind, WriteHook,
 };
 use raxdbg_core::reg::{ARM32_REGS, ARM64_REGS, RegId};
 
@@ -61,7 +61,9 @@ fn arm64_register_roundtrip() {
             (RegId::B(index), u128::from(u8::MAX)),
         ] {
             let value = u128::MAX - u128::from(index);
-            backend.reg_write_vector(reg, value.to_le_bytes()).expect("write");
+            backend
+                .reg_write_vector(reg, value.to_le_bytes())
+                .expect("write");
             let read = u128::from_le_bytes(backend.reg_read_vector(reg).expect("read"));
             assert_eq!(read, value & mask, "{reg}");
         }
@@ -82,7 +84,9 @@ fn arm64_aliases_track_their_backing_register() {
     backend.reg_write(RegId::X(16), 0xbeef).expect("write x16");
     assert_eq!(backend.reg_read(RegId::Ip).expect("read ip"), 0xbeef);
 
-    backend.reg_write(RegId::W(3), 0xffff_ffff).expect("write w3");
+    backend
+        .reg_write(RegId::W(3), 0xffff_ffff)
+        .expect("write w3");
     assert_eq!(backend.reg_read(RegId::X(3)).expect("read x3"), 0xffff_ffff);
 }
 
@@ -106,7 +110,11 @@ fn arm32_register_roundtrip() {
         }
         let value = 0x2222_0000u64 | (index as u64 + 1);
         backend.reg_write(reg, value).expect("write");
-        assert_eq!(backend.reg_read(reg).expect("read"), value as u32 as u64, "{reg}");
+        assert_eq!(
+            backend.reg_read(reg).expect("read"),
+            value as u32 as u64,
+            "{reg}"
+        );
     }
     for index in 0..16u8 {
         let reg = RegId::D(index);
@@ -121,15 +129,22 @@ fn arm32_cpsr_roundtrip_preserves_flags_mode_and_state() {
     let mut backend = arm32_backend(&a32::words(&[a32::mov_r0(1)]));
     // NZCV = 1010, I and F set, T set, mode = User (0x10).
     let cpsr = (0b1010u32 << 28) | (1 << 7) | (1 << 6) | (1 << 5) | 0x10;
-    backend.reg_write(RegId::Cpsr, u64::from(cpsr)).expect("write");
-    assert_eq!(backend.reg_read(RegId::Cpsr).expect("read"), u64::from(cpsr));
+    backend
+        .reg_write(RegId::Cpsr, u64::from(cpsr))
+        .expect("write");
+    assert_eq!(
+        backend.reg_read(RegId::Cpsr).expect("read"),
+        u64::from(cpsr)
+    );
     assert!(backend.arm32().unwrap().thumb());
 }
 
 #[test]
 fn arm32_pc_write_selects_the_instruction_set() {
     let mut backend = arm32_backend(&a32::halfwords(&[a32::t16_nop()]));
-    backend.reg_write(RegId::Pc, common::CODE | 1).expect("write");
+    backend
+        .reg_write(RegId::Pc, common::CODE | 1)
+        .expect("write");
     assert!(backend.arm32().unwrap().thumb(), "bit 0 selects T32");
     assert_eq!(backend.reg_read(RegId::Pc).expect("read"), common::CODE);
     backend.reg_write(RegId::Pc, common::CODE).expect("write");
@@ -268,7 +283,12 @@ fn code_hook_can_move_the_program_counter() {
         }
     }
 
-    let mut backend = arm64_backend(&[a64::add_x0_1(), a64::add_x0_1(), a64::add_x0_1(), a64::nop()]);
+    let mut backend = arm64_backend(&[
+        a64::add_x0_1(),
+        a64::add_x0_1(),
+        a64::add_x0_1(),
+        a64::nop(),
+    ]);
     backend.hook_add_code(Box::new(Skipper { done: false }), CODE, CODE);
     run(&mut backend, 3);
     // The hook replaced the first instruction: two adds and a nop retired.
@@ -322,7 +342,13 @@ fn block_hook_fires_at_basic_block_entries() {
     // `b #8` skips one instruction, so the entry after it is a new block.
     const B_8: u32 = 0x1400_0002;
     let hits = Rc::new(RefCell::new(Vec::new()));
-    let mut backend = arm64_backend(&[B_8, a64::add_x0_1(), a64::add_x0_1(), a64::nop(), a64::nop()]);
+    let mut backend = arm64_backend(&[
+        B_8,
+        a64::add_x0_1(),
+        a64::add_x0_1(),
+        a64::nop(),
+        a64::nop(),
+    ]);
     backend.hook_add_block(
         Box::new(Recorder { hits: hits.clone() }),
         CODE,
@@ -384,7 +410,9 @@ fn write_hook_observes_the_stored_value() {
     let mut backend = arm64_backend(&[a64::str_x1_x0(), a64::nop()]);
     map_data(backend.address_space());
     backend.reg_write(RegId::X(0), DATA).expect("write x0");
-    backend.reg_write(RegId::X(1), 0xdead_beef).expect("write x1");
+    backend
+        .reg_write(RegId::X(1), 0xdead_beef)
+        .expect("write x1");
     backend.hook_add_write(Box::new(Recorder { seen: seen.clone() }), DATA, DATA);
     run(&mut backend, 1);
 
@@ -416,7 +444,11 @@ fn event_mem_hook_that_maps_the_page_makes_the_loop_retry() {
             }
             self.mapped = true;
             backend
-                .mem_map(CODE, 0x1000, Prot::READ.union(Prot::WRITE).union(Prot::EXEC))
+                .mem_map(
+                    CODE,
+                    0x1000,
+                    Prot::READ.union(Prot::WRITE).union(Prot::EXEC),
+                )
                 .expect("map");
             backend
                 .mem_write(CODE, &a64::mov_x0(0x2a).to_le_bytes())
@@ -490,7 +522,11 @@ fn hook_del_stops_dispatch() {
 
     let hits = Rc::new(Cell::new(0));
     let mut backend = arm64_backend(&[a64::add_x0_1(); 4]);
-    let id = backend.hook_add_code(Box::new(Recorder { hits: hits.clone() }), CODE, CODE + 0x100);
+    let id = backend.hook_add_code(
+        Box::new(Recorder { hits: hits.clone() }),
+        CODE,
+        CODE + 0x100,
+    );
     run(&mut backend, 1);
     assert_eq!(hits.get(), 1);
     backend.hook_del(id);
@@ -508,7 +544,9 @@ fn context_roundtrip_restores_the_whole_register_file() {
     backend.reg_write(RegId::X(1), 0x1111).expect("write");
     backend.reg_write(RegId::X(30), 0x2222).expect("write");
     backend.reg_write(RegId::TpidrEl0, 0x3333).expect("write");
-    backend.reg_write_vector(RegId::Q(5), [7u8; 16]).expect("write");
+    backend
+        .reg_write_vector(RegId::Q(5), [7u8; 16])
+        .expect("write");
     run(&mut backend, 20);
 
     let snapshot: Vec<u64> = ARM64_REGS
@@ -533,7 +571,9 @@ fn context_roundtrip_restores_the_whole_register_file() {
     }
     for (index, expected) in vectors.into_iter().enumerate() {
         assert_eq!(
-            backend.reg_read_vector(RegId::Q(index as u8)).expect("read"),
+            backend
+                .reg_read_vector(RegId::Q(index as u8))
+                .expect("read"),
             expected,
             "q{index}"
         );
@@ -603,7 +643,11 @@ fn a_guest_store_to_a_read_only_page_faults() {
 
 #[test]
 fn arm32_runs_arm_state_code() {
-    let mut backend = arm32_backend(&a32::words(&[a32::mov_r0(0x2a), a32::add_r0_1(), a32::bx_lr()]));
+    let mut backend = arm32_backend(&a32::words(&[
+        a32::mov_r0(0x2a),
+        a32::add_r0_1(),
+        a32::bx_lr(),
+    ]));
     let outcome = run(&mut backend, 2);
     assert_eq!(outcome, RunOutcome::Count);
     assert_eq!(backend.reg_read(RegId::R(0)).unwrap(), 0x2b);
@@ -611,9 +655,14 @@ fn arm32_runs_arm_state_code() {
 
 #[test]
 fn arm32_runs_thumb_code() {
-    let mut backend = arm32_backend(&a32::halfwords(&[a32::t16_movs_r0(0x2a), a32::t16_adds_r0_1()]));
+    let mut backend = arm32_backend(&a32::halfwords(&[
+        a32::t16_movs_r0(0x2a),
+        a32::t16_adds_r0_1(),
+    ]));
     // Enter Thumb state: the PC's bit 0 selects T32.
-    backend.reg_write(RegId::Cpsr, 0x10 | (1 << 5)).expect("write cpsr");
+    backend
+        .reg_write(RegId::Cpsr, 0x10 | (1 << 5))
+        .expect("write cpsr");
     backend.emu_start(CODE | 1, 0, 0, 2).expect("run");
     assert_eq!(backend.reg_read(RegId::R(0)).unwrap(), 0x2b);
     assert!(backend.arm32().unwrap().thumb());
@@ -622,7 +671,10 @@ fn arm32_runs_thumb_code() {
 #[test]
 fn arm32_until_and_count_work() {
     let mut backend = arm32_backend(&a32::words(&[a32::add_r0_1(); 8]));
-    assert_eq!(backend.emu_start(CODE, CODE + 8, 0, 0).unwrap(), RunOutcome::Until);
+    assert_eq!(
+        backend.emu_start(CODE, CODE + 8, 0, 0).unwrap(),
+        RunOutcome::Until
+    );
     assert_eq!(backend.reg_read(RegId::R(0)).unwrap(), 2);
 
     let mut backend = arm32_backend(&a32::words(&[a32::add_r0_1(); 8]));
@@ -654,8 +706,12 @@ fn arm32_svc_reaches_the_interrupt_hook() {
 #[test]
 fn arm32_context_roundtrip() {
     let mut backend = arm32_backend(&a32::words(&[a32::add_r0_1(); 16]));
-    backend.reg_write(RegId::Cpsr, 0x6000_0010).expect("write cpsr");
-    backend.reg_write(RegId::D(3), 0x0123_4567_89ab_cdef).expect("write d3");
+    backend
+        .reg_write(RegId::Cpsr, 0x6000_0010)
+        .expect("write cpsr");
+    backend
+        .reg_write(RegId::D(3), 0x0123_4567_89ab_cdef)
+        .expect("write d3");
     run(&mut backend, 8);
 
     let snapshot: Vec<u64> = ARM32_REGS
@@ -698,7 +754,11 @@ fn arm32_code_hook_fires() {
 
     let hits = Rc::new(Cell::new(0));
     let mut backend = arm32_backend(&a32::words(&[a32::add_r0_1(); 4]));
-    backend.hook_add_code(Box::new(Recorder { hits: hits.clone() }), CODE, CODE + 0x100);
+    backend.hook_add_code(
+        Box::new(Recorder { hits: hits.clone() }),
+        CODE,
+        CODE + 0x100,
+    );
     run(&mut backend, 4);
     assert_eq!(hits.get(), 4);
 }
@@ -722,7 +782,9 @@ fn arm32_memory_bridge_dispatches_hooks() {
         .mem_map(DATA, 0x1000, Prot::READ.union(Prot::WRITE))
         .expect("map data");
     backend.reg_write(RegId::R(0), DATA).expect("write r0");
-    backend.reg_write(RegId::R(1), 0x1234_5678).expect("write r1");
+    backend
+        .reg_write(RegId::R(1), 0x1234_5678)
+        .expect("write r1");
     backend.hook_add_write(Box::new(Recorder { seen: seen.clone() }), DATA, DATA);
     run(&mut backend, 1);
     assert_eq!(*seen.lock().unwrap(), 1);

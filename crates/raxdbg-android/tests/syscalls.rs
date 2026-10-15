@@ -26,17 +26,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use raxdbg_backend_rax::RaxBackend;
-use raxdbg_core::backend::{
-    Backend, BackendError, Prot, RunError, EXCP_SWI, EXCP_UDEF,
-};
-use raxdbg_core::errno::EAGAIN;
-use raxdbg_core::memory::loader::Loader;
-use raxdbg_core::memory::{Memory, MemoryError};
-use raxdbg_core::reg::RegId;
-use raxdbg_core::svc::{Svc, SvcKind};
 use raxdbg_android::elf::AndroidElfLoader;
 use raxdbg_android::syscall::{AndroidSyscallHandler, SharedSink, SyscallHook};
+use raxdbg_backend_rax::RaxBackend;
+use raxdbg_core::backend::{Backend, BackendError, EXCP_SWI, EXCP_UDEF, Prot, RunError};
+use raxdbg_core::errno::EAGAIN;
+use raxdbg_core::memory::MemoryError;
+use raxdbg_core::memory::loader::Loader;
+use raxdbg_core::reg::RegId;
+use raxdbg_core::svc::{Svc, SvcKind};
 
 // -------- A `Svc` impl with a constant return value -------------------------------
 
@@ -70,8 +68,9 @@ fn build_test() -> TestHarness {
     let backend = RaxBackend::new_arm64(RaxBackend::default_space());
     let guest = backend.guest_memory();
     let backend_dyn: Rc<RefCell<dyn Backend>> = Rc::new(RefCell::new(backend));
-    let loader = AndroidElfLoader::new(backend_dyn.clone(), guest, true, "raxdbg-test", 0xfeed_face)
-        .expect("loader");
+    let loader =
+        AndroidElfLoader::new(backend_dyn.clone(), guest, true, "raxdbg-test", 0xfeed_face)
+            .expect("loader");
     let syscall =
         AndroidSyscallHandler::new(loader.clone(), true, Some(sink.clone())).expect("syscall");
     install_hook(backend_dyn.clone(), syscall.clone());
@@ -83,10 +82,7 @@ fn build_test() -> TestHarness {
     }
 }
 
-fn install_hook(
-    backend: Rc<RefCell<dyn Backend>>,
-    handler: Rc<RefCell<AndroidSyscallHandler>>,
-) {
+fn install_hook(backend: Rc<RefCell<dyn Backend>>, handler: Rc<RefCell<AndroidSyscallHandler>>) {
     let hook = SyscallHook::new(handler);
     backend.borrow_mut().hook_add_interrupt(Box::new(hook));
 }
@@ -197,10 +193,15 @@ fn clock_gettime_returns_zero_with_nonzero_secs() {
     let harness = build_test();
     harness.map_and_write_data(&[0; 16]);
     // x0 = clk_id (0 = CLOCK_REALTIME), x1 = tp (DATA).
-    harness.dispatch_swi(113, &[0, 0x2000, 0, 0, 0, 0, 0]).expect("clock_gettime");
+    harness
+        .dispatch_swi(113, &[0, 0x2000, 0, 0, 0, 0, 0])
+        .expect("clock_gettime");
     assert_eq!(harness.x0(), 0, "clock_gettime returns 0 on success");
     let secs = harness.read_u64(0x2000);
-    assert!(secs > 0, "clock_gettime writes a non-zero seconds value: {secs}");
+    assert!(
+        secs > 0,
+        "clock_gettime writes a non-zero seconds value: {secs}"
+    );
 }
 
 #[test]
@@ -240,7 +241,11 @@ fn getrandom_fills_sixteen_bytes() {
     // x0 = buf, x1 = len, x2 = flags.
     let args = [0x2000u64, 16, 0, 0, 0, 0, 0];
     harness.dispatch_swi(278, &args).expect("getrandom");
-    assert_eq!(harness.x0(), 16, "getrandom returns the requested byte count");
+    assert_eq!(
+        harness.x0(),
+        16,
+        "getrandom returns the requested byte count"
+    );
 }
 
 #[test]
@@ -256,7 +261,6 @@ fn register_svc_blr_returns_handler_value() {
             .expect("register svc")
     };
     assert!(stub_addr >= 0xfffe_0000, "stub lives in the SVC page");
-    drop(stub_addr);
 
     let args = [0u64; 7];
     harness.dispatch_stub(0x100, &args).expect("svc #0x100");

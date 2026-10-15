@@ -19,7 +19,7 @@ mod axml;
 mod dir;
 mod file;
 
-pub use axml::{parse_manifest, AxmlError, ManifestMeta};
+pub use axml::{AxmlError, ManifestMeta, parse_manifest};
 
 #[derive(Debug, Error)]
 pub enum ApkError {
@@ -75,6 +75,8 @@ pub fn open(path: &Path) -> Result<Box<dyn Apk>, ApkError> {
     } else if meta.is_file() {
         Ok(Box::new(file::ApkFile::open(path)?))
     } else {
-        Err(ApkError::NotADirectoryOrFile { path: path.to_path_buf().into_boxed_path() })
+        Err(ApkError::NotADirectoryOrFile {
+            path: path.to_path_buf().into_boxed_path(),
+        })
     }
 }

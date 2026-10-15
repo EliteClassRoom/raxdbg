@@ -435,7 +435,10 @@ fn get_timespec64(buf: &[u8], offset: usize) -> TimeSpec64 {
 }
 
 fn get_timespec32(buf: &[u8], offset: usize) -> TimeSpec64 {
-    TimeSpec64::new(i64::from(get_u32(buf, offset)), i64::from(get_u32(buf, offset + 4)))
+    TimeSpec64::new(
+        i64::from(get_u32(buf, offset)),
+        i64::from(get_u32(buf, offset + 4)),
+    )
 }
 
 #[cfg(test)]
