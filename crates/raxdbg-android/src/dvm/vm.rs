@@ -26,6 +26,7 @@ use crate::dvm::object::{
     DvmClass, DvmField, DvmMethod, DvmObject, InstanceObject, IntArrayObject, StringObject,
     normalize_class_name,
 };
+use crate::dvm::valist::read_va_list;
 use crate::elf::loader::ElfError;
 use crate::emulator::AndroidEmulator;
 
@@ -84,14 +85,42 @@ pub enum JniFunc {
     DeleteLocalRef = 23,
     /// `NewObject` — slot 28.
     NewObject = 28,
+    /// `GetObjectClass` — slot 31.
+    ///
+    /// Port of unidbg: `DalvikVM`'s `_GetObjectClass@0x7c`@7f5da98e, which
+    /// answers a `jclass` for the object's type. A packer asks this before it
+    /// looks a method up on the type it just received, so answering it is what
+    /// keeps a ClassLoader bootstrap going.
+    GetObjectClass = 31,
     /// `GetMethodID` — slot 33.
     GetMethodID = 33,
+    /// `CallObjectMethod` — slot 34.
+    CallObjectMethod = 34,
+    /// `CallObjectMethodV` — slot 35.
+    ///
+    /// The `va_list` form of `CallObjectMethod`: the arguments are behind the
+    /// pointer in `x3`, not in `x4..`, which is why it needs the reader in
+    /// [`super::valist`] rather than the register reads `CallObjectMethod`
+    /// uses. Slot 35, not 36: `CallObjectMethodA`, the `jvalue*` form, sits
+    /// after it.
+    CallObjectMethodV = 35,
     /// `CallIntMethod` — slot 49.
     CallIntMethod = 49,
     /// `GetStaticMethodID` — slot 113.
     GetStaticMethodID = 113,
+    /// `CallStaticObjectMethodV` — slot 115.
+    ///
+    /// The `va_list` form of `CallStaticObjectMethod`: the arguments are behind
+    /// the pointer in `x3`, not in `x4..`, which is why it needs the reader in
+    /// [`super::valist`] rather than the register reads the other call slots
+    /// use.
+    CallStaticObjectMethodV = 115,
     /// `CallStaticIntMethod` — slot 129.
     CallStaticIntMethod = 129,
+    /// `GetStaticFieldID` — slot 144.
+    GetStaticFieldID = 144,
+    /// `GetStaticIntField` — slot 150.
+    GetStaticIntField = 150,
     /// `NewStringUTF` — slot 167.
     NewStringUTF = 167,
     /// `GetStringUTFChars` — slot 169.
@@ -119,17 +148,23 @@ pub enum JniFunc {
 
 impl JniFunc {
     /// Every implemented function, in slot order.
-    pub const ALL: [JniFunc; 19] = [
+    pub const ALL: [JniFunc; 25] = [
         JniFunc::GetVersion,
         JniFunc::FindClass,
         JniFunc::ThrowNew,
         JniFunc::NewGlobalRef,
         JniFunc::DeleteLocalRef,
         JniFunc::NewObject,
+        JniFunc::GetObjectClass,
         JniFunc::GetMethodID,
+        JniFunc::CallObjectMethod,
+        JniFunc::CallObjectMethodV,
         JniFunc::CallIntMethod,
         JniFunc::GetStaticMethodID,
+        JniFunc::CallStaticObjectMethodV,
         JniFunc::CallStaticIntMethod,
+        JniFunc::GetStaticFieldID,
+        JniFunc::GetStaticIntField,
         JniFunc::NewStringUTF,
         JniFunc::GetStringUTFChars,
         JniFunc::ReleaseStringUTFChars,
@@ -155,10 +190,16 @@ impl JniFunc {
             JniFunc::NewGlobalRef => "NewGlobalRef",
             JniFunc::DeleteLocalRef => "DeleteLocalRef",
             JniFunc::NewObject => "NewObject",
+            JniFunc::GetObjectClass => "GetObjectClass",
             JniFunc::GetMethodID => "GetMethodID",
+            JniFunc::CallObjectMethod => "CallObjectMethod",
+            JniFunc::CallObjectMethodV => "CallObjectMethodV",
             JniFunc::CallIntMethod => "CallIntMethod",
             JniFunc::GetStaticMethodID => "GetStaticMethodID",
+            JniFunc::CallStaticObjectMethodV => "CallStaticObjectMethodV",
             JniFunc::CallStaticIntMethod => "CallStaticIntMethod",
+            JniFunc::GetStaticFieldID => "GetStaticFieldID",
+            JniFunc::GetStaticIntField => "GetStaticIntField",
             JniFunc::NewStringUTF => "NewStringUTF",
             JniFunc::GetStringUTFChars => "GetStringUTFChars",
             JniFunc::ReleaseStringUTFChars => "ReleaseStringUTFChars",
@@ -239,6 +280,71 @@ pub trait Jni {
     ) -> Option<Rc<dyn DvmObject>> {
         Some(vm.new_instance(class))
     }
+
+    /// Resolves a static field.
+    ///
+    /// Port of unidbg: `DvmClass.getStaticFieldID`, which hashes
+    /// `L<Class>;-><name>:<type>` and registers a `DvmField`. unidbg keeps
+    /// static and instance fields in separate maps; this port has one, because
+    /// only the static accessors are implemented.
+    fn get_static_field_id(
+        &self,
+        vm: &mut Vm,
+        class: &Rc<DvmClass>,
+        name: &str,
+        field_type: &str,
+    ) -> Option<Rc<DvmField>> {
+        Some(vm.create_field(class, name, field_type))
+    }
+
+    /// Reads a static `int` field.
+    ///
+    /// Port of unidbg: `DvmField.getStaticIntField`, which asks the host. The
+    /// default answers the value the host published through
+    /// [`DvmField::set_value`], which is zero for a field nothing has set --
+    /// the same "no host model answers zero" the other call defaults use.
+    fn get_static_int_field(
+        &self,
+        _vm: &mut Vm,
+        _class: &Rc<DvmClass>,
+        field: &Rc<DvmField>,
+    ) -> i32 {
+        field.value() as i32
+    }
+
+    /// Calls a static method returning an object, through its `va_list`.
+    ///
+    /// Port of unidbg: `AbstractJni.callStaticObjectMethodV`, which switches on
+    /// the method signature and throws for one it has no model for. `args` is
+    /// the decoded `va_list`, so `args[i] as i32` is the `jint` argument `i`.
+    /// `None` is a null return, which is what a call with no host model
+    /// answers.
+    fn call_static_object_method_v(
+        &self,
+        _vm: &mut Vm,
+        _class: &Rc<DvmClass>,
+        _method: &Rc<DvmMethod>,
+        _args: &[u64],
+    ) -> Option<Rc<dyn DvmObject>> {
+        None
+    }
+
+    /// Calls an instance method returning an object.
+    ///
+    /// Port of unidbg: `AbstractJni.callObjectMethodV`, which switches on
+    /// `Class->method(signature)`. `args` is the decoded arguments, however the
+    /// slot read them, so `args[0] as i32` is the first `jobject`/`jint`
+    /// argument. `None` is a null return, which is what a call with no host
+    /// model answers.
+    fn call_object_method_v(
+        &self,
+        _vm: &mut Vm,
+        _object: &Rc<dyn DvmObject>,
+        _method: &Rc<DvmMethod>,
+        _args: &[u64],
+    ) -> Option<Rc<dyn DvmObject>> {
+        None
+    }
 }
 
 /// A `Jni` that answers nothing: the starting point for a caller that only
@@ -315,6 +421,12 @@ impl std::fmt::Debug for Vm {
 
 impl Vm {
     /// Creates a VM and builds its `JNIEnv` and `JavaVM` tables.
+    ///
+    /// The host model is unidbg's [`AbstractJni`](super::abstract_jni::AbstractJni)
+    /// -- the same default `BaseVM` installs -- so a caller that sets none
+    /// still answers the Android bootstrap a packed library performs. A
+    /// caller that wants the native side only installs [`NoJni`] through
+    /// [`Self::set_jni`].
     pub fn create(emulator: &Rc<AndroidEmulator>) -> Result<Rc<RefCell<Vm>>, JniError> {
         let svc = emulator.loader().svc_memory().ok_or(JniError::NoSvcPage)?;
         let vm = Rc::new(RefCell::new(Vm {
@@ -323,7 +435,7 @@ impl Vm {
             pointer_size: if emulator.is_64bit() { 8 } else { 4 },
             memory: Rc::clone(emulator.memory()),
             svc,
-            jni: RefCell::new(Box::new(NoJni)),
+            jni: RefCell::new(Box::new(super::abstract_jni::AbstractJni)),
             classes_by_name: RefCell::new(BTreeMap::new()),
             classes_by_hash: RefCell::new(BTreeMap::new()),
             methods: RefCell::new(BTreeMap::new()),
@@ -540,6 +652,17 @@ impl Vm {
     pub fn new_instance(&self, class: &Rc<DvmClass>) -> Rc<dyn DvmObject> {
         let hash = self.next_identity();
         Rc::new(InstanceObject::new(class.name(), hash))
+    }
+
+    /// A `jclass` reference for `class`, as a local reference.
+    ///
+    /// A `jclass` *is* a `jobject` in the JNI type system -- a handle onto a
+    /// `java.lang.Class` -- so the answer is an object whose hash is the
+    /// class's own, which is what lets the guest hand it straight back to
+    /// [`Self::class_by_hash`]. unidbg's `addLocalObject(new DvmClass(...))` is
+    /// the same shape.
+    pub fn new_class_ref(&self, class: &Rc<DvmClass>) -> Rc<dyn DvmObject> {
+        Rc::new(ClassObject::new(class.hash_code()))
     }
 
     /// The object a reference names, looking in locals then globals.
@@ -1008,8 +1131,10 @@ fn dispatch(
                     vm.classes_by_name
                         .borrow_mut()
                         .insert(class.name().to_string(), Rc::clone(&class));
-                    vm.classes_by_hash.borrow_mut().insert(hash, class);
-                    vm.add_local(Rc::new(ClassObject::new(hash)));
+                    vm.classes_by_hash
+                        .borrow_mut()
+                        .insert(hash, Rc::clone(&class));
+                    vm.add_local(vm.new_class_ref(&class));
                     hash as i64
                 }
                 None => 0,
@@ -1098,6 +1223,85 @@ fn dispatch(
             });
             Ok(value as i64)
         }
+        JniFunc::GetObjectClass => {
+            let object_hash = arg(backend, is_64bit, 0) as i32;
+            let Some(object) = vm.object(object_hash) else {
+                return Ok(0);
+            };
+            // Port of unidbg `_GetObjectClass`: the answer is a `jclass` for
+            // the object's type, so the guest can then ask that class for
+            // methods.
+            let class = vm.resolve_class(object.object_type());
+            Ok(vm.add_local(vm.new_class_ref(&class)) as i64)
+        }
+        JniFunc::CallObjectMethod | JniFunc::CallObjectMethodV => {
+            let object_hash = arg(backend, is_64bit, 0) as i32;
+            let method_hash = arg(backend, is_64bit, 1) as i32;
+            let (Some(object), Some(method)) =
+                (vm.object(object_hash), vm.method_by_hash(method_hash))
+            else {
+                return Ok(0);
+            };
+            // `CallObjectMethod`'s arguments are in `x3..x7`; the `V` twin
+            // takes a `va_list` in `x3` instead, which the reader walks.
+            let args: Vec<u64> = if function == JniFunc::CallObjectMethod {
+                (2..8).map(|i| arg(backend, is_64bit, i)).collect()
+            } else {
+                let va_list = arg(backend, is_64bit, 2);
+                read_va_list(
+                    memory.as_ref(),
+                    va_list,
+                    &method.decode_args_shorty(),
+                    is_64bit,
+                )
+                .map_err(|error| {
+                    RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+                })?
+            };
+            method.note_invocation();
+            let result = with_jni(vm, |jni, vm| {
+                jni.call_object_method_v(vm, &object, &method, &args)
+            });
+            // unidbg's `addLocalObject`, as for the static twin: the host's
+            // object becomes a local reference and the guest gets that.
+            Ok(match result {
+                Some(object) => vm.add_local(object) as i64,
+                None => 0,
+            })
+        }
+        JniFunc::CallStaticObjectMethodV => {
+            let class_hash = arg(backend, is_64bit, 0) as i32;
+            let method_hash = arg(backend, is_64bit, 1) as i32;
+            // `(*env)->CallStaticObjectMethodV(env, clazz, mid, args)`: the
+            // `va_list` is the third real argument, in `x3`/`r3`.
+            let va_list = arg(backend, is_64bit, 2);
+            let (Some(class), Some(method)) =
+                (vm.class_by_hash(class_hash), vm.method_by_hash(method_hash))
+            else {
+                return Ok(0);
+            };
+            method.note_invocation();
+            // `memory` is the `Rc<Loader>` the stub was built with; the reader
+            // wants the `dyn Memory` behind it.
+            let args = read_va_list(
+                memory.as_ref(),
+                va_list,
+                &method.decode_args_shorty(),
+                is_64bit,
+            )
+            .map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })?;
+            let object = with_jni(vm, |jni, vm| {
+                jni.call_static_object_method_v(vm, &class, &method, &args)
+            });
+            // unidbg's `addLocalObject`: the host's object becomes a local
+            // reference and the guest gets that reference.
+            Ok(match object {
+                Some(object) => vm.add_local(object) as i64,
+                None => 0,
+            })
+        }
         JniFunc::NewObject => {
             let class_hash = arg(backend, is_64bit, 0) as i32;
             let ctor_hash = arg(backend, is_64bit, 1) as i32;
@@ -1114,6 +1318,42 @@ fn dispatch(
                 Some(object) => vm.add_local(object) as i64,
                 None => 0,
             })
+        }
+        JniFunc::GetStaticFieldID => {
+            let class_hash = arg(backend, is_64bit, 0) as i32;
+            let name_ptr = arg(backend, is_64bit, 1);
+            let type_ptr = arg(backend, is_64bit, 2);
+            let Some(class) = vm.class_by_hash(class_hash) else {
+                return Ok(0);
+            };
+            let name = vm.read_cstring(name_ptr).map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })?;
+            let field_type = vm.read_cstring(type_ptr).map_err(|error| {
+                RunError::Backend(raxdbg_core::backend::BackendError::Other(error.to_string()))
+            })?;
+            let field = with_jni(vm, |jni, vm| {
+                jni.get_static_field_id(vm, &class, &name, &field_type)
+            });
+            Ok(match field {
+                Some(field) => {
+                    let hash = field.hash_code();
+                    vm.fields.borrow_mut().insert(hash, field);
+                    hash as i64
+                }
+                None => 0,
+            })
+        }
+        JniFunc::GetStaticIntField => {
+            let class_hash = arg(backend, is_64bit, 0) as i32;
+            let field_hash = arg(backend, is_64bit, 1) as i32;
+            let (Some(class), Some(field)) =
+                (vm.class_by_hash(class_hash), vm.field_by_hash(field_hash))
+            else {
+                return Ok(0);
+            };
+            let value = with_jni(vm, |jni, vm| jni.get_static_int_field(vm, &class, &field));
+            Ok(value as i64)
         }
         JniFunc::NewStringUTF => {
             let address = arg(backend, is_64bit, 0);

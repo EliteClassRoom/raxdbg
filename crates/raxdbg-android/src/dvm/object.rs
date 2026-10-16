@@ -343,6 +343,25 @@ pub fn normalize_class_name(name: &str) -> String {
     }
 }
 
+/// Consumes one JNI type from `chars`, so an array's element type is not read
+/// as a second argument.
+///
+/// `[` dimensions are consumed too, so `[[I` and `[Ljava/lang/String;` both
+/// leave `chars` positioned after the type.
+fn skip_one_type(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while matches!(chars.peek(), Some('[')) {
+        chars.next();
+    }
+    if matches!(chars.next(), Some('L')) {
+        for c in chars.by_ref() {
+            if c == ';' {
+                break;
+            }
+        }
+    }
+    // A primitive is the one character just consumed.
+}
+
 /// JNI's name mangling.
 ///
 /// Port of unidbg: `DvmClass.mangleForJni` — `_` becomes `_1`, `/` and `.`
@@ -448,6 +467,69 @@ impl DvmMethod {
     pub fn invocations(&self) -> usize {
         self.invocations.get()
     }
+
+    /// The argument types in the signature's `(...)`.
+    ///
+    /// Port of unidbg: `DvmMethod.decodeArgsShorty`. unidbg caches the result
+    /// in `shortyCache`; this re-derives it, because it is read once per
+    /// `va_list` call and the signature string is already in hand.
+    pub fn decode_args_shorty(&self) -> Vec<ArgType> {
+        let mut types = Vec::new();
+        let mut chars = self.signature.chars();
+        // Everything before `(` is the return type and says nothing about the
+        // arguments. A signature with no `(` is not one this can describe, and
+        // an empty argument list is the honest answer rather than an error: a
+        // `CallStatic*MethodV` on it then reads no varargs.
+        if chars.by_ref().any(|c| c == '(') {
+            let mut rest = chars.peekable();
+            while let Some(c) = rest.next() {
+                match c {
+                    ')' => break,
+                    // `[` is one array dimension and the element type that
+                    // follows is part of the same argument.
+                    '[' => {
+                        types.push(ArgType::Object);
+                        skip_one_type(&mut rest);
+                    }
+                    'L' => {
+                        types.push(ArgType::Object);
+                        for c in rest.by_ref() {
+                            if c == ';' {
+                                break;
+                            }
+                        }
+                    }
+                    'B' | 'C' | 'I' | 'S' | 'Z' => types.push(ArgType::Int),
+                    'J' => types.push(ArgType::Long),
+                    'F' => types.push(ArgType::Float),
+                    'D' => types.push(ArgType::Double),
+                    // A character that starts no type cannot begin an argument
+                    // this can describe; stop rather than emit a wrong width.
+                    _ => break,
+                }
+            }
+        }
+        types
+    }
+}
+
+/// A method signature's argument types, in `(...)` order.
+///
+/// Port of unidbg: `DvmMethod.decodeArgsShorty` and `Shorty`. Only the width
+/// and the register bank matter to a `va_list` reader, so the eight primitive
+/// shorties collapse to four variants plus the reference one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgType {
+    /// `B`, `C`, `I`, `S`, `Z` -- one `jint`-wide slot.
+    Int,
+    /// `J` -- a `jlong`.
+    Long,
+    /// `F` -- a `jfloat`.
+    Float,
+    /// `D` -- a `jdouble`.
+    Double,
+    /// `L...;` or an array -- a reference.
+    Object,
 }
 
 /// A field the guest has an id for.

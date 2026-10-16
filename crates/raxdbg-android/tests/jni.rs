@@ -9,6 +9,7 @@
 #[path = "synthetic/mod.rs"]
 mod synthetic;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use raxdbg_android::android_file::ElfLibraryFile;
@@ -62,6 +63,14 @@ struct Fixture {
 
 impl Fixture {
     fn boot() -> Fixture {
+        let fixture = Fixture::boot_with_default_jni();
+        fixture.vm.borrow().set_jni(Box::new(TestJni));
+        fixture
+    }
+
+    /// Boots with whatever `Vm::create` installed, so a test can exercise the
+    /// default host model rather than one the harness supplies.
+    fn boot_with_default_jni() -> Fixture {
         let emulator = AndroidEmulatorBuilder::for_64bit()
             .process_name("raxdbg-jni")
             .seed(11)
@@ -76,7 +85,6 @@ impl Fixture {
         let file = ElfLibraryFile::open(&path).expect("open fixture");
         emulator.load(Box::new(file), false).expect("load fixture");
         let vm = Vm::create(&emulator).expect("vm");
-        vm.borrow().set_jni(Box::new(TestJni));
         Fixture { emulator, vm }
     }
 
@@ -655,5 +663,617 @@ fn jni_on_load_runs_after_the_librarys_initialisers() {
         Vm::call_jni_on_load(&emulator, &vm, "libjnionload.so").expect("JNI_OnLoad"),
         JNI_VERSION_1_6,
         "the constructor's word came back, so it ran first"
+    );
+}
+
+/// The stub address in the `JNIEnv` table's `slot`.
+///
+/// Slots 115, 144 and 150 are what a packed library reaches for once
+/// `GetStaticMethodID` has handed it a method id -- the `va_list` call that
+/// resolves `ActivityThread.currentActivityThread()`, and the two static-field
+/// slots behind it. Before they were implemented every one of them was the
+/// shared `UnimplementedJniFunction` stub, so a run recorded the slot and
+/// answered zero.
+fn slot_address(fixture: &Fixture, slot: u64) -> u64 {
+    let vm = fixture.vm.borrow();
+    let table = fixture
+        .emulator
+        .memory()
+        .pointer(vm.jni_env())
+        .read_pointer(0)
+        .expect("the JNIEnv handle points at its table");
+    fixture
+        .emulator
+        .memory()
+        .pointer(table + slot * 8)
+        .read_pointer(0)
+        .expect("read the slot")
+}
+
+/// A NUL-terminated guest string, as a JNI name or signature argument.
+fn guest_string(fixture: &Fixture, value: &str) -> u64 {
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.push(0);
+    let address = fixture
+        .emulator
+        .memory()
+        .mmap(bytes.len(), Prot::READ)
+        .expect("string buffer")
+        .peer();
+    fixture
+        .emulator
+        .memory()
+        .pointer(address)
+        .write_bytes(0, &bytes)
+        .expect("write the string");
+    address
+}
+
+/// A zeroed 32-byte arm64 `struct __va_list` in guest memory.
+///
+/// The header is read before any argument is, so even a call whose signature
+/// takes nothing needs a real one -- a null `va_list` faults in the reader
+/// rather than in the slot being tested.
+fn guest_va_list(fixture: &Fixture) -> u64 {
+    guest_va_list_with_arguments(fixture, &[])
+}
+
+/// The same, with `arguments` laid out in the GP register save area.
+///
+/// One eight-byte slot follows the 32-byte header per argument, `__gr_top`
+/// sits a slot above the last of them and `__gr_offs` counts back down, which
+/// is the shape the caller's own `va_start` leaves behind.
+fn guest_va_list_with_arguments(fixture: &Fixture, arguments: &[u64]) -> u64 {
+    const SLOT: usize = 8;
+    let slots = arguments.len() as u64;
+    let address = fixture
+        .emulator
+        .memory()
+        .mmap(32 + SLOT * arguments.len(), Prot::READ)
+        .expect("va_list page")
+        .peer();
+    let save_area = address + 32;
+    let list = fixture.emulator.memory().pointer(address);
+    list.write_bytes(0, &[0u8; 32]).expect("zero the header");
+    for (index, value) in arguments.iter().enumerate() {
+        list.write_u64(SLOT as u64 * index as u64 + 32, *value)
+            .expect("the argument in the save area");
+    }
+    list.write_u64(0, save_area).expect("__stack");
+    list.write_u64(8, save_area + SLOT as u64 * slots)
+        .expect("__gr_top");
+    list.write_u64(16, 0).expect("__vr_top");
+    let gr_offs = -(SLOT as i32) * arguments.len() as i32;
+    list.write_u32(24, gr_offs as u32).expect("__gr_offs");
+    list.write_u32(28, 0).expect("__vr_offs");
+    address
+}
+
+/// All three slots are reached through the table rather than a host shortcut,
+/// so this asserts the only thing that matters about them: a call that used to
+/// be recorded as missing now is not.
+///
+/// It also covers the reverse failure -- a slot that answered but recorded
+/// itself unimplemented on the way -- because `unimplemented()` is what the CLI
+/// prints as "JNI functions this port lacks".
+#[test]
+fn the_three_missing_slots_are_no_longer_unimplemented() {
+    let fixture = Fixture::boot();
+    let class = fixture.class();
+    let class_hash = class.hash_code() as i64 as u64;
+    let env = fixture.vm.borrow().jni_env();
+
+    // Slot 115 takes a `va_list`; this method takes no arguments, so the
+    // reader walks nothing and the slot's own dispatch is what is under test.
+    let method_hash = fixture
+        .vm
+        .borrow_mut()
+        .create_method(&class, "noArgs", "()Ljava/lang/Object;", true, 0)
+        .hash_code() as i64 as u64;
+    let va_list = guest_va_list(&fixture);
+    fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 115),
+            &[env, class_hash, method_hash, va_list],
+        )
+        .expect("CallStaticObjectMethodV runs");
+
+    let name_ptr = guest_string(&fixture, "PADDED");
+    let type_ptr = guest_string(&fixture, "I");
+    let field = fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 144),
+            &[env, class_hash, name_ptr, type_ptr],
+        )
+        .expect("GetStaticFieldID runs") as i64 as u64;
+    fixture
+        .emulator
+        .call_function(slot_address(&fixture, 150), &[env, class_hash, field])
+        .expect("GetStaticIntField runs");
+
+    assert!(
+        fixture.vm.borrow().unimplemented().is_empty(),
+        "115, 144 and 150 are implemented, so nothing should be recorded: {:?}",
+        fixture.vm.borrow().unimplemented()
+    );
+}
+
+/// A `Jni` that keeps what slot 115 decoded out of the `va_list`.
+///
+/// It answers `currentActivityThread()` the way unidbg's `AbstractJni` does --
+/// a fresh instance of the class -- rather than the test inventing a reference
+/// hash that no other code path could produce.
+struct RecordingJni {
+    calls: Rc<RefCell<Vec<Vec<u64>>>>,
+}
+
+impl Jni for RecordingJni {
+    fn call_static_object_method_v(
+        &self,
+        vm: &mut Vm,
+        class: &Rc<DvmClass>,
+        _method: &Rc<DvmMethod>,
+        args: &[u64],
+    ) -> Option<Rc<dyn DvmObject>> {
+        self.calls.borrow_mut().push(args.to_vec());
+        Some(vm.new_instance(class))
+    }
+}
+
+/// The arm64 `va_list` is the ABI's own `struct __va_list`, not a JNI concept:
+/// a stack cursor, the *tops* of the two register save areas, and a signed
+/// offset into each that is negative while that save area still has room -- the
+/// next slot is at `top + offset`, which is below the top, since a save area
+/// fills downward from it. Nothing else in the port models that layout, so a
+/// reader that took the wrong branch here would hand a host a
+/// plausible-looking wrong number and no test would notice.
+///
+/// The save area is given a *different* value from the stack cursor's, so a
+/// reader that skips the save area while a register slot is still available
+/// fails rather than coincidentally agreeing.
+#[test]
+fn call_static_object_method_v_decodes_its_va_list() {
+    const ARGUMENT: u32 = 0x1234_5678;
+    const ON_THE_STACK: u32 = 0x7fff_ffff;
+
+    let fixture = Fixture::boot();
+    let class = fixture.class();
+    // Built directly rather than through slot 113, so this test is about the
+    // `va_list` reader and not about method-id resolution.
+    let method_hash = fixture
+        .vm
+        .borrow_mut()
+        .create_method(&class, "takeInt", "(I)Ljava/lang/Object;", true, 0)
+        .hash_code();
+
+    // 32 bytes of `__va_list`, then the eight-byte GP save area, then a
+    // separate eight-byte stack area.
+    let page = fixture
+        .emulator
+        .memory()
+        .mmap(56, Prot::READ)
+        .expect("va_list page")
+        .peer();
+    let save_area = page + 32;
+    let stack_area = page + 48;
+    fixture
+        .emulator
+        .memory()
+        .pointer(save_area)
+        .write_u32(0, ARGUMENT)
+        .expect("the argument in the save area");
+    fixture
+        .emulator
+        .memory()
+        .pointer(stack_area)
+        .write_u32(0, ON_THE_STACK)
+        .expect("the poison argument on the stack");
+
+    let list = fixture.emulator.memory().pointer(page);
+    list.write_u64(0, stack_area).expect("__stack");
+    // The top of the save area is one slot above the argument it holds.
+    list.write_u64(8, save_area + 8).expect("__gr_top");
+    list.write_u64(16, 0).expect("__vr_top");
+    // One eight-byte slot left in the save area.
+    list.write_u32(24, (-8i32) as u32).expect("__gr_offs");
+    list.write_u32(28, 0).expect("__vr_offs");
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    fixture.vm.borrow().set_jni(Box::new(RecordingJni {
+        calls: Rc::clone(&calls),
+    }));
+
+    let env = fixture.vm.borrow().jni_env();
+    let reference = fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 115),
+            &[
+                env,
+                class.hash_code() as i64 as u64,
+                method_hash as i64 as u64,
+                page,
+            ],
+        )
+        .expect("CallStaticObjectMethodV runs");
+
+    assert_ne!(reference, 0, "a modelled static call answers a reference");
+    let object = fixture
+        .vm
+        .borrow()
+        .object(reference as i32)
+        .expect("the returned reference names an object");
+    assert_eq!(
+        object.object_type(),
+        class.name(),
+        "the host's object is an instance of the class it was called on"
+    );
+    assert_eq!(
+        calls.borrow().as_slice(),
+        [vec![ARGUMENT as u64]],
+        "the argument came off the register save area, not the stack"
+    );
+}
+
+/// The other branch of the reader: once the register save area is exhausted,
+/// the arguments are on the stack, which is where a call with more arguments
+/// than the save area holds puts them.
+///
+/// The save area's offsets start non-negative here, so nothing can look like a
+/// remaining register slot. Each argument is a full eight-byte stack slot and
+/// so each advances the cursor to the next boundary -- a reader that advanced
+/// by the argument's own width would hand the second argument the first one's
+/// padding, and a reader that kept taking from the save area would fault.
+#[test]
+fn call_static_object_method_v_reads_arguments_off_the_stack() {
+    const FIRST: i32 = 0x1122_3344;
+    const SECOND: i32 = 0x5566_7788;
+
+    let fixture = Fixture::boot();
+    let class = fixture.class();
+    let method_hash = fixture
+        .vm
+        .borrow_mut()
+        .create_method(&class, "twoInts", "(II)Ljava/lang/Object;", true, 0)
+        .hash_code();
+
+    let page = fixture
+        .emulator
+        .memory()
+        .mmap(32 + 32, Prot::READ)
+        .expect("va_list page")
+        .peer();
+    let stack_area = page + 32;
+    let memory = fixture.emulator.memory();
+    // Two eight-byte slots, each holding its argument in the low four bytes
+    // and zero above. A reader that advanced the cursor by four would find the
+    // padding, and report zero.
+    memory
+        .pointer(stack_area)
+        .write_u64(0, FIRST as u32 as u64)
+        .expect("the first argument");
+    memory
+        .pointer(stack_area + 8)
+        .write_u64(0, SECOND as u32 as u64)
+        .expect("the second argument");
+
+    let list = memory.pointer(page);
+    list.write_u64(0, stack_area).expect("__stack");
+    list.write_u64(8, 0).expect("__gr_top");
+    list.write_u64(16, 0).expect("__vr_top");
+    // Both save areas are spent: no argument may come from them.
+    list.write_u32(24, 0).expect("__gr_offs");
+    list.write_u32(28, 0).expect("__vr_offs");
+
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    fixture.vm.borrow().set_jni(Box::new(RecordingJni {
+        calls: Rc::clone(&calls),
+    }));
+
+    let env = fixture.vm.borrow().jni_env();
+    fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 115),
+            &[
+                env,
+                class.hash_code() as i64 as u64,
+                method_hash as i64 as u64,
+                page,
+            ],
+        )
+        .expect("CallStaticObjectMethodV runs");
+
+    assert_eq!(
+        calls.borrow().as_slice(),
+        [vec![FIRST as i64 as u64, SECOND as i64 as u64]],
+        "both arguments came off the stack, eight bytes apart"
+    );
+}
+
+/// The static-field path end to end: a name and a signature go in as guest
+/// strings, an id comes out, and that id is what the read slot takes. The id
+/// is a hash of `L<Class>;-><name>:<type>` rather than an invention, so the
+/// guest can hold it across calls and the host can look it up again.
+#[test]
+fn a_static_field_id_resolves_and_reads_its_value() {
+    const VALUE: i32 = 0x40;
+
+    let fixture = Fixture::boot();
+    let class = fixture.class();
+    let env = fixture.vm.borrow().jni_env();
+    let class_hash = class.hash_code() as i64 as u64;
+    let name_ptr = guest_string(&fixture, "GET_SIGNATURES");
+    let type_ptr = guest_string(&fixture, "I");
+
+    let id = fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 144),
+            &[env, class_hash, name_ptr, type_ptr],
+        )
+        .expect("GetStaticFieldID runs") as i32;
+    let expected = fixture
+        .vm
+        .borrow()
+        .hash_field(class.name(), "GET_SIGNATURES", "I");
+    assert_eq!(id, expected, "the id is the field's hash");
+    let field = fixture
+        .vm
+        .borrow()
+        .field_by_hash(id)
+        .expect("the id names a field");
+    assert_eq!(field.name(), "GET_SIGNATURES");
+    assert_eq!(field.field_type(), "I");
+
+    // The value is the host's, published through the field rather than chosen
+    // by the dispatch, which is the whole reason the field object exists.
+    field.set_value(VALUE as i64);
+    let value = fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 150),
+            &[env, class_hash, id as i64 as u64],
+        )
+        .expect("GetStaticIntField runs");
+    assert_eq!(
+        value as i32, VALUE,
+        "the read slot answers the host's value"
+    );
+}
+
+/// A `jfieldID` the host never handed out is not a field. Answering with a
+/// plausible-looking number here is how a caller would go on to branch on
+/// garbage, so the slot answers zero like every other unresolved reference.
+#[test]
+fn an_unknown_field_answers_zero() {
+    let fixture = Fixture::boot();
+    let class = fixture.class();
+    let env = fixture.vm.borrow().jni_env();
+
+    let value = fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 150),
+            &[env, class.hash_code() as i64 as u64, 0x0bad_f00d],
+        )
+        .expect("GetStaticIntField runs");
+    assert_eq!(value, 0, "an id that was never registered reads as zero");
+}
+
+/// Slot 31 is what a packer calls on an object it has just been handed, to
+/// reach the class it will look a method up on. Answering null here is what
+/// made the guest's own ClassLoader bootstrap give up.
+#[test]
+fn get_object_class_answers_the_objects_type() {
+    let fixture = Fixture::boot();
+    let class = fixture.class();
+    let instance = fixture.vm.borrow().new_instance(&class);
+    let object_type = instance.object_type().to_string();
+    let reference = fixture.vm.borrow().add_local(instance) as i64 as u64;
+    let env = fixture.vm.borrow().jni_env();
+
+    let answer = fixture
+        .emulator
+        .call_function(slot_address(&fixture, 31), &[env, reference])
+        .expect("GetObjectClass runs") as i32;
+
+    assert_ne!(answer, 0, "a live object has a type");
+    assert_eq!(
+        fixture
+            .vm
+            .borrow()
+            .object(answer)
+            .expect("the answer is a local reference")
+            .object_type(),
+        "Ljava/lang/Class;",
+        "a jclass is a java.lang.Class"
+    );
+    assert_eq!(
+        fixture
+            .vm
+            .borrow()
+            .class_by_hash(answer)
+            .expect("the answer names the class it was asked about")
+            .name(),
+        object_type,
+        "and it is the object's own type, so the guest can ask it for methods"
+    );
+}
+
+/// The whole point of the default model: with no `Jni` installed, a
+/// `findClass` on a ClassLoader answers the class the guest named, instead of
+/// the null that made the guest bail out of its own unpack path.
+#[test]
+fn the_default_model_finds_a_class_by_name() {
+    const NAME: &str = "java/lang/Object";
+
+    let fixture = Fixture::boot_with_default_jni();
+    let env = fixture.vm.borrow().jni_env();
+    // A `jstring` local reference, which is how the class name reaches the
+    // host -- not a bare C string in guest memory.
+    let name = fixture.vm.borrow().new_string(NAME) as i64 as u64;
+    let loader = fixture
+        .vm
+        .borrow_mut()
+        .resolve_class("java/lang/ClassLoader");
+    // The receiver has to be a ClassLoader for the model to match the
+    // signature at all -- that is how unidbg decides which call this is.
+    let loader_ref = fixture.vm.borrow().new_instance(&loader);
+    let receiver = fixture.vm.borrow().add_local(loader_ref) as i64 as u64;
+    let method_hash = fixture
+        .vm
+        .borrow_mut()
+        .create_method(
+            &loader,
+            "findClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            false,
+            0,
+        )
+        .hash_code() as i64 as u64;
+
+    let answer = fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 35),
+            &[
+                env,
+                receiver,
+                method_hash,
+                guest_va_list_with_arguments(&fixture, &[name]),
+            ],
+        )
+        .expect("CallObjectMethodV runs") as i32;
+
+    assert_ne!(answer, 0, "a modelled findClass answers a class, not null");
+    assert_eq!(
+        fixture
+            .vm
+            .borrow()
+            .class_by_hash(answer)
+            .expect("the answer is a jclass for the named class")
+            .name(),
+        "Ljava/lang/Object;",
+        "and it is the class the guest asked for"
+    );
+}
+
+/// The call the guest's ClassLoader bootstrap hangs off. A null here is not a
+/// fault the guest reports -- it is a silent early return, which is why the
+/// default model answers an instance rather than nothing.
+#[test]
+fn the_default_model_answers_current_activity_thread() {
+    let fixture = Fixture::boot_with_default_jni();
+    let env = fixture.vm.borrow().jni_env();
+    let class = fixture
+        .vm
+        .borrow_mut()
+        .resolve_class("android/app/ActivityThread");
+    let class_hash = class.hash_code() as i64 as u64;
+    let method_hash = fixture
+        .vm
+        .borrow_mut()
+        .create_method(
+            &class,
+            "currentActivityThread",
+            "()Landroid/app/ActivityThread;",
+            true,
+            0,
+        )
+        .hash_code() as i64 as u64;
+
+    let answer = fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 115),
+            &[
+                env,
+                class_hash,
+                method_hash,
+                guest_va_list_with_arguments(&fixture, &[]),
+            ],
+        )
+        .expect("CallStaticObjectMethodV runs") as i32;
+
+    assert_ne!(answer, 0, "currentActivityThread answers an object");
+    assert_eq!(
+        fixture
+            .vm
+            .borrow()
+            .object(answer)
+            .expect("the answer is a local reference")
+            .object_type(),
+        "Landroid/app/ActivityThread;",
+        "the object is an ActivityThread, so the guest proceeds past its null check"
+    );
+}
+
+/// A `Jni` that keeps what slot 34 handed it, and answers nothing -- the
+/// minimum needed to tell the register-reading path apart from the `V` one.
+struct RecordingObjectJni {
+    calls: Rc<RefCell<Vec<Vec<u64>>>>,
+}
+
+impl Jni for RecordingObjectJni {
+    fn call_object_method_v(
+        &self,
+        _vm: &mut Vm,
+        _object: &Rc<dyn DvmObject>,
+        _method: &Rc<DvmMethod>,
+        args: &[u64],
+    ) -> Option<Rc<dyn DvmObject>> {
+        self.calls.borrow_mut().push(args.to_vec());
+        None
+    }
+}
+
+/// Slot 34 takes its arguments in registers, not behind a pointer, and a model
+/// with no answer is a null return rather than a fault -- both are what the
+/// guest sees for a method the host does not model.
+#[test]
+fn call_object_method_reads_its_arguments_from_the_registers() {
+    const FIRST: u64 = 0x1122_3344_5566_7788;
+    const SECOND: u64 = 0x0000_0000_9abc_def0;
+
+    let fixture = Fixture::boot();
+    let class = fixture.class();
+    let instance = fixture.vm.borrow().new_instance(&class);
+    let reference = fixture.vm.borrow().add_local(instance) as i64 as u64;
+    let method_hash = fixture
+        .vm
+        .borrow_mut()
+        .create_method(
+            &class,
+            "twoArgs",
+            "(ILjava/lang/String;)Ljava/lang/Class;",
+            false,
+            0,
+        )
+        .hash_code() as i64 as u64;
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    fixture.vm.borrow().set_jni(Box::new(RecordingObjectJni {
+        calls: Rc::clone(&calls),
+    }));
+    let env = fixture.vm.borrow().jni_env();
+
+    // The slot reads x3..x8 -- six registers, as `CallIntMethod` does -- so all
+    // six are supplied here rather than left as whatever the previous call
+    // happened to leave behind.
+    let answer = fixture
+        .emulator
+        .call_function(
+            slot_address(&fixture, 34),
+            &[env, reference, method_hash, FIRST, SECOND, 0, 0, 0, 0],
+        )
+        .expect("CallObjectMethod runs");
+
+    assert_eq!(answer, 0, "a model that answers nothing is a null return");
+    assert_eq!(
+        calls.borrow().as_slice(),
+        [vec![FIRST, SECOND, 0, 0, 0, 0]],
+        "the arguments came from x3..x7, ahead of the method's own signature"
     );
 }

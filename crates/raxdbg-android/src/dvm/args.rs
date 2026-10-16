@@ -110,6 +110,9 @@ fn format_env_call(
         // `NewGlobalRef`/`DeleteLocalRef(JNIEnv*, jobject)`
         JniFunc::NewGlobalRef | JniFunc::DeleteLocalRef => reference(backend, 1),
 
+        // `GetObjectClass(JNIEnv*, jobject)`
+        JniFunc::GetObjectClass => reference(backend, 1),
+
         // `NewObject(JNIEnv*, jclass, jmethodID, ...)`
         JniFunc::NewObject => {
             format!(
@@ -123,6 +126,39 @@ fn format_env_call(
         // then `jvalue*` varargs the trace cannot type without a signature
         // table the VM does not keep.
         JniFunc::CallIntMethod | JniFunc::CallStaticIntMethod => {
+            format!(
+                "env, {}, mid={}",
+                reference(backend, 1),
+                reference(backend, 2)
+            )
+        }
+
+        // `GetStaticFieldID(JNIEnv*, jclass, const char* name, const char* sig)`,
+        // the field twin of `GetStaticMethodID`.
+        JniFunc::GetStaticFieldID => format!(
+            "env, {}, {}, {}",
+            reference(backend, 1),
+            string(backend, 2),
+            string(backend, 3),
+        ),
+
+        // `GetStaticIntField(JNIEnv*, jclass, jfieldID)`
+        JniFunc::GetStaticIntField => {
+            format!(
+                "env, {}, fid={}",
+                reference(backend, 1),
+                reference(backend, 2)
+            )
+        }
+
+        // `CallStaticObjectMethodV(JNIEnv*, jclass, jmethodID, va_list)` -- the
+        // `va_list` is a pointer into the caller's arguments, and typing it
+        // needs the method's signature, which the stub does not have. The
+        // instance twins share the shape: only the second argument differs, a
+        // `jobject` rather than a `jclass`.
+        JniFunc::CallStaticObjectMethodV
+        | JniFunc::CallObjectMethod
+        | JniFunc::CallObjectMethodV => {
             format!(
                 "env, {}, mid={}",
                 reference(backend, 1),
