@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use raxdbg_android::debug::ArmDisassembler;
-use raxdbg_android::dvm::Vm;
+use raxdbg_android::dvm::{Vm, format_jni_args};
 use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder, EmulatorError};
 use raxdbg_android::syscall::trace::Verbosity;
 use raxdbg_core::alloc::MemoryTracker;
@@ -622,6 +622,9 @@ impl Trace {
                     loader: Rc::clone(emulator.loader()),
                     is_64bit: options.is_64bit(),
                     out: sink,
+                    jni_args: options.jni_args,
+                    memory: Rc::clone(emulator.loader().memory()),
+                    traced: (info.name.clone(), info.base, info.base + info.size),
                 }));
                 // The module's own range is the point of this trace: only
                 // branch instructions executed inside the library are
@@ -759,6 +762,71 @@ struct CallLog {
     loader: Rc<raxdbg_android::elf::AndroidElfLoader>,
     is_64bit: bool,
     out: TraceSink,
+    /// Whether to print the arguments of a `JNIEnv`/`JavaVM` call (`--jni-args`).
+    jni_args: bool,
+    /// The guest memory, for decoding a JNI string argument.
+    memory: Rc<raxdbg_core::memory::loader::Loader>,
+    /// The module being traced, as `(name, base, end)`.
+    ///
+    /// A branch inside it prints as an offset alone. Its symbol would repeat
+    /// the module the address column already names, and in a stripped binary
+    /// the nearest symbol is `JNI_OnLoad` or an unnamed base for nearly every
+    /// line, so `l1296851e_a64.so!+0x3dfec` says nothing the offset did not.
+    traced: (String, u64, u64),
+}
+
+impl CallLog {
+    /// Whether `address` is inside the module this trace is about.
+    fn in_traced(&self, address: u64) -> bool {
+        address >= self.traced.1 && address < self.traced.2
+    }
+
+    /// The caller column: the offset alone for a branch in the traced module,
+    /// and the owning module otherwise.
+    fn caller(&self, address: u64) -> String {
+        if self.in_traced(address) {
+            format!("+{:#x}", address.wrapping_sub(self.traced.1))
+        } else {
+            at(&self.loader, address)
+        }
+    }
+
+    /// The symbol to print beside the caller, or nothing when there is none.
+    ///
+    /// Only for a caller outside the module being traced. Inside it, the name
+    /// comes from the nearest symbol *below* the branch, and in a stripped
+    /// library that is an unrelated entry -- a `FindClass` inside `JNI_OnLoad`
+    /// reads as `start+0x12088`, which is a lie about where the call is. The
+    /// offset is both true and the thing a reader pastes into a disassembler.
+    /// A call from `libc.so` has no such problem: `libc.so!malloc` really is
+    /// the function, so it is kept.
+    fn caller_name(&self, address: u64) -> String {
+        if self.in_traced(address) {
+            String::new()
+        } else {
+            name_caller(&self.loader, address)
+        }
+    }
+
+    /// The `"(env, ...)"` suffix for a JNI call, or the empty string.
+    ///
+    /// The arguments are read here, before the branch retires, which is the
+    /// only moment they are still in `x1..x7`.
+    fn jni_arguments(&self, backend: &mut dyn Backend, callee: u64) -> String {
+        if !self.jni_args {
+            return String::new();
+        }
+        let Some(svc) = self.loader.svc_memory() else {
+            return String::new();
+        };
+        let Some(region) = svc.find_region(callee) else {
+            return String::new();
+        };
+        match format_jni_args(&region.label, backend, self.memory.as_ref(), self.is_64bit) {
+            Some(arguments) if !arguments.is_empty() => format!("({arguments})"),
+            _ => String::new(),
+        }
+    }
 }
 
 impl FunctionCallListener for CallLog {
@@ -769,13 +837,24 @@ impl FunctionCallListener for CallLog {
         // pasted into IDA next to the binary; the RVA can. An address with no
         // module -- a host service on the SVC page -- prints as `-` rather
         // than as a bare offset that looks like it belongs to nothing.
+        //
+        // The caller's symbol rides along only when there is one to print, so
+        // a branch inside the traced module reads `call +0x15372c ->` rather
+        // than repeating the module name beside its own offset.
+        let caller = match self.caller_name(call.caller) {
+            name if name.is_empty() => self.caller(call.caller),
+            name => format!("{} {}", self.caller(call.caller), name),
+        };
         let _ = writeln!(
             self.out.0.borrow_mut(),
-            "call {} {} -> {} {}",
-            at(&self.loader, call.caller),
-            name_caller(&self.loader, call.caller),
+            "call {} -> {} {}{}",
+            caller,
             at(&self.loader, call.callee),
             name_callee(&self.loader, self.is_64bit, backend, call.callee),
+            // `--jni-args` turns a call into the question the guest asked:
+            // `JNIEnv!FindClass("v1296851e/l1296851e")` names the class, which
+            // is the whole answer to "what is this protection loading?".
+            self.jni_arguments(backend, call.callee),
         );
     }
 

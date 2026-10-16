@@ -176,17 +176,63 @@ fn format_env_call(
             format!("env, {}, mode={}", reference(backend, 1), word(backend, 2))
         }
 
-        // `RegisterNatives(JNIEnv*, jclass, JNINativeMethod*, jint count)` --
-        // the method table is the payload here, so its size answers the
-        // question the pointers would not.
-        JniFunc::RegisterNatives => {
-            format!(
-                "env, {}, count={}",
-                reference(backend, 1),
-                arg(backend, 3) as i32
-            )
-        }
+        // `RegisterNatives(JNIEnv*, jclass, JNINativeMethod* methods,
+        // jint count)` -- the table *is* the payload, and it is the answer to
+        // "what does this library bind into the VM?". The class and the count
+        // alone say nothing; the entries name every method and point at the
+        // code behind it.
+        JniFunc::RegisterNatives => format!(
+            "env, {}, count={}, natives={}",
+            reference(backend, 1),
+            arg(backend, 3) as i32,
+            format_native_methods(memory, arg(backend, 2), arg(backend, 3) as i32, is_64bit,),
+        ),
     })
+}
+
+/// How many `JNINativeMethod` entries one line will print.
+///
+/// A protection registers a handful; a corrupt or hostile `count` must not turn
+/// a trace into a million-line dump, so the list is capped and says so.
+const MAX_NATIVE_METHODS: usize = 32;
+
+/// Reads the `JNINativeMethod` array a `RegisterNatives` call is handing over.
+///
+/// Each entry is `{const char* name, const char* signature, void* fnPtr}`, so
+/// the walk is three pointer-sized reads per entry and stops at the first one
+/// that is not readable -- a table the guest built is in its own memory, and an
+/// unreadable entry is where the trace can no longer tell the truth.
+fn format_native_methods(memory: &dyn Memory, table: u64, count: i32, is_64bit: bool) -> String {
+    if table == 0 || count <= 0 {
+        return "[]".to_string();
+    }
+    let stride = if is_64bit { 8u64 } else { 4u64 };
+    let mut entries = Vec::new();
+    for index in 0..count as usize {
+        if entries.len() == MAX_NATIVE_METHODS {
+            entries.push("...".to_string());
+            break;
+        }
+        let entry = memory.pointer(table + index as u64 * stride * 3);
+        let (Ok(name), Ok(signature), Ok(function)) = (
+            entry.read_pointer(0),
+            entry.read_pointer(stride),
+            entry.read_pointer(stride * 2),
+        ) else {
+            // The table ends before `count` claims it does. Printing what was
+            // read, without padding, is honest; guessing the rest is not.
+            break;
+        };
+        if name == 0 || function == 0 {
+            break;
+        }
+        entries.push(format!(
+            "{} {} fn={function:#x}",
+            format_string(memory, name),
+            format_string(memory, signature),
+        ));
+    }
+    format!("[{}]", entries.join(", "))
 }
 
 /// Formats a `JavaVM` call.

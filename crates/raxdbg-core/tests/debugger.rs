@@ -849,11 +849,17 @@ impl CallHarness {
 
 /// Attaches a function-call hook to a fresh harness.
 fn call_hook(is_64bit: bool) -> CallHarness {
+    call_hook_in_range(is_64bit, 0, u64::MAX)
+}
+
+/// Attaches a function-call hook over one address range, so a tail call that
+/// leaves the range can be told apart from a jump that stays inside it.
+fn call_hook_in_range(is_64bit: bool, begin: u64, end: u64) -> CallHarness {
     let (backend_dyn, backend, _breaker) = harness();
     let recorder = Rc::new(RefCell::new(CallRecorder::default()));
     let hook = Rc::new(TraceFunctionCall::new(is_64bit));
     hook.set_listener(Box::new(CallRecorderProxy(Rc::clone(&recorder))));
-    let id = hook.attach(&backend_dyn, 0, u64::MAX);
+    let id = hook.attach(&backend_dyn, begin, end);
     CallHarness {
         hook,
         recorder,
@@ -998,6 +1004,84 @@ fn a_thumb_blx_register_reports_the_call() {
         vec![FunctionCall {
             caller: 0x1000,
             callee: 0x2000,
+        }]
+    );
+    assert_eq!(harness.hook.count(), 1);
+}
+
+/// A JNI `JNIEnv` dispatch is a `br` through a function pointer, and the stub
+/// lives outside the module, so a trace that only watched branch-with-link
+/// instructions reported a protection that calls Java as one that calls
+/// nothing. This is the shape that was invisible.
+#[test]
+fn an_arm64_br_out_of_range_reports_the_call() {
+    let harness = call_hook_in_range(true, 0x1000, 0x1FFF);
+    write_code(&harness, 0x1000, &0xD61F_0000u32.to_le_bytes());
+    harness.set_reg(RegId::X(0), 0x8000);
+
+    harness.fire(0x1000, 4);
+
+    assert_eq!(
+        harness.calls(),
+        vec![FunctionCall {
+            caller: 0x1000,
+            callee: 0x8000,
+        }]
+    );
+    assert_eq!(harness.hook.count(), 1);
+}
+
+/// The other half of the same rule: a `br` that stays inside the traced range
+/// is a jump, not a call. A flattened control flow is nearly all of them, and
+/// reporting them would bury the calls the trace exists to show.
+#[test]
+fn an_arm64_br_inside_the_range_reports_nothing() {
+    let harness = call_hook_in_range(true, 0x1000, 0x1FFF);
+    write_code(&harness, 0x1000, &0xD61F_0000u32.to_le_bytes());
+    harness.set_reg(RegId::X(0), 0x1800);
+
+    harness.fire(0x1000, 4);
+
+    assert!(harness.calls().is_empty());
+    assert_eq!(harness.hook.count(), 0);
+}
+
+/// The AArch32 twin: `bx r3` out of range is the same tail call, and the
+/// target's low bit is cleared on the way, because that bit selects the state.
+#[test]
+fn an_arm_state_bx_register_out_of_range_reports_the_call() {
+    let harness = call_hook_in_range(false, 0x1000, 0x1FFF);
+    write_code(&harness, 0x1000, &0xE12F_FF13u32.to_le_bytes());
+    harness.set_reg(RegId::Cpsr, 0);
+    harness.set_reg(RegId::R(3), 0x8001);
+
+    harness.fire(0x1000, 4);
+
+    assert_eq!(
+        harness.calls(),
+        vec![FunctionCall {
+            caller: 0x1000,
+            callee: 0x8000,
+        }]
+    );
+    assert_eq!(harness.hook.count(), 1);
+}
+
+/// The Thumb twin, in Thumb state.
+#[test]
+fn a_thumb_bx_register_out_of_range_reports_the_call() {
+    let harness = call_hook_in_range(false, 0x1000, 0x1FFF);
+    write_code(&harness, 0x1000, &[0x18, 0x47]);
+    harness.set_reg(RegId::Cpsr, 1 << 5);
+    harness.set_reg(RegId::R(3), 0x8001);
+
+    harness.fire(0x1000, 2);
+
+    assert_eq!(
+        harness.calls(),
+        vec![FunctionCall {
+            caller: 0x1000,
+            callee: 0x8000,
         }]
     );
     assert_eq!(harness.hook.count(), 1);

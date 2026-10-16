@@ -14,10 +14,13 @@ use std::rc::Rc;
 
 use raxdbg_android::android_file::ElfLibraryFile;
 use raxdbg_android::dvm::vm::JniError;
-use raxdbg_android::dvm::{DvmClass, DvmMethod, DvmObject, JNI_OK, JNI_VERSION_1_6, Jni, Vm};
+use raxdbg_android::dvm::{
+    DvmClass, DvmMethod, DvmObject, JNI_OK, JNI_VERSION_1_6, Jni, Vm, format_jni_args,
+};
 use raxdbg_android::emulator::{AndroidEmulator, AndroidEmulatorBuilder};
 use raxdbg_core::backend::Prot;
 use raxdbg_core::memory::{MAP_ANONYMOUS, Memory};
+use raxdbg_core::reg::RegId;
 
 /// The fixture's class, as the guest names it.
 const CLASS: &str = "com/raxdbg/test/JniTest";
@@ -1276,4 +1279,120 @@ fn call_object_method_reads_its_arguments_from_the_registers() {
         [vec![FIRST, SECOND, 0, 0, 0, 0]],
         "the arguments came from x3..x7, ahead of the method's own signature"
     );
+}
+
+/// Builds a `JNINativeMethod` table in guest memory and returns its address.
+///
+/// The array is `{const char* name, const char* signature, void* fnPtr}` per
+/// entry, three pointers wide, so the caller only has to say which methods it
+/// is registering.
+fn guest_native_methods(fixture: &Fixture, entries: &[(&str, &str, u64)]) -> u64 {
+    const STRIDE: u64 = 24;
+    let table = fixture
+        .emulator
+        .memory()
+        .mmap((entries.len() as u64 * STRIDE) as usize, Prot::READ)
+        .expect("native method table")
+        .peer();
+    let strings = fixture
+        .emulator
+        .memory()
+        .mmap(entries.len() * 48, Prot::READ)
+        .expect("native method strings")
+        .peer();
+    for (index, (name, signature, function)) in entries.iter().enumerate() {
+        let name_at = guest_string(fixture, name);
+        let signature_at = guest_string(fixture, signature);
+        let entry = fixture
+            .emulator
+            .memory()
+            .pointer(table + index as u64 * STRIDE);
+        entry.write_pointer(0, name_at).expect("name pointer");
+        entry
+            .write_pointer(8, signature_at)
+            .expect("signature pointer");
+        entry.write_pointer(16, *function).expect("fnPtr");
+        let _ = strings;
+    }
+    table
+}
+
+/// `RegisterNatives`' payload is the `JNINativeMethod` array, and a trace that
+/// printed only `count=3` still could not answer "what does this library bind
+/// into the VM?". Every field of every entry has to appear on the line.
+#[test]
+fn register_natives_prints_every_method_it_binds() {
+    let fixture = Fixture::boot();
+    let class = fixture.class();
+    let env = fixture.vm.borrow().jni_env();
+    let table = guest_native_methods(
+        &fixture,
+        &[
+            ("load", "()V", 0x1200_1000),
+            ("unload", "(I)Z", 0x1200_2000),
+            ("check", "(Ljava/lang/String;)I", 0x1200_3000),
+        ],
+    );
+
+    let line = jni_arguments(
+        &fixture,
+        "JNIEnv!RegisterNatives",
+        &[env, class.hash_code() as i64 as u64, table, 3],
+    );
+
+    assert!(
+        line.contains("count=3"),
+        "the count is still part of the answer: {line}"
+    );
+    for (name, signature, function) in [
+        ("load", "()V", 0x1200_1000u64),
+        ("unload", "(I)Z", 0x1200_2000),
+        ("check", "(Ljava/lang/String;)I", 0x1200_3000),
+    ] {
+        assert!(
+            line.contains(&format!("\"{name}\" \"{signature}\" fn={function:#x}")),
+            "the entry for `{name}` is missing from: {line}"
+        );
+    }
+}
+
+/// A `count` larger than the table really is must print the entries that exist,
+/// not padding to match the number the guest claimed. A fabricated binding is
+/// worse than a short line.
+#[test]
+fn a_register_natives_count_past_the_table_stops_at_the_last_entry() {
+    let fixture = Fixture::boot();
+    let class = fixture.class();
+    let env = fixture.vm.borrow().jni_env();
+    let table = guest_native_methods(&fixture, &[("only", "()V", 0x1200_1000)]);
+
+    // Claims eight entries; the table holds one, and the rest is unmapped.
+    let line = jni_arguments(
+        &fixture,
+        "JNIEnv!RegisterNatives",
+        &[env, class.hash_code() as i64 as u64, table, 8],
+    );
+
+    assert!(
+        line.contains("\"only\""),
+        "the one real entry is shown: {line}"
+    );
+    assert_eq!(
+        line.matches("fn=").count(),
+        1,
+        "no entry is invented to fill the count: {line}"
+    );
+}
+
+/// The trace line for a JNI call, through the same seam the tracer uses.
+fn jni_arguments(fixture: &Fixture, label: &str, args: &[u64]) -> String {
+    let mut backend = fixture.emulator.backend().borrow_mut();
+    for (index, value) in args.iter().enumerate() {
+        backend
+            .reg_write(RegId::X(index as u8), *value)
+            .expect("write the argument register");
+    }
+    let memory = Rc::clone(fixture.emulator.loader().memory());
+    format_jni_args(label, &mut *backend, memory.as_ref(), true)
+        .expect("the label names a JNI function")
 }

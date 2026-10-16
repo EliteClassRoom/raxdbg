@@ -105,14 +105,18 @@ fn trace_functions_logs_the_calls_the_library_makes() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // The branch is inside `hello`, and its target is a PLT stub, which only
-    // the loader's relocation table can name. The count itself is left to the
-    // core tests: a rebuilt fixture may reach `fflush` by a tail call.
-    assert!(stdout.contains("libctest.so!hello+0x"), "{stdout}");
-    // Addresses print module-relative, so the log can be read against the
-    // binary itself rather than against one particular load base. The callee
-    // is a PLT stub, so it belongs to the calling module even though the
-    // function it reaches is libc's.
+    // The caller column carries the offset alone for a branch inside the
+    // module being traced. The nearest symbol below it is not the function the
+    // branch is in -- `find_closest_symbol` attributes a stripped library's
+    // branch to an unrelated entry -- so naming it would be a lie, and the
+    // offset is what a reader pastes into a disassembler anyway.
+    assert!(stdout.contains("call +0x"), "{stdout}");
+    assert!(
+        !stdout.contains("libctest.so!hello+0x"),
+        "a branch inside the traced module is not named by its nearest symbol: {stdout}"
+    );
+    // The callee side still names things: the target is a PLT stub, which only
+    // the loader's relocation table can name.
     assert!(stdout.contains("libctest.so+0x"), "{stdout}");
     assert!(stdout.contains("libc.so!printf"), "{stdout}");
     assert!(stdout.contains("calls --"), "{stdout}");
